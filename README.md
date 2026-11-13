@@ -1,3 +1,11 @@
+> **This is a self-host distribution fork of Multica.**
+> It tracks [multica-ai/multica](https://github.com/multica-ai/multica) and adds
+> direct-to-object-storage attachment upload.
+> Install and update from **this** repository's releases —
+> [docs/self-host-distribution.md](docs/self-host-distribution.md).
+> The upstream install commands below (`multica-ai/multica`, the
+> `multica-ai/tap` Homebrew formula) install a build **without** these changes.
+
 <div align="center">
 
 <picture>

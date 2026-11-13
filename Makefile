@@ -100,11 +100,11 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		fi; \
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
-	@echo "==> Pulling official Multica images..."
+	@echo "==> Pulling published distribution images..."
 	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
-		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
-		echo "If this is before the first GHCR release, build from the current checkout:"; \
+		echo "Images for tag '$${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}' could not be pulled."; \
+		echo "Set MULTICA_IMAGE_TAG in .env to a published version, or build from this checkout:"; \
 		echo "  make selfhost-build"; \
 		exit 1; \
 	fi

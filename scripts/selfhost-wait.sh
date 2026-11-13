@@ -84,8 +84,8 @@ if [ "$mode" = "build" ]; then
   echo "Built images locally via docker-compose.selfhost.build.yml."
   echo "Local tags: multica-backend:dev and multica-web:dev."
 else
-  echo "Images: ${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:${MULTICA_IMAGE_TAG:-latest}"
-  echo "        ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}"
+  echo "Images: ${MULTICA_BACKEND_IMAGE:-ghcr.io/zzttzzmyswy/multica-backend}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}"
+  echo "        ${MULTICA_WEB_IMAGE:-ghcr.io/zzttzzmyswy/multica-web}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}"
 fi
 echo ""
 echo "Log in: configure RESEND_API_KEY in .env for email codes,"
