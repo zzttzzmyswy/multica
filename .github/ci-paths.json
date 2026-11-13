@@ -122,7 +122,17 @@
     ".github/workflows/ci.yml",
     ".github/ci-paths.json",
     "scripts/ci-scope.mjs",
-    "scripts/ci-scope.test.mjs"
+    "scripts/ci-scope.test.mjs",
+    "scripts/install-myswy.sh",
+    "scripts/install-myswy.test.sh",
+    "scripts/myswy-update-e2e.sh",
+    "scripts/myswy-release-server.py",
+    "scripts/myswy-release-config.test.mjs",
+    ".goreleaser.myswy.yml",
+    ".github/workflows/release-myswy.yml",
+    "docs/self-host-distribution.md",
+    ".github/workflows/release.yml",
+    ".goreleaser.yml"
   ],
   "installer": [
     "scripts/install.sh",
@@ -135,7 +145,15 @@
     ".github/workflows/ci.yml",
     ".github/ci-paths.json",
     "scripts/ci-scope.mjs",
-    "scripts/ci-scope.test.mjs"
+    "scripts/ci-scope.test.mjs",
+    "scripts/install-myswy.sh",
+    "scripts/install-myswy.test.sh",
+    "scripts/myswy-update-e2e.sh",
+    "scripts/myswy-release-server.py",
+    "scripts/myswy-release-config.test.mjs",
+    ".goreleaser.myswy.yml",
+    ".github/workflows/release-myswy.yml",
+    "docs/self-host-distribution.md"
   ],
   "images": [
     "**/*.png",

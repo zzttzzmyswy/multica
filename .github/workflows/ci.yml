@@ -977,6 +977,12 @@ jobs:
         shell: pwsh
         run: ./scripts/install.ps1.test.ps1
 
+      - name: Test the distribution installer
+        # Only the shipping script is exercised here; the behavioural suite is
+        # in script-checks (it needs no Windows-specific path).
+        if: runner.os != 'Windows'
+        run: bash scripts/install-myswy.test.sh
+
   script-checks:
     needs: changes
     if: ${{ needs.changes.outputs.scripts == 'true' }}
@@ -1032,6 +1038,12 @@ jobs:
 
       - name: Test build output naming
         run: bash scripts/makefile-build.test.sh
+
+      - name: Test the distribution CLI update path
+        # Runs the real CLI against a loopback release server, so the update
+        # path is covered end to end: pinned and unpinned resolution, checksum
+        # verification, and the refusal cases. No GitHub access.
+        run: bash scripts/myswy-update-e2e.sh
 
   frontend-quality:
     needs: changes

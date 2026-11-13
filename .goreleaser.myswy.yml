@@ -1,0 +1,96 @@
+# GoReleaser configuration for the self-host distribution of this fork.
+#
+# Differences from the upstream .goreleaser.yml, and why:
+#
+#   * No `brews:` section. The upstream config pushes a formula to
+#     multica-ai/homebrew-tap with a secret this fork does not have. Running it
+#     here would either fail the release (missing token) or, worse, publish a
+#     fork build into the upstream tap. This fork publishes no tap at all, so
+#     server/internal/cli's BrewFormulaName is empty and both update paths
+#     refuse the brew route instead of falling back to upstream's formula.
+#   * `project_name` stays `multica` so archive names remain exactly what
+#     internal/cli/update.go looks for. Changing it would make `multica update`
+#     search for an asset no release publishes.
+#
+# Everything else mirrors upstream so the two configs stay comparable: same
+# build ids, same ldflags (so `multica version` reports the tag and commit),
+# same dual archive naming (legacy `multica_<os>_<arch>` kept for CLIs released
+# before the versioned scheme), and the same checksums.txt that
+# internal/cli/update.go verifies before replacing a binary.
+version: 2
+
+project_name: multica
+
+release:
+  # A non-prerelease tag publishes a GitHub release; the distribution tags all
+  # carry a `-myswy.N` suffix, so GoReleaser's `prerelease: auto` default marks
+  # them prereleases. That is deliberate — see docs/self-host-distribution.md.
+  #
+  # replace_existing_artifacts is FALSE, unlike upstream's config. A published
+  # version's bytes are what an installed CLI verified against its checksum, so
+  # a same-tag rerun must fail rather than swap the artifact underneath it. The
+  # documented recovery for a partial publish is a new patch version, which
+  # costs one tag and keeps every version immutable and auditable.
+  replace_existing_artifacts: false
+
+builds:
+  - id: multica
+    main: ./cmd/multica
+    dir: server
+    binary: multica
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.buildCommit={{.FullCommit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  # The legacy name is still published because a CLI released before the
+  # versioned scheme looks for `multica_{os}_{arch}.{ext}` when it self-updates.
+  - id: legacy
+    files:
+      - LICENSE*
+      - README*
+      - NOTICE
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+  # The name internal/cli.ReleaseAssetName builds, and the one the pinned
+  # install/update flow documents.
+  - id: versioned
+    files:
+      - LICENSE*
+      - README*
+      - NOTICE
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}-cli-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
