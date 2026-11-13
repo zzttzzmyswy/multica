@@ -5248,7 +5248,18 @@ func (d *Daemon) tryBeginServerUpdate(ctx context.Context) serverUpdateAcquireRe
 // the restart — extracted so the server-triggered path (handleUpdate) and the
 // auto-update poller (autoUpdateLoop) share the exact same execution body.
 func (d *Daemon) runUpdate(targetVersion string) (string, error) {
-	if cli.IsBrewInstall() {
+	// Through the package seam, not cli.IsBrewInstall directly: every other
+	// brew decision in this package goes through it, and calling the real
+	// helper here made this branch unreachable from a test.
+	if isBrewInstall() {
+		// A build that publishes no tap cannot be upgraded through brew, and
+		// replacing a keg's binary in place would corrupt the install. Report
+		// the situation instead of picking either bad option; the same message
+		// the CLI's `update` command returns, so both paths agree.
+		if cli.BrewFormulaName == "" {
+			err := cli.BrewInstallBlockedError(targetVersion, runtime.GOOS, runtime.GOARCH)
+			return "", err
+		}
 		d.logger.Info("updating CLI via Homebrew...")
 		out, err := cli.UpdateViaBrew()
 		if err != nil {

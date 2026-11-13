@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,11 +32,31 @@ import (
 // changes one place.
 const ChecksumManifestName = "checksums.txt"
 
+// ReleaseRepository is the single source of truth for where this build's
+// release metadata, archives, and checksum manifests live. Every request path
+// in this file derives from it — latest, by-tag, archive, and checksums.txt —
+// so a distribution cannot read release metadata from one repository and
+// download archives from another.
+//
+// It is a constant rather than a variable on purpose. This repository is a
+// maintained fork whose builds carry features the upstream releases lack, so
+// there is no configuration under which pointing an installed binary at
+// upstream is correct: that would silently replace the operator's build with
+// one that has different behavior. Operators who need a mirror set
+// MULTICA_RELEASE_API_BASE_URL / MULTICA_RELEASE_DOWNLOAD_BASE_URL, which
+// change the host but keep this repository in the path.
+const ReleaseRepository = "zzttzzmyswy/multica"
+
+// defaultReleaseAPIBaseURL is the GitHub Releases API root. A mirror only
+// rewrites the host; the /repos/<ReleaseRepository>/releases/... path is
+// preserved.
 const defaultReleaseAPIBaseURL = "https://api.github.com"
 
 // MULTICA_RELEASE_API_BASE_URL points at a GitHub Releases API-compatible
 // mirror. MULTICA_RELEASE_DOWNLOAD_BASE_URL points at an artifact mirror
 // serving /<tag>/<asset-name>; when unset, the release-provided URLs win.
+// Both are host overrides only: the repository in the request path stays
+// ReleaseRepository.
 const releaseAPIBaseURLEnv = "MULTICA_RELEASE_API_BASE_URL"
 const releaseDownloadBaseURLEnv = "MULTICA_RELEASE_DOWNLOAD_BASE_URL"
 
@@ -48,6 +69,31 @@ func releaseAPIBaseURL() string {
 	return defaultReleaseAPIBaseURL
 }
 
+// releaseRepository is the "owner/name" used for every latest/tag lookup.
+func releaseRepository() string {
+	return ReleaseRepository
+}
+
+// ReleaseWebURL is the human-facing page an operator should visit for this
+// build's releases. Diagnostics and install instructions print it instead of
+// hardcoding a URL, so they cannot point somewhere the binary does not update
+// from.
+func ReleaseWebURL() string {
+	return "https://github.com/" + ReleaseRepository
+}
+
+// ReleaseArchiveURL is the download URL for one asset of one release tag.
+func ReleaseArchiveURL(targetVersion, assetName string) string {
+	return fmt.Sprintf("%s/releases/download/%s/%s",
+		ReleaseWebURL(), url.PathEscape(normalizeReleaseTag(targetVersion)), url.PathEscape(assetName))
+}
+
+// releaseAPIPath builds the /repos/<repo>/releases/... path shared by the
+// latest and by-tag lookups, so the two can never disagree about the source.
+func releaseAPIPath(suffix string) string {
+	return "/repos/" + releaseRepository() + "/releases/" + suffix
+}
+
 func releaseDownloadBaseURL() string {
 	return strings.TrimRight(strings.TrimSpace(os.Getenv(releaseDownloadBaseURLEnv)), "/")
 }
@@ -58,6 +104,26 @@ func releaseAssetDownloadURL(assetName, targetVersion, fallback string) string {
 		return fallback
 	}
 	return fmt.Sprintf("%s/%s/%s", base, url.PathEscape(normalizeReleaseTag(targetVersion)), url.PathEscape(assetName))
+}
+
+// ErrNoBrewFormula reports that this build has no Homebrew formula to upgrade
+// through. The caller must surface it as an explicit failure rather than
+// silently falling back to a different formula.
+var ErrNoBrewFormula = errors.New("this build publishes no Homebrew formula")
+
+// BrewInstallBlockedError explains why a Homebrew-installed copy of this build
+// cannot be updated in place, and what to run instead. Both the CLI's `update`
+// command and the daemon's update path return it, so the two cannot give an
+// operator different instructions for the same situation.
+//
+// Replacing a keg's binary in place is not an option: brew owns that path, and
+// the next `brew upgrade` or `brew doctor` would either overwrite the
+// replacement or report a corrupted keg.
+func BrewInstallBlockedError(targetVersion, goos, goarch string) error {
+	return fmt.Errorf("this build is installed via Homebrew, but %s publishes no Homebrew formula;\n"+
+		"reinstall from this build's release archives instead:\n  %s",
+		ReleaseRepository,
+		ReleaseArchiveURL(targetVersion, ReleaseAssetName(targetVersion, goos, goarch)))
 }
 
 // GitHubRelease is the subset of the GitHub releases API response we need.
@@ -170,6 +236,8 @@ func normalizeReleaseTag(targetVersion string) string {
 	return tag
 }
 
+// releaseAssetCandidates lists the archive names a release may publish for one
+// platform, most-preferred first.
 func releaseAssetCandidates(targetVersion, goos, goarch string) []string {
 	tag := normalizeReleaseTag(targetVersion)
 	version := strings.TrimPrefix(tag, "v")
@@ -177,9 +245,18 @@ func releaseAssetCandidates(targetVersion, goos, goarch string) []string {
 	// Prefer the versioned name (current scheme); fall back to the legacy
 	// `multica_{os}_{arch}` name for releases that still ship it.
 	return []string{
-		fmt.Sprintf("multica-cli-%s-%s-%s.%s", version, goos, goarch, ext),
+		ReleaseAssetName(version, goos, goarch),
 		fmt.Sprintf("multica_%s_%s.%s", goos, goarch, ext),
 	}
+}
+
+// ReleaseAssetName is the versioned archive name for one platform, matching
+// .goreleaser.yml's `versioned` archive template. Exported so install
+// instructions and error messages print the exact asset the updater looks for
+// instead of a hand-written approximation that drifts.
+func ReleaseAssetName(version, goos, goarch string) string {
+	return fmt.Sprintf("multica-cli-%s-%s-%s.%s",
+		strings.TrimPrefix(normalizeReleaseTag(version), "v"), goos, goarch, releaseArchiveExtension(goos))
 }
 
 func findReleaseAsset(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) (*GitHubReleaseAsset, error) {
@@ -252,9 +329,17 @@ func verifyAssetSHA256(data []byte, expectedHex, assetName string) error {
 	return nil
 }
 
+// FetchReleaseByTag fetches one release's metadata from ReleaseRepository.
+// Unlike FetchLatestRelease it can name a specific tag, which is what a pinned
+// update and a rolled-back install both need: `latest` is a moving target, and
+// pinning is the only way to install a version that is not the newest one.
+func FetchReleaseByTag(tag string) (*GitHubRelease, error) {
+	return fetchReleaseByTag(normalizeReleaseTag(tag))
+}
+
 func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/tags/"+url.PathEscape(tag), nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("tags/"+url.PathEscape(tag)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -277,10 +362,10 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from the multica GitHub repo.
+// FetchLatestRelease fetches the latest release tag from ReleaseRepository.
 func FetchLatestRelease() (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/latest", nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("latest"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -346,10 +431,28 @@ func GetBrewPrefix() string {
 	return strings.TrimSpace(string(out))
 }
 
-// UpdateViaBrew runs `brew upgrade multica-ai/tap/multica`.
+// BrewFormulaName is the Homebrew formula this build upgrades through. It is a
+// build-time property for the same reason ReleaseRepository is: a distribution
+// build must never run `brew upgrade multica-ai/tap/multica`, because that
+// replaces it with an upstream binary that lacks its features.
+//
+// This distribution publishes no tap, so the default is empty and the brew
+// route fails closed. Defaulting to the upstream formula would make every
+// mistyped build silently downgrade to upstream, which is exactly the failure
+// the fork exists to prevent. A build that does ship a tap sets this at link
+// time via `-X .../cli.BrewFormulaName=owner/tap/name`.
+var BrewFormulaName = ""
+
+// UpdateViaBrew runs `brew upgrade <BrewFormulaName>`.
 // Returns the combined output and any error.
 func UpdateViaBrew() (string, error) {
-	cmd := exec.Command("brew", "upgrade", "multica-ai/tap/multica")
+	if BrewFormulaName == "" {
+		// Fail loudly rather than picking some other formula. An install with
+		// no tap of its own must update through the release archives, and the
+		// caller turns this into a message telling the operator how.
+		return "", ErrNoBrewFormula
+	}
+	cmd := exec.Command("brew", "upgrade", BrewFormulaName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("brew upgrade failed: %w", err)
