@@ -12,6 +12,12 @@ build
 bin
 dist-electron
 *.tsbuildinfo
+# `next dev` writes this rules file into each Next app directory on every
+# start, so running the dev server (or the browser smoke test) dirties the tree
+# with a file nobody authored. Scoped to the Next apps: apps/mobile/AGENTS.md is
+# a real, hand-written file and must stay tracked.
+apps/web/AGENTS.md
+apps/desktop/AGENTS.md
 # ...except electron-builder's source resources dir, which holds tracked
 # config files (entitlements, icons) — not build output.
 !apps/desktop/build/
