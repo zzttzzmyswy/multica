@@ -85,12 +85,35 @@ class Handler(BaseHTTPRequestHandler):
 
         releases = _releases()
 
+        # GitHub's real semantics: `/releases/latest` returns the newest
+        # NON-prerelease, non-draft release and 404s when there is none. Every
+        # distribution release is a prerelease, so this endpoint must 404 here
+        # too — an earlier fixture returned a prerelease from `latest` and
+        # therefore hid the fact that the CLI depended on an endpoint that can
+        # never answer. `latest` in the fixture file is honored only when it
+        # names a non-prerelease tag, exactly as GitHub would.
         if path.endswith("/releases/latest"):
-            tag = releases.get("latest")
-            if not tag:
+            tags = releases.get("tags", {})
+            candidates = [
+                (tag, rel) for tag, rel in tags.items()
+                if not rel.get("prerelease") and not rel.get("draft")
+            ]
+            if not candidates:
                 self._json({"message": "Not Found"}, 404)
                 return
-            self._json(releases["tags"][tag])
+            candidates.sort(key=lambda item: item[1].get("published_at", ""))
+            self._json(candidates[-1][1])
+            return
+
+        # The list endpoint includes prereleases and drafts=false, which is what
+        # the CLI's newest-build selection relies on. GitHub accepts both
+        # `/releases` and `/releases/`; the CLI builds the latter by appending a
+        # query string to the collection path, so both must answer.
+        if path.rstrip("/").endswith("/releases"):
+            tags = releases.get("tags", {})
+            listed = [rel for rel in tags.values() if not rel.get("draft")]
+            listed.sort(key=lambda rel: rel.get("published_at", ""), reverse=True)
+            self._json(listed)
             return
 
         if "/releases/tags/" in path:

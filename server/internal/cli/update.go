@@ -128,9 +128,15 @@ func BrewInstallBlockedError(targetVersion, goos, goarch string) error {
 
 // GitHubRelease is the subset of the GitHub releases API response we need.
 type GitHubRelease struct {
-	TagName string               `json:"tag_name"`
-	HTMLURL string               `json:"html_url"`
-	Assets  []GitHubReleaseAsset `json:"assets"`
+	TagName    string               `json:"tag_name"`
+	HTMLURL    string               `json:"html_url"`
+	Assets     []GitHubReleaseAsset `json:"assets"`
+	Prerelease bool                 `json:"prerelease"`
+	Draft      bool                 `json:"draft"`
+	// PublishedAt orders releases for newest-build selection. GitHub returns
+	// the list newest-first, but sorting on this field keeps the choice
+	// independent of that guarantee.
+	PublishedAt string `json:"published_at"`
 }
 
 // IsReleaseVersion reports whether v looks like a tagged release version
@@ -362,10 +368,60 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from ReleaseRepository.
+// FetchLatestRelease fetches the newest release of ReleaseRepository that this
+// build can actually install.
+//
+// It does NOT use the `/releases/latest` endpoint. Every distribution release is
+// a prerelease, and GitHub excludes prereleases from that endpoint — it would
+// return 404 no matter how many builds were published, which is exactly the
+// failure an operator would hit running `multica update` with no arguments.
+//
+// So the list endpoint is used and the newest distribution tag that carries an
+// archive for this platform is selected. Upstream releases that happen to share
+// the repository (a synced `v0.9.0`) are never selected: their tags lack the
+// distribution suffix, and installing one would replace this build with a
+// binary that has different behavior.
 func FetchLatestRelease() (*GitHubRelease, error) {
+	releases, err := listReleases()
+	if err != nil {
+		return nil, err
+	}
+
+	var newest *GitHubRelease
+	var newestVersion [4]int
+	for i := range releases {
+		release := &releases[i]
+		if release.Draft {
+			continue
+		}
+		if !IsDistributionTag(release.TagName) {
+			continue
+		}
+		if !hasReleaseAssetFor(release.Assets, release.TagName, runtime.GOOS, runtime.GOARCH) {
+			continue
+		}
+		version, ok := parseDistributionVersion(release.TagName)
+		if !ok {
+			continue
+		}
+		if newest == nil || versionGreater(version, newestVersion) {
+			newest, newestVersion = release, version
+		}
+	}
+	if newest == nil {
+		return nil, fmt.Errorf("no published distribution build for %s/%s in %s",
+			runtime.GOOS, runtime.GOARCH, ReleaseRepository)
+	}
+	return newest, nil
+}
+
+// listReleases fetches one page of releases. The list endpoint includes
+// prereleases, which is the whole reason it is used instead of `latest`.
+func listReleases() ([]GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("latest"), nil)
+	// per_page=100 is GitHub's maximum; the newest distribution build is always
+	// in the first page because releases are returned newest-first.
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("?per_page=100"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -381,11 +437,68 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 		return nil, fmt.Errorf("release API returned %d", resp.StatusCode)
 	}
 
-	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return nil, err
+	var releases []GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("decode release list: %w", err)
 	}
-	return &release, nil
+	return releases, nil
+}
+
+// DistributionTagSuffix marks a release as this distribution's build.
+const DistributionTagSuffix = "-myswy."
+
+// IsDistributionTag reports whether tag is one of this distribution's releases
+// (vX.Y.Z-myswy.N) rather than an upstream tag synced into the same repository.
+func IsDistributionTag(tag string) bool {
+	return strings.Contains(tag, DistributionTagSuffix)
+}
+
+// parseDistributionVersion splits vX.Y.Z-myswy.N into its four numeric
+// components. A tag of any other shape returns false.
+func parseDistributionVersion(tag string) ([4]int, bool) {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(tag), "v")
+	base, tail, found := strings.Cut(trimmed, DistributionTagSuffix)
+	if !found {
+		return [4]int{}, false
+	}
+
+	core, ok := parseReleaseVersion(base)
+	if !ok {
+		return [4]int{}, false
+	}
+
+	// The build number is the leading digits of the tail; a trailing suffix
+	// ("1-rc1") is not something this distribution publishes, so it is refused
+	// rather than silently compared as 1.
+	digits := tail
+	if i := strings.IndexFunc(tail, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+		digits = tail[:i]
+	}
+	if digits == "" {
+		return [4]int{}, false
+	}
+	build, err := strconv.Atoi(digits)
+	if err != nil {
+		return [4]int{}, false
+	}
+	return [4]int{core[0], core[1], core[2], build}, true
+}
+
+func versionGreater(a, b [4]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
+}
+
+// hasReleaseAssetFor reports whether a release publishes an archive this
+// platform can install. A release that only built other platforms must be
+// skipped, not selected and then failed at download time.
+func hasReleaseAssetFor(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) bool {
+	_, err := findReleaseAsset(assets, targetVersion, goos, goarch)
+	return err == nil
 }
 
 // knownBrewPrefixes lists the install roots Homebrew uses on each platform.

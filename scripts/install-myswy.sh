@@ -23,6 +23,12 @@
 #   * Without --version, this script lists the published distribution tags and
 #     installs the highest one. It never falls back to an upstream release.
 #
+# Requirements: curl, tar, and python3 for JSON parsing. python3 is not
+# optional and is checked before anything is downloaded. A hand-rolled text
+# parser cannot be used here: the releases payload nests objects (uploader,
+# author, reactions) and the order of `assets` entries is not fixed, so both
+# "split on }" and "grep for the asset name" misparse real responses.
+#
 # Security: every downloaded archive is verified against the release's
 # checksums.txt before the binary is moved into place. A missing manifest or a
 # digest mismatch aborts the install.
@@ -112,49 +118,91 @@ api_get() {
   curl -fsSL "$url"
 }
 
-# Every distribution release tag that has an archive for this platform,
-# newest first. Reads the releases list rather than /releases/latest because
-# every distribution tag is a prerelease, which the `latest` endpoint excludes.
-#
-# Ordering is done in awk rather than `sort -V`: BSD sort (macOS) has no -V, so
-# a -V sort works on Linux CI and silently misorders on a developer's Mac.
-# The comparison is the one that actually matters here — numeric X.Y.Z, then
-# the N in `-myswy.N` — and a tag without the suffix never reaches it.
+# JSON helper. python3 is a hard requirement, checked up front rather than
+# discovered halfway through a download. A text/awk parser is not an option:
+# the releases payload nests objects and the order of `assets` is not fixed, so
+# any "split the document and match nearby strings" approach misparses real
+# responses (it passes only while the wanted asset happens to be first).
+JSON_PY='
+import json, sys
+
+mode = sys.argv[1]
+suffix = sys.argv[2]
+asset_suffix = sys.argv[3]
+
+try:
+    data = json.load(sys.stdin)
+except Exception as exc:
+    sys.stderr.write("release API returned invalid JSON: %s\n" % exc)
+    sys.exit(2)
+
+# A single release object, or the list endpoint. Normalize to a list.
+releases = data if isinstance(data, list) else [data]
+
+def version_key(tag):
+    """Sort key for vX.Y.Z-myswy.N: numeric X.Y.Z, then the build number N.
+
+    A tag missing the distribution suffix never reaches this point. Anything
+    unparsable sorts below every well-formed tag instead of crashing, so one
+    odd release cannot make the whole list unusable.
+    """
+    core = tag[1:] if tag.startswith("v") else tag
+    base, _, tail = core.partition("-myswy.")
+    try:
+        major, minor, patch = (int(part) for part in base.split("."))
+    except Exception:
+        return (-1, -1, -1, -1)
+    try:
+        build = int(tail.split(".")[0]) if tail else 0
+    except Exception:
+        build = 0
+    return (major, minor, patch, build)
+
+def has_asset(release, asset_suffix):
+    for asset in release.get("assets") or []:
+        name = asset.get("name") or ""
+        if name.startswith("multica-cli-") and name.endswith(asset_suffix):
+            return True
+    return False
+
+if mode == "highest":
+    tags = [
+        release["tag_name"]
+        for release in releases
+        if isinstance(release, dict)
+        and isinstance(release.get("tag_name"), str)
+        and suffix in release["tag_name"]
+        and has_asset(release, asset_suffix)
+    ]
+    if not tags:
+        sys.exit(1)
+    print(max(tags, key=version_key))
+elif mode == "assets":
+    # Asset names of the single release on stdin, one per line.
+    for asset in data.get("assets") or []:
+        name = asset.get("name")
+        if name:
+            print(name)
+else:
+    sys.stderr.write("unknown mode %r\n" % mode)
+    sys.exit(2)
+'
+
+require_json_parser() {
+  command_exists python3 && return 0
+  fail "python3 is required to read the release metadata but was not found on PATH.
+  Install python3 and re-run; the installer will not guess at JSON without it."
+}
+
+# Every distribution release tag that has an archive for this platform, newest
+# first. Reads the releases list rather than /releases/latest because every
+# distribution tag is a prerelease, which the `latest` endpoint excludes.
 list_distribution_tags() {
   local json
   json="$(api_get "${REPO_API_URL}/releases?per_page=100")" ||
     fail "Could not list releases from ${REPO_WEB_URL}. Check your network connection."
 
-  printf '%s' "$json" | awk -v suffix="$DISTRIBUTION_SUFFIX" -v asset_suffix="-${OS}-${ARCH}.tar.gz" '
-    # Walk the JSON as flat text: collect each tag_name and the asset names in
-    # its release object. Small, fixed response shape; no jq dependency.
-    {
-      text = text $0 "\n"
-    }
-    END {
-      n = split(text, parts, "}")
-      for (i = 1; i <= n; i++) {
-        chunk = parts[i]
-        if (match(chunk, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/) == 0) continue
-        tag = substr(chunk, RSTART, RLENGTH)
-        sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
-        sub(/"$/, "", tag)
-        if (index(tag, suffix) == 0) continue
-        version = tag
-        sub(/^v/, "", version)
-        if (index(chunk, "\"multica-cli-" version asset_suffix "\"") == 0) continue
-
-        # X.Y.Z for the base, then N for the distribution build number.
-        base = version
-        sub(/-.*$/, "", base)
-        dist = version
-        if (sub(/.*-myswy\./, "", dist) == version) dist = 0
-        sub(/\..*$/, "", dist)
-        split(base, b, ".")
-        printf "%010d %010d %010d %010d\t%s\n", b[1], b[2], b[3], dist, tag
-      }
-    }
-  ' | sort -r | cut -f2
+  printf '%s' "$json" | python3 -c "$JSON_PY" highest "$DISTRIBUTION_SUFFIX" "-${OS}-${ARCH}.tar.gz"
 }
 
 resolve_target_version() {
@@ -166,8 +214,18 @@ resolve_target_version() {
     return 0
   fi
 
-  local tags newest
+  local tags newest status
+  # Capture the exit status explicitly: `fail` must report "no published build",
+  # while a JSON parse error must report a parse error. Collapsing both into an
+  # empty string would tell an operator their release is missing when the real
+  # problem is an unreadable API response.
+  set +e
   tags="$(list_distribution_tags)"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+    fail "Could not read the release list from ${REPO_WEB_URL} (parser exit ${status})."
+  fi
   if [ -z "$tags" ]; then
     fail "No published build for ${OS}/${ARCH} was found in ${REPO_WEB_URL}.
   If this is unexpected, check ${REPO_WEB_URL}/releases — an archive named
@@ -265,6 +323,7 @@ main() {
   done
 
   detect_platform
+  require_json_parser
 
   local current target
   current="$(installed_version || true)"

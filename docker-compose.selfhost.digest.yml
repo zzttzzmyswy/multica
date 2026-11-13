@@ -1,0 +1,33 @@
+# Digest-pinned image override for the self-host distribution.
+#
+#   docker compose -f docker-compose.selfhost.yml \
+#                  -f docker-compose.selfhost.digest.yml up -d
+#   # or: make selfhost-digest
+#
+# Why a separate file: docker-compose.selfhost.yml resolves an image as
+# `<repo>:${MULTICA_IMAGE_TAG}`, and Compose interpolation cannot test whether a
+# value already carries a `@digest` or `:tag`. Setting
+# MULTICA_BACKEND_IMAGE=ghcr.io/.../multica-backend@sha256:<digest> there
+# therefore produced `ghcr.io/.../multica-backend@sha256:<digest>:v0.9.0-myswy.1`,
+# which Docker rejects as an invalid reference format — so digest pinning was
+# documented but unusable.
+#
+# This file replaces both image references outright, so the whole reference is
+# whatever the operator pins. Set the two variables to a complete
+# `name@sha256:<64 hex>` reference; there is no tag appended to them.
+#
+# A digest is the only immutable pin: a tag can be re-pushed, a digest cannot.
+# Take the value from the release run's image-merge job output, or:
+#
+#   docker buildx imagetools inspect \
+#     ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.1 --format '{{json .Manifest}}'
+#
+# Leaving a variable empty fails the boot rather than silently falling back to a
+# tag, because "I meant to pin this" and "I forgot" must not look the same.
+
+services:
+  backend:
+    image: ${MULTICA_BACKEND_DIGEST:?MULTICA_BACKEND_DIGEST must be a full image@sha256:<digest> reference}
+
+  frontend:
+    image: ${MULTICA_WEB_DIGEST:?MULTICA_WEB_DIGEST must be a full image@sha256:<digest> reference}

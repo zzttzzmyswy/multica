@@ -1,4 +1,4 @@
-.PHONY: help makehelp dev server daemon cli multica build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
+.PHONY: help makehelp dev server daemon cli multica build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-digest selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
 
 MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
@@ -110,6 +110,24 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 	fi
 	@echo "==> Starting Multica via Docker Compose..."
 	$(COMPOSE) -f docker-compose.selfhost.yml up -d
+	@bash scripts/selfhost-wait.sh official
+
+selfhost-digest: ## Start the self-hosted stack from digest-pinned images (MULTICA_{BACKEND,WEB}_DIGEST)
+	$(REQUIRE_COMPOSE)
+	@if [ ! -f .env ]; then \
+		echo "Missing .env. Run 'make selfhost' once, or copy .env.example to .env."; \
+		exit 1; \
+	fi
+	@if [ -z "$${MULTICA_BACKEND_DIGEST:-}" ] || [ -z "$${MULTICA_WEB_DIGEST:-}" ]; then \
+		echo "MULTICA_BACKEND_DIGEST and MULTICA_WEB_DIGEST must both be set to a full"; \
+		echo "'ghcr.io/zzttzzmyswy/multica-{backend,web}@sha256:<digest>' reference."; \
+		echo "A digest is the only immutable pin; see docs/self-host-distribution.md."; \
+		exit 1; \
+	fi
+	@echo "==> Pulling digest-pinned images..."
+	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.digest.yml pull
+	@echo "==> Starting Multica via Docker Compose (digest-pinned)..."
+	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.digest.yml up -d
 	@bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack

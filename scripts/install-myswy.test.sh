@@ -111,25 +111,116 @@ STUB
   chmod +x "$stub_dir/curl"
 }
 
-# A releases list with the given tags, each advertising the standard linux
-# archive names.
+# A releases list shaped like GitHub's real response.
+#
+# The nesting is the point: a real release object carries `author`, `uploader`
+# and `reactions` sub-objects, and the order of `assets` is not guaranteed. An
+# earlier version of the installer split the document on `}` and required the
+# tag and the wanted asset to land in the same fragment, which passed only while
+# the archive happened to be assets[0]. These fixtures put the wanted archive at
+# several positions and include nested objects, so a reintroduced text parser
+# fails here instead of on an operator's machine.
+#
+# Argument 1 is the destination. Each further argument is
+# "tag:asset-order", where asset-order is one of:
+#   archive-first    archive, checksums.txt
+#   checksums-first  checksums.txt, archive
+#   with-noise       checksums.txt, a source tarball, archive, another asset
+# A bare "tag" means archive-first.
 write_releases_json() {
   local dest=$1
   shift
-  {
-    printf '['
-    local first=1 tag version
-    for tag in "$@"; do
-      version="${tag#v}"
-      [ "$first" = 1 ] || printf ','
-      first=0
-      printf '{"tag_name":"%s","prerelease":true,"assets":[' "$tag"
-      printf '{"name":"multica-cli-%s-linux-amd64.tar.gz"},' "$version"
-      printf '{"name":"multica-cli-%s-linux-arm64.tar.gz"},' "$version"
-      printf '{"name":"checksums.txt"}]}'
-    done
-    printf ']'
-  } >"$dest"
+  python3 - "$dest" "$@" <<'PY'
+import json, sys
+
+dest = sys.argv[1]
+specs = sys.argv[2:]
+
+# Nested objects are taken from a real GitHub releases payload so the fixture
+# exercises the same shape the installer sees in production.
+UPLOADER = {
+    "login": "zzttzzmyswy",
+    "id": 46914680,
+    "node_id": "MDQ6VXNlcjQ2OTE0Njgw",
+    "avatar_url": "https://avatars.githubusercontent.com/u/46914680?v=4",
+    "type": "User",
+    "site_admin": False,
+}
+AUTHOR = {
+    "login": "github-actions[bot]",
+    "id": 41898282,
+    "node_id": "MDM6Qm90NDE4OTgyODI=",
+    "type": "Bot",
+    "site_admin": False,
+}
+REACTIONS = {"url": "https://api.github.com/repos/x/y/releases/1/reactions", "total_count": 0, "+1": 0, "-1": 0}
+
+releases = []
+for index, spec in enumerate(specs):
+    tag, _, order = spec.partition(":")
+    order = order or "archive-first"
+    version = tag.lstrip("v")
+
+    archive = {
+        "name": "multica-cli-%s-linux-amd64.tar.gz" % version,
+        "content_type": "application/gzip",
+        "size": 12345678,
+        "download_count": 0,
+        "uploader": UPLOADER,
+    }
+    arm64 = {
+        "name": "multica-cli-%s-linux-arm64.tar.gz" % version,
+        "content_type": "application/gzip",
+        "size": 12000000,
+        "uploader": UPLOADER,
+    }
+    checksums = {
+        "name": "checksums.txt",
+        "content_type": "text/plain",
+        "size": 900,
+        "uploader": UPLOADER,
+    }
+    source = {
+        "name": "Source code (tar.gz)",
+        "content_type": "application/x-gzip",
+        "size": 5000000,
+        "uploader": UPLOADER,
+    }
+
+    if order == "checksums-first":
+        assets = [checksums, archive, arm64]
+    elif order == "with-noise":
+        assets = [checksums, source, archive, {"name": "multica_darwin_amd64.tar.gz", "uploader": UPLOADER}]
+    else:
+        assets = [archive, arm64, checksums]
+
+    releases.append({
+        "url": "https://api.github.com/repos/zzttzzmyswy/multica/releases/%d" % (1000 + index),
+        "assets_url": "https://api.github.com/repos/zzttzzmyswy/multica/releases/%d/assets" % (1000 + index),
+        "upload_url": "https://uploads.github.com/repos/zzttzzmyswy/multica/releases/%d/assets{?name,label}" % (1000 + index),
+        "html_url": "https://github.com/zzttzzmyswy/multica/releases/tag/%s" % tag,
+        "id": 1000 + index,
+        "node_id": "RE_kwDOABCDEF%d" % index,
+        "tag_name": tag,
+        "target_commitish": "main",
+        "name": tag,
+        "draft": False,
+        # Every distribution tag is a prerelease, which is what makes
+        # /releases/latest skip it.
+        "prerelease": True,
+        "created_at": "2026-11-14T00:00:%02dZ" % index,
+        "published_at": "2026-11-14T00:01:%02dZ" % index,
+        "author": AUTHOR,
+        "assets": assets,
+        "tarball_url": "https://api.github.com/repos/zzttzzmyswy/multica/tarball/%s" % tag,
+        "zipball_url": "https://api.github.com/repos/zzttzzmyswy/multica/zipball/%s" % tag,
+        "body": "See CHANGELOG. Contains braces } and {\"quoted\": \"json\"} on purpose.",
+        "reactions": REACTIONS,
+    })
+
+with open(dest, "w", encoding="utf-8") as handle:
+    json.dump(releases, handle, indent=2)
+PY
 }
 
 # Runs the installer with stubs on PATH and an empty HOME, so the real user's
@@ -390,6 +481,116 @@ if grep -qi "no published build" "$TMP/empty.err"; then
   ok "the failure names the missing build"
 else
   bad "the failure message does not explain the situation: $(cat "$TMP/empty.err" 2>/dev/null)"
+fi
+
+step "Asset order inside a release does not change which build is chosen"
+# The reported defect: with checksums.txt as assets[0] and the archive second,
+# the old text parser reported "No published build". Both orders must resolve to
+# the same tag.
+for order in archive-first checksums-first with-noise; do
+  reset_sandbox
+  write_curl_stub "$TMP/stub-bin"
+  build_release_assets "0.9.0-myswy.1" >/dev/null
+  build_release_assets "0.9.0-myswy.2" >/dev/null
+  write_releases_json "$TMP/releases.json" "v0.9.0-myswy.1:$order" "v0.9.0-myswy.2:$order"
+
+  if run_installer "order-$order"; then
+    if "$TMP/install-bin/multica" version 2>/dev/null | grep -q "0.9.0-myswy.2"; then
+      ok "assets in order '$order' resolved to v0.9.0-myswy.2"
+    else
+      bad "assets in order '$order' installed $("$TMP/install-bin/multica" version 2>/dev/null || echo missing), want 0.9.0-myswy.2"
+    fi
+  else
+    bad "assets in order '$order' made the installer fail: $(cat "$TMP/order-$order.err" 2>/dev/null)"
+  fi
+done
+
+step "A release whose assets lack this platform's archive is skipped, not fatal"
+# A darwin-only release sorts highest; the installer must skip it and fall back
+# to the newest release that actually has a linux/amd64 archive.
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+build_release_assets "0.9.0-myswy.1" >/dev/null
+write_releases_json "$TMP/releases.json" "v0.9.0-myswy.1"
+python3 - "$TMP/releases.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+releases = json.load(open(path))
+# A higher version that published no linux archive at all.
+releases.insert(0, {
+    "tag_name": "v9.9.9-myswy.1",
+    "prerelease": True,
+    "assets": [{"name": "multica-cli-9.9.9-myswy.1-darwin-arm64.tar.gz"}],
+})
+json.dump(releases, open(path, "w"))
+PY
+
+run_installer noplatform || true
+if "$TMP/install-bin/multica" version 2>/dev/null | grep -q "0.9.0-myswy.1"; then
+  ok "skipped the platform-less release and installed the newest usable one"
+else
+  bad "did not fall back past a release with no linux/amd64 archive: $("$TMP/install-bin/multica" version 2>/dev/null || echo missing)"
+fi
+
+step "Nested objects and braces in the release body do not confuse the parser"
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+build_release_assets "0.9.0-myswy.1" >/dev/null
+write_releases_json "$TMP/releases.json" "v0.9.0-myswy.1:with-noise"
+
+run_installer nested || true
+if "$TMP/install-bin/multica" version 2>/dev/null | grep -q "0.9.0-myswy.1"; then
+  ok "parsed a payload with uploader/author/reactions objects and brace-bearing body text"
+else
+  bad "failed on the real GitHub response shape: $(cat "$TMP/nested.err" 2>/dev/null)"
+fi
+
+step "Malformed JSON is reported as a parse error, not as a missing release"
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+printf '{"not":"a list of releases"' >"$TMP/releases.json"
+
+if run_installer malformed; then
+  bad "installer succeeded on malformed JSON"
+else
+  ok "installer failed on malformed JSON"
+fi
+if grep -qi "no published build" "$TMP/malformed.err"; then
+  bad "malformed JSON was reported as a missing release, which misdiagnoses the cause"
+else
+  ok "malformed JSON was not misreported as a missing release"
+fi
+
+step "A missing python3 fails with an explicit requirement, before any download"
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+build_release_assets "0.9.0-myswy.1" >/dev/null
+write_releases_json "$TMP/releases.json" "v0.9.0-myswy.1"
+# A PATH that resolves the tools the installer needs but not python3. /bin and
+# /usr/bin both ship python3 on most hosts, so the only way to model an absent
+# interpreter is to build a bin directory of explicit symlinks.
+nopy_dir="$TMP/no-python-bin"
+mkdir -p "$nopy_dir"
+for tool in bash sh uname mktemp curl tar awk sed grep tr head cat mkdir mv chmod ls rm cd \
+  sha256sum shasum dirname basename sort od date; do
+  real="$(command -v "$tool" 2>/dev/null)" || continue
+  ln -sf "$real" "$nopy_dir/$tool"
+done
+if env -i PATH="$TMP/stub-bin:$nopy_dir" HOME="$TMP/home" MULTICA_BIN_DIR="$TMP/install-bin" \
+  CURL_LOG="$TMP/curl.log" RELEASES_JSON="$TMP/releases.json" PAYLOAD_DIR="$TMP/payload" \
+  bash "$INSTALLER" --check >"$TMP/nopy.out" 2>"$TMP/nopy.err"; then
+  bad "installer succeeded without python3"
+else
+  if grep -qi "python3 is required" "$TMP/nopy.err"; then
+    ok "the failure names python3 as a requirement"
+  else
+    bad "the failure does not explain that python3 is required: $(cat "$TMP/nopy.err" 2>/dev/null)"
+  fi
+fi
+if grep -q "/releases?per_page=100" "$TMP/curl.log" 2>/dev/null; then
+  bad "the installer reached the release API before checking for python3"
+else
+  ok "the requirement is checked before any network access"
 fi
 
 step "A mirror override is honoured for both the archive and its manifest"

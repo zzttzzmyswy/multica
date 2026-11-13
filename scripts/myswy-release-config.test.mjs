@@ -73,6 +73,21 @@ test("the distribution GoReleaser config publishes no Homebrew formula", () => {
   // fail (no token) or, worse, publish into the upstream tap.
   assert.equal(config.brews, undefined, ".goreleaser.myswy.yml must not declare a Homebrew formula");
 
+  // Prerelease policy must be explicit. GoReleaser's defaults are
+  // prerelease=false and make_latest=true; a `-myswy.N` tag suffix does not
+  // change them unless `prerelease: "auto"` is set. Leaving both unset would
+  // publish the release as a normal release AND claim GitHub's "latest" pointer.
+  assert.equal(
+    config.release?.prerelease,
+    true,
+    "distribution releases must be explicit prereleases, not rely on GoReleaser defaults",
+  );
+  assert.equal(
+    String(config.release?.make_latest),
+    "false",
+    "a prerelease must never become GitHub's latest release",
+  );
+
   // Re-running a release must not swap already-published bytes.
   assert.equal(
     config.release?.replace_existing_artifacts,
@@ -155,6 +170,64 @@ test("the distribution release workflow publishes only fork namespaces", () => {
     text,
     /--config \.goreleaser\.myswy\.yml/,
     "GoReleaser must run with the fork's config, whose absence of a brew section is what keeps upstream's tap untouched",
+  );
+
+  // Nothing may publish without the overwrite guard. replace_existing_artifacts
+  // protects the GitHub release only; GHCR tags are written unconditionally by
+  // the merge jobs, so a rerun could replace a pinned digest.
+  assert.ok(workflow.jobs?.guard, "the workflow must define an overwrite guard job");
+  for (const jobName of ["cli", "docker-backend-build", "docker-web-build"]) {
+    const needs = workflow.jobs?.[jobName]?.needs ?? [];
+    const list = Array.isArray(needs) ? needs : [needs];
+    assert.ok(
+      list.includes("guard"),
+      `${jobName} must depend on the guard so nothing publishes over an existing tag`,
+    );
+  }
+  assert.match(
+    text,
+    /myswy-release-guard\.sh/,
+    "the guard job must run the overwrite guard script",
+  );
+});
+
+test("a Homebrew-installed build cannot be silently downgraded", () => {
+  const updateGo = read("../server/internal/cli/update.go");
+  // The daemon's update path must go through the package seam; calling
+  // cli.IsBrewInstall directly made the branch unreachable from a test.
+  const daemonGo = read("../server/internal/daemon/daemon.go");
+  assert.match(
+    daemonGo,
+    /if isBrewInstall\(\) \{/,
+    "daemon runUpdate must use the isBrewInstall seam",
+  );
+  assert.match(updateGo, /var BrewFormulaName = ""/, "BrewFormulaName must default to empty");
+});
+
+test("the CLI resolves its newest build from the release list, not /releases/latest", () => {
+  // Every distribution release is a prerelease, and GitHub excludes
+  // prereleases from /releases/latest — that endpoint 404s for this repository
+  // no matter how many builds exist. Reading it and giving up was the reported
+  // defect, so this asserts the shape of the lookup.
+  const updateGo = read("../server/internal/cli/update.go");
+
+  const latestFn = /func FetchLatestRelease\(\)[\s\S]*?\n\}/.exec(updateGo);
+  assert.ok(latestFn, "update.go must define FetchLatestRelease");
+  assert.doesNotMatch(
+    latestFn[0],
+    /releaseAPIPath\("latest"\)/,
+    "FetchLatestRelease must not request /releases/latest: prereleases are invisible there",
+  );
+  assert.match(
+    latestFn[0],
+    /listReleases\(\)/,
+    "FetchLatestRelease must read the release list",
+  );
+  assert.match(updateGo, /func listReleases\(\)/, "update.go must define listReleases");
+  assert.match(
+    updateGo,
+    /per_page=100/,
+    "the list request must ask for a full page of releases",
   );
 });
 

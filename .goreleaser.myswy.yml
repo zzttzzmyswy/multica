@@ -22,15 +22,28 @@ version: 2
 project_name: multica
 
 release:
-  # A non-prerelease tag publishes a GitHub release; the distribution tags all
-  # carry a `-myswy.N` suffix, so GoReleaser's `prerelease: auto` default marks
-  # them prereleases. That is deliberate — see docs/self-host-distribution.md.
+  # Every distribution tag is a prerelease, and that is stated explicitly rather
+  # than inherited. GoReleaser's defaults are prerelease=false and
+  # make_latest=true: a tag carrying a `-myswy.N` suffix does NOT make the
+  # release a prerelease unless `prerelease: "auto"` is set, and an earlier
+  # version of this file assumed `auto` was the default. With the real defaults
+  # the release would have been published as a normal GitHub release and marked
+  # "latest", which is exactly the state this distribution must not be in: the
+  # updater's `/releases/latest` lookups and any `latest`-following tooling would
+  # pick a build whose artifacts are never replaced.
+  #
+  # `prerelease: true` is unconditional rather than "auto" on purpose: a tag
+  # that somehow lacked the suffix would otherwise silently publish as a normal
+  # release. The workflow rejects such tags before this runs.
+  prerelease: true
+  # A prerelease must never claim GitHub's "latest release" pointer.
+  make_latest: "false"
   #
   # replace_existing_artifacts is FALSE, unlike upstream's config. A published
   # version's bytes are what an installed CLI verified against its checksum, so
   # a same-tag rerun must fail rather than swap the artifact underneath it. The
-  # documented recovery for a partial publish is a new patch version, which
-  # costs one tag and keeps every version immutable and auditable.
+  # documented recovery for a partial publish is a new build number (myswy.N+1),
+  # which costs one tag and keeps every version immutable and auditable.
   replace_existing_artifacts: false
 
 builds:

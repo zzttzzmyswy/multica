@@ -132,7 +132,11 @@
     ".github/workflows/release-myswy.yml",
     "docs/self-host-distribution.md",
     ".github/workflows/release.yml",
-    ".goreleaser.yml"
+    ".goreleaser.yml",
+    "scripts/myswy-release-guard.sh",
+    "scripts/myswy-release-guard.test.sh",
+    "docker-compose.selfhost.digest.yml",
+    "deploy/helm/multica/Chart.yaml"
   ],
   "installer": [
     "scripts/install.sh",
@@ -153,7 +157,11 @@
     "scripts/myswy-release-config.test.mjs",
     ".goreleaser.myswy.yml",
     ".github/workflows/release-myswy.yml",
-    "docs/self-host-distribution.md"
+    "docs/self-host-distribution.md",
+    "scripts/myswy-release-guard.sh",
+    "scripts/myswy-release-guard.test.sh",
+    "docker-compose.selfhost.digest.yml",
+    "deploy/helm/multica/Chart.yaml"
   ],
   "images": [
     "**/*.png",

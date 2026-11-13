@@ -558,4 +558,80 @@ for shadowed_alias in BACKEND_PORT API_PORT SERVER_PORT; do
   require_consistent "env-file ${shadowed_alias} over the same shell variable" 9700
 done
 
+# ---------------------------------------------------------------------------
+# Image references must render to something Docker can parse.
+#
+# The tag path always worked. The digest path did not: the base compose file
+# appends `:${MULTICA_IMAGE_TAG}` unconditionally, so a pinned
+# `name@sha256:<digest>` rendered as `name@sha256:<digest>:v0.9.0-myswy.1` and
+# `docker image inspect` rejected it as an invalid reference format. These cases
+# render the actual configuration and validate the reference shape, without
+# touching a registry.
+# ---------------------------------------------------------------------------
+require_image_ref() {
+  local label=$1 rendered=$2
+  local ref
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    case "$ref" in
+      # postgres is a normal tag and is not part of this check.
+      pgvector/*) continue ;;
+    esac
+    if ! printf '%s' "$ref" | grep -Eq '^[a-z0-9./_-]+(:[A-Za-z0-9._-]+|@sha256:[0-9a-f]{64})$'; then
+      echo "  [$label] invalid image reference: $ref"
+      exit 1
+    fi
+  done <<<"$rendered"
+}
+
+digest="$(printf 'a%.0s' $(seq 1 64))"
+backend_repo="ghcr.io/zzttzzmyswy/multica-backend"
+web_repo="ghcr.io/zzttzzmyswy/multica-web"
+
+# 1. Default (tag) rendering is a valid reference.
+tagged="$(
+  JWT_SECRET="$JWT_SECRET" docker compose --env-file "$tmp_env" \
+    -f docker-compose.selfhost.yml config --images
+)"
+require_image_ref "default tag" "$tagged"
+if ! grep -Fxq "${backend_repo}:v0.9.0-myswy.1" <<<"$tagged"; then
+  echo "  default backend image is not the pinned distribution tag:"
+  echo "$tagged"
+  exit 1
+fi
+
+# 2. Digest rendering reproduces exactly the requested reference — no tag
+#    appended, no doubled separator.
+pinned="$(
+  JWT_SECRET="$JWT_SECRET" \
+    MULTICA_BACKEND_DIGEST="${backend_repo}@sha256:${digest}" \
+    MULTICA_WEB_DIGEST="${web_repo}@sha256:${digest}" \
+    docker compose --env-file "$tmp_env" \
+      -f docker-compose.selfhost.yml \
+      -f docker-compose.selfhost.digest.yml config --images
+)"
+require_image_ref "pinned digest" "$pinned"
+for want in "${backend_repo}@sha256:${digest}" "${web_repo}@sha256:${digest}"; do
+  if ! grep -Fxq "$want" <<<"$pinned"; then
+    echo "  digest-pinned config did not render $want:"
+    echo "$pinned"
+    exit 1
+  fi
+done
+if grep -q "${digest}:" <<<"$pinned"; then
+  echo "  a tag was appended after a digest, which Docker rejects:"
+  echo "$pinned"
+  exit 1
+fi
+
+# 3. A missing digest must fail rather than silently falling back to a tag.
+if JWT_SECRET="$JWT_SECRET" docker compose --env-file "$tmp_env" \
+  -f docker-compose.selfhost.yml -f docker-compose.selfhost.digest.yml config --images \
+  >/dev/null 2>&1; then
+  echo "  digest override accepted an empty digest; it must require one"
+  exit 1
+fi
+
+echo "self-host image references ok"
+
 echo "self-host env derivation ok"

@@ -29,6 +29,14 @@
 # any more: `make selfhost` (via scripts/selfhost-wait.sh) and both installers
 # read it back with `docker compose port`, so the health check and the printed
 # URL always match what was actually published.
+#
+# Image references: MULTICA_IMAGE_TAG selects a tag, and
+# docker-compose.selfhost.digest.yml exists for a digest-pinned deployment.
+# Digest pinning cannot be expressed here by substitution: Compose has no way to
+# ask "does this value already contain @" or ":", so appending `:${...TAG}`
+# unconditionally produced `...@sha256:<digest>:v0.9.0-myswy.1`, which Docker
+# rejects as an invalid reference format. The override file sets complete
+# references instead, and `make selfhost-digest` below points at it.
 
 name: multica
 

@@ -59,10 +59,13 @@ func runUpdate(_ *cobra.Command, _ []string) error {
 	} else {
 		target, err = cli.FetchLatestRelease()
 		if err != nil {
-			// Do not fall through to a download with no target: the previous
-			// behavior printed a warning and then failed at a second lookup,
-			// which read like a network blip rather than "no release found".
-			return fmt.Errorf("could not check the latest release in %s: %w", cli.ReleaseRepository, err)
+			// The list-based lookup can legitimately find nothing (no build
+			// published yet for this platform). Say so, and give the pinned
+			// form, instead of a bare "release API returned 404".
+			return fmt.Errorf("could not find a published distribution build in %s: %w\n"+
+				"Install one exact version instead:\n  multica update --version vX.Y.Z-myswy.N\n"+
+				"List the available tags at %s/releases",
+				cli.ReleaseRepository, err, cli.ReleaseWebURL())
 		}
 	}
 

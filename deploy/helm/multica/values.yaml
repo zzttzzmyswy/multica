@@ -4,13 +4,16 @@
 images:
   backend:
     repository: ghcr.io/zzttzzmyswy/multica-backend
-    # Empty defaults to Chart.appVersion. Released OCI charts set appVersion to
-    # the Git tag (for example v0.3.5), so installs use matching app images.
+    # Empty falls back to Chart.appVersion, which this chart pins to a real
+    # distribution release (vX.Y.Z-myswy.N). This distribution publishes no
+    # `latest` tag, so an empty tag used to render
+    # `ghcr.io/zzttzzmyswy/multica-backend:latest`, which never pulls.
+    # Set explicitly to deploy a different published build.
     tag: ""
     pullPolicy: IfNotPresent
   frontend:
     repository: ghcr.io/zzttzzmyswy/multica-web
-    # Empty defaults to Chart.appVersion. Set explicitly to override.
+    # Empty falls back to Chart.appVersion; see the backend note above.
     tag: ""
     pullPolicy: IfNotPresent
   postgres:

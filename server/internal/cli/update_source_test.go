@@ -19,6 +19,9 @@ type releaseRecorder struct {
 	latestTag string
 	tags      map[string]string // normalized tag -> tag name to echo back
 	assets    []GitHubReleaseAsset
+	// releases backs the list endpoint, which is what newest-build selection
+	// reads.
+	releases []GitHubRelease
 }
 
 func (r *releaseRecorder) record(path string) {
@@ -41,6 +44,8 @@ func (r *releaseRecorder) server(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/releases/latest"):
+			// GitHub excludes prereleases here. Serving one would recreate the
+			// fixture that hid the reported defect.
 			if r.latestTag == "" {
 				http.NotFound(w, req)
 				return
@@ -54,6 +59,8 @@ func (r *releaseRecorder) server(t *testing.T) *httptest.Server {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(GitHubRelease{TagName: name, Assets: r.assets})
+		case strings.Contains(req.URL.Path, "/releases"):
+			_ = json.NewEncoder(w).Encode(r.releases)
 		default:
 			http.NotFound(w, req)
 		}
@@ -110,8 +117,199 @@ func TestReleaseRepositoryPinnedToThisDistribution(t *testing.T) {
 	}
 }
 
+// The newest-build lookup must read the LIST endpoint, never
+// `/releases/latest`: every distribution release is a prerelease and GitHub
+// excludes prereleases from `latest`, so that endpoint 404s for this repository
+// no matter how many builds are published. A CLI that asks `latest` and gives up
+// is the reported defect; this test fails if it comes back.
+func TestFetchLatestReleaseReadsTheListNotTheLatestEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// GitHub's real answer for a prerelease-only repository.
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			http.NotFound(w, r)
+			return
+		}
+		if !strings.Contains(r.URL.Path, "/releases") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("per_page") == "" {
+			t.Errorf("list request omitted per_page: %s", r.URL.String())
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]GitHubRelease{
+			{
+				TagName:    "v0.9.0-myswy.1",
+				Prerelease: true,
+				Assets:     assetsFor("0.9.0-myswy.1"),
+			},
+			{
+				TagName:    "v0.9.0-myswy.2",
+				Prerelease: true,
+				Assets:     assetsFor("0.9.0-myswy.2"),
+			},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
+
+	got, err := FetchLatestRelease()
+	if err != nil {
+		t.Fatalf("FetchLatestRelease() error = %v", err)
+	}
+	if got.TagName != "v0.9.0-myswy.2" {
+		t.Fatalf("release tag = %q, want v0.9.0-myswy.2", got.TagName)
+	}
+}
+
+func assetsFor(version string) []GitHubReleaseAsset {
+	return []GitHubReleaseAsset{{
+		Name:               ReleaseAssetName(version, "linux", "amd64"),
+		BrowserDownloadURL: "https://example.invalid/" + version,
+	}}
+}
+
+// assetsForPlatform lets a table test pin an arbitrary platform.
+func assetsForPlatform(version, goos, goarch string) []GitHubReleaseAsset {
+	return []GitHubReleaseAsset{{
+		Name:               ReleaseAssetName(version, goos, goarch),
+		BrowserDownloadURL: "https://example.invalid/" + version,
+	}}
+}
+
+// Newest-build selection has to skip four kinds of entry that a real fork
+// repository contains: upstream tags synced alongside the distribution's own,
+// prereleases for other platforms, drafts, and releases without the archive this
+// platform installs. Picking any of them either installs a binary without this
+// distribution's features or fails at download time.
+func TestFetchLatestReleaseSelectsNewestUsableDistributionBuild(t *testing.T) {
+	releases := []GitHubRelease{
+		// Upstream tag synced into the same repository, highest version of all.
+		{TagName: "v9.9.9", Assets: assetsFor("9.9.9")},
+		// Newer distribution build that only built another platform.
+		{TagName: "v0.10.0-myswy.1", Assets: assetsForPlatform("0.10.0-myswy.1", "darwin", "arm64")},
+		{TagName: "v0.9.0-myswy.3", Assets: assetsFor("0.9.0-myswy.3")},
+		{TagName: "v0.9.0-myswy.10", Assets: assetsFor("0.9.0-myswy.10")},
+		// A distribution tag with no assets at all.
+		{TagName: "v0.9.0-myswy.11"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(releases[0]) // what a fork's latest could be
+			return
+		}
+		_ = json.NewEncoder(w).Encode(releases)
+	}))
+	defer srv.Close()
+	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
+
+	got, err := FetchLatestRelease()
+	if err != nil {
+		t.Fatalf("FetchLatestRelease() error = %v", err)
+	}
+	// 0.9.0-myswy.10 beats myswy.3 numerically; 0.10.0-myswy.1 and 0.9.0-myswy.11
+	// are excluded for having no linux/amd64 archive; v9.9.9 is not a
+	// distribution tag.
+	if got.TagName != "v0.9.0-myswy.10" {
+		t.Fatalf("selected %q, want v0.9.0-myswy.10", got.TagName)
+	}
+}
+
+func TestFetchLatestReleaseReportsWhenNothingIsInstalled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]GitHubRelease{
+			{TagName: "v9.9.9", Assets: assetsFor("9.9.9")}, // upstream only
+		})
+	}))
+	defer srv.Close()
+	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
+
+	_, err := FetchLatestRelease()
+	if err == nil {
+		t.Fatal("FetchLatestRelease() must fail when only upstream tags exist")
+	}
+	if !strings.Contains(err.Error(), "no published distribution build") {
+		t.Fatalf("error should say there is no distribution build, got: %v", err)
+	}
+}
+
+func TestIsDistributionTagRejectsUpstreamTags(t *testing.T) {
+	distribution := []string{"v0.9.0-myswy.1", "0.9.0-myswy.1", "v1.2.3-myswy.10"}
+	upstream := []string{"v0.9.0", "v1.2.3", "v0.2.15-235-gdaf0e935", ""}
+
+	for _, tag := range distribution {
+		if !IsDistributionTag(tag) {
+			t.Fatalf("IsDistributionTag(%q) = false, want true", tag)
+		}
+	}
+	for _, tag := range upstream {
+		if IsDistributionTag(tag) {
+			t.Fatalf("IsDistributionTag(%q) = true; an upstream tag must never be selected", tag)
+		}
+	}
+}
+
+func TestParseDistributionVersion(t *testing.T) {
+	tests := []struct {
+		tag  string
+		want [4]int
+		ok   bool
+	}{
+		{"v0.9.0-myswy.1", [4]int{0, 9, 0, 1}, true},
+		{"0.9.0-myswy.10", [4]int{0, 9, 0, 10}, true},
+		{"v1.2.3-myswy.0", [4]int{1, 2, 3, 0}, true},
+		{"v0.9.0", [4]int{}, false},
+		{"v0.9.0-myswy.", [4]int{}, false},
+		{"v0.9-myswy.1", [4]int{}, false},
+		{"v0.2.15-235-gdaf0e935", [4]int{}, false},
+	}
+	for _, tt := range tests {
+		got, ok := parseDistributionVersion(tt.tag)
+		if ok != tt.ok {
+			t.Fatalf("parseDistributionVersion(%q) ok = %v, want %v", tt.tag, ok, tt.ok)
+		}
+		if ok && got != tt.want {
+			t.Fatalf("parseDistributionVersion(%q) = %v, want %v", tt.tag, got, tt.want)
+		}
+	}
+}
+
+func TestVersionGreaterOrdersBuildNumbersNumerically(t *testing.T) {
+	// The distinction a lexical comparison gets wrong: "10" sorts before "9" as
+	// text but is the newer build.
+	if !versionGreater([4]int{0, 9, 0, 10}, [4]int{0, 9, 0, 9}) {
+		t.Fatal("myswy.10 must be newer than myswy.9")
+	}
+	if versionGreater([4]int{0, 9, 0, 9}, [4]int{0, 9, 0, 10}) {
+		t.Fatal("myswy.9 must not be newer than myswy.10")
+	}
+	if !versionGreater([4]int{0, 10, 0, 1}, [4]int{0, 9, 0, 7}) {
+		t.Fatal("a newer base version must win regardless of build number")
+	}
+	if versionGreater([4]int{0, 9, 0, 1}, [4]int{0, 9, 0, 1}) {
+		t.Fatal("equal versions must not compare as greater")
+	}
+}
+
+// Newest-build selection must ask this distribution's repository, and must do it
+// through the list endpoint. This replaces an earlier version of the test that
+// asserted a `/releases/latest` request: that assertion described the defect
+// (prereleases are invisible to `latest`) rather than the requirement.
 func TestFetchLatestReleaseUsesDistributionRepository(t *testing.T) {
-	rec := &releaseRecorder{latestTag: "v9.8.7"}
+	rec := &releaseRecorder{
+		releases: []GitHubRelease{{
+			TagName:    "v9.8.7-myswy.7",
+			Prerelease: true,
+			Assets:     assetsFor("9.8.7-myswy.7"),
+		}},
+	}
 	srv := rec.server(t)
 	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
 
@@ -119,16 +317,20 @@ func TestFetchLatestReleaseUsesDistributionRepository(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchLatestRelease() error = %v", err)
 	}
-	if got.TagName != "v9.8.7" {
-		t.Fatalf("release tag = %q, want v9.8.7", got.TagName)
+	if got.TagName != "v9.8.7-myswy.7" {
+		t.Fatalf("release tag = %q, want v9.8.7-myswy.7", got.TagName)
 	}
 
 	paths := rec.recorded()
 	if len(paths) != 1 {
-		t.Fatalf("latest lookup made %d requests, want 1: %v", len(paths), paths)
+		t.Fatalf("newest-build lookup made %d requests, want 1: %v", len(paths), paths)
 	}
-	if want := "/repos/zzttzzmyswy/multica/releases/latest"; paths[0] != want {
-		t.Fatalf("latest lookup path = %q, want %q", paths[0], want)
+	// The path must be the collection, with the distribution repository in it.
+	if !strings.HasPrefix(paths[0], "/repos/zzttzzmyswy/multica/releases") {
+		t.Fatalf("newest-build lookup path = %q, want the distribution release list", paths[0])
+	}
+	if strings.Contains(paths[0], "/latest") {
+		t.Fatalf("newest-build lookup must not use /releases/latest (prereleases are invisible there): %q", paths[0])
 	}
 }
 

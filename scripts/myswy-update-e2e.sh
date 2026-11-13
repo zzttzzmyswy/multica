@@ -63,17 +63,27 @@ make_release_assets "0.9.0-myswy.2"
 
 # Build the manifest and the releases fixture together: the server substitutes
 # PORT with the port it actually bound.
+#
+# The fixture models GitHub's real semantics, which is the point:
+#   * every release is `prerelease: true`, exactly as the distribution publishes;
+#   * therefore `/releases/latest` 404s, exactly as GitHub answers when the only
+#     releases are prereleases;
+#   * the list endpoint returns them, newest first, with `published_at` ordering.
+# A fixture that served a prerelease from `latest` would let a CLI that depends
+# on that endpoint pass while being unable to work against the real API.
 ( cd "$ROOT/assets" && sha256sum v*/*.tar.gz ) | sed 's#v[^/]*/##' >"$WORK/sums.txt"
 {
-  printf '{\n "latest": "v0.9.0-myswy.2",\n "tags": {\n'
+  printf '{\n "latest": null,\n "tags": {\n'
   first=1
+  index=0
   for tag in v0.9.0-myswy.1 v0.9.0-myswy.2; do
     version="${tag#v}"
     asset="multica-cli-${version}-linux-amd64.tar.gz"
     cp "$WORK/sums.txt" "$ROOT/assets/$tag/checksums.txt"
     [ "$first" = 1 ] || printf ',\n'
     first=0
-    printf '  "%s": {"tag_name": "%s", "prerelease": true, "assets": [' "$tag" "$tag"
+    index=$((index + 1))
+    printf '  "%s": {"tag_name": "%s", "prerelease": true, "draft": false, "published_at": "2026-11-14T00:0%d:00Z", "assets": [' "$tag" "$tag" "$index"
     printf '{"name": "%s", "browser_download_url": "http://127.0.0.1:PORT/releases/download/%s/%s"},' "$asset" "$tag" "$asset"
     printf '{"name": "checksums.txt", "browser_download_url": "http://127.0.0.1:PORT/releases/download/%s/checksums.txt"}' "$tag"
     printf ']}'
@@ -172,10 +182,48 @@ else
   bad "unpinned update did not install the newest release: $out"
 fi
 new_requests="$(comm -13 <(printf '%s\n' "$before") <(requests))"
-if printf '%s\n' "$new_requests" | grep -q "/repos/zzttzzmyswy/multica/releases/latest"; then
-  ok "unpinned update read /releases/latest from zzttzzmyswy/multica"
+# The critical assertion: an unpinned update must use the LIST endpoint, because
+# `/releases/latest` cannot see prereleases and this fixture makes it 404 like
+# the real API does. Asking `latest` and giving up is the exact defect that was
+# reported.
+if printf '%s\n' "$new_requests" | grep -qE "/repos/zzttzzmyswy/multica/releases/?$"; then
+  ok "unpinned update read the release LIST from zzttzzmyswy/multica"
 else
-  bad "unpinned update did not use the distribution latest endpoint: $new_requests"
+  bad "unpinned update did not use the distribution release list: $new_requests"
+fi
+if printf '%s\n' "$new_requests" | grep -q "/releases/latest"; then
+  bad "unpinned update depended on /releases/latest, which 404s for prerelease-only repositories"
+else
+  ok "unpinned update never relies on /releases/latest"
+fi
+
+step "An unpinned update with no usable build fails with the pinned form"
+# Same server, but this repository's only release has no linux/amd64 archive, so
+# there is genuinely nothing to install. The error must teach the pinned
+# command rather than surfacing a bare status code.
+target_bin="$(fresh_target nopublished)"
+mv "$ROOT/releases.json" "$ROOT/releases.json.bak"
+python3 - "$ROOT" <<'PY'
+import json, sys
+root = sys.argv[1]
+# A darwin-only release: nothing this platform can install.
+data = {"latest": None, "tags": {"v0.9.0-myswy.9": {
+    "tag_name": "v0.9.0-myswy.9", "prerelease": True, "draft": False,
+    "published_at": "2026-11-14T00:00:00Z",
+    "assets": [{"name": "multica-cli-0.9.0-myswy.9-darwin-arm64.tar.gz"}]}}}
+json.dump(data, open(root + "/releases.json", "w"))
+PY
+out="$("$target_bin" update 2>&1)"; rc=$?
+mv "$ROOT/releases.json.bak" "$ROOT/releases.json"
+if [ "$rc" != 0 ]; then
+  ok "an unpinned update with no installable build fails"
+else
+  bad "an unpinned update succeeded with no installable build"
+fi
+if printf '%s' "$out" | grep -q -- "--version"; then
+  ok "the failure shows the pinned --version form"
+else
+  bad "the failure does not teach the pinned form: $out"
 fi
 
 step "A checksum mismatch refuses to replace the binary"
