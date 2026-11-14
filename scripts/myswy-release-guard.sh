@@ -4,13 +4,12 @@
 # Why this exists: GoReleaser's `replace_existing_artifacts: false` protects the
 # GitHub release's CLI archives, but it protects nothing in GHCR. The image jobs
 # in release-myswy.yml wrote the tag with `docker buildx imagetools create`, so a
-# rerun of a tag whose CLI had already been published could still replace the
-# image a deployment was pinned to — the exact thing a digest pin is supposed to
-# make impossible.
+# rerun could repoint an already published tag to a different image. Digest pins
+# remain immutable, but deployments resolving that tag would get different bytes.
 #
 # One rule: if the artifact a job is about to write already exists, that job
-# publishes nothing. A partial release is recovered by cutting the next build
-# number (myswy.N+1), never by overwriting.
+# publishes nothing. Failed jobs may fill missing artifacts from the same run;
+# changing published artifacts requires the next build number (myswy.N+1).
 #
 # Two scopes, because the two checks answer different questions:
 #
@@ -289,8 +288,8 @@ check_image() {
   case "$STATE" in
     present)
       fail "image ${ref} already exists.
-  A deployment may be pinned to its digest; re-pushing the tag would make that
-  pin resolve to different bytes. Cut the next build number (myswy.N+1)."
+  Re-pushing would change the tag's target; existing digest pins stay unchanged.
+  Cut the next build number (myswy.N+1) to publish different bytes."
       ;;
     package-absent) ok "no ${image} package has been published yet" ;;
     tag-absent) ok "the ${image} package exists but carries no ${TAG} tag" ;;

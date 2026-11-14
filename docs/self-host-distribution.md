@@ -98,9 +98,11 @@ not blocked by having already built something.
 
 ### Published names are immutable
 
-A published version is never replaced. If a release goes wrong partway through,
-cut the next build number (`myswy.N+1`) and tag again; do not re-run the old tag.
-The protection has two layers, and both are needed.
+A published artifact is never replaced. Failed jobs from the same run may
+publish artifacts that are still missing; they refuse to overwrite an existing
+release or image tag. A fresh run refuses a version if any artifact already
+exists. To change a partially published release, cut the next build number
+(`myswy.N+1`). The protection has two layers, and both are needed.
 
 **Only the version tag is published.** Each image gets exactly one tag, the
 frozen `vX.Y.Z-myswy.N`, plus the content digest the build produced. No `latest`
@@ -125,7 +127,8 @@ that writes, and the writer checks only its own artifact: during one healthy run
 the artifacts finish at different times, and a writer that refused because a
 sibling had already published would break a release that is going fine.
 `scripts/myswy-release-workflow.test.mjs` replays exactly that sequence against a
-local stub and asserts zero writes on the rerun.
+local stub and asserts zero writes to an existing target on the rerun, while
+allowing a missing target to be published without changing its siblings.
 
 **Absence has to be proved, not assumed.** The guard asks the release API and
 the registry over HTTP with explicit credentials (`GHCR_USERNAME`/`GHCR_TOKEN`
