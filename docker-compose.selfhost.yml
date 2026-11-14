@@ -34,7 +34,7 @@
 # docker-compose.selfhost.digest.yml exists for a digest-pinned deployment.
 # Digest pinning cannot be expressed here by substitution: Compose has no way to
 # ask "does this value already contain @" or ":", so appending `:${...TAG}`
-# unconditionally produced `...@sha256:<digest>:v0.9.0-myswy.1`, which Docker
+# unconditionally produced `...@sha256:<digest>:v0.9.0-myswy.2`, which Docker
 # rejects as an invalid reference format. The override file sets complete
 # references instead, and `make selfhost-digest` below points at it.
 
@@ -61,7 +61,7 @@ services:
       retries: 5
 
   backend:
-    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/zzttzzmyswy/multica-backend}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}
+    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/zzttzzmyswy/multica-backend}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.2}
     depends_on:
       postgres:
         condition: service_healthy
@@ -246,7 +246,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ${MULTICA_WEB_IMAGE:-ghcr.io/zzttzzmyswy/multica-web}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}
+    image: ${MULTICA_WEB_IMAGE:-ghcr.io/zzttzzmyswy/multica-web}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.2}
     depends_on:
       - backend
     ports:

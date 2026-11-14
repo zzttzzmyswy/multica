@@ -103,7 +103,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 	@echo "==> Pulling published distribution images..."
 	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
-		echo "Images for tag '$${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}' could not be pulled."; \
+		echo "Images for tag '$${MULTICA_IMAGE_TAG:-v0.9.0-myswy.2}' could not be pulled."; \
 		echo "Set MULTICA_IMAGE_TAG in .env to a published version, or build from this checkout:"; \
 		echo "  make selfhost-build"; \
 		exit 1; \

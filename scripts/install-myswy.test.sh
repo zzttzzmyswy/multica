@@ -27,6 +27,19 @@ step() { printf '\n==> %s\n' "$1"; }
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/install-myswy-test.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# Release fixtures below contain Linux/amd64 archives. Keep the installer's
+# platform query consistent with those fixtures on every CI host.
+mkdir -p "$TMP/stub-bin"
+cat >"$TMP/stub-bin/uname" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) printf '%s\n' Linux ;;
+  -m) printf '%s\n' x86_64 ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+STUB
+chmod +x "$TMP/stub-bin/uname"
+
 # ---------------------------------------------------------------------------
 # Sandbox: a fake `multica` payload, a release archive built from it, and a
 # `curl` stub that serves whatever the case registers.

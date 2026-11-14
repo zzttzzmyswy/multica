@@ -8,7 +8,7 @@
 # `<repo>:${MULTICA_IMAGE_TAG}`, and Compose interpolation cannot test whether a
 # value already carries a `@digest` or `:tag`. Setting
 # MULTICA_BACKEND_IMAGE=ghcr.io/.../multica-backend@sha256:<digest> there
-# therefore produced `ghcr.io/.../multica-backend@sha256:<digest>:v0.9.0-myswy.1`,
+# therefore produced `ghcr.io/.../multica-backend@sha256:<digest>:v0.9.0-myswy.2`,
 # which Docker rejects as an invalid reference format — so digest pinning was
 # documented but unusable.
 #
@@ -20,7 +20,7 @@
 # Take the value from the release run's image-merge job output, or:
 #
 #   docker buildx imagetools inspect \
-#     ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.1 --format '{{json .Manifest}}'
+#     ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.2 --format '{{json .Manifest}}'
 #
 # Leaving a variable empty fails the boot rather than silently falling back to a
 # tag, because "I meant to pin this" and "I forgot" must not look the same.

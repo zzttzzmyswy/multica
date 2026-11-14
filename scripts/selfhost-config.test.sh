@@ -563,7 +563,7 @@ done
 #
 # The tag path always worked. The digest path did not: the base compose file
 # appends `:${MULTICA_IMAGE_TAG}` unconditionally, so a pinned
-# `name@sha256:<digest>` rendered as `name@sha256:<digest>:v0.9.0-myswy.1` and
+# `name@sha256:<digest>` rendered as `name@sha256:<digest>:v0.9.0-myswy.2` and
 # `docker image inspect` rejected it as an invalid reference format. These cases
 # render the actual configuration and validate the reference shape, without
 # touching a registry.
@@ -594,11 +594,28 @@ tagged="$(
     -f docker-compose.selfhost.yml config --images
 )"
 require_image_ref "default tag" "$tagged"
-if ! grep -Fxq "${backend_repo}:v0.9.0-myswy.1" <<<"$tagged"; then
-  echo "  default backend image is not the pinned distribution tag:"
-  echo "$tagged"
-  exit 1
-fi
+for want in "${backend_repo}:v0.9.0-myswy.2" "${web_repo}:v0.9.0-myswy.2"; do
+  if ! grep -Fxq "$want" <<<"$tagged"; then
+    echo "  default image is not the pinned distribution tag $want:"
+    echo "$tagged"
+    exit 1
+  fi
+done
+
+# An operator-supplied tag must still win over the pinned default, so a
+# deployment can move between published builds without editing the compose file.
+custom_tagged="$(
+  JWT_SECRET="$JWT_SECRET" MULTICA_IMAGE_TAG=v0.10.0-myswy.7 \
+    docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config --images
+)"
+require_image_ref "custom tag" "$custom_tagged"
+for want in "${backend_repo}:v0.10.0-myswy.7" "${web_repo}:v0.10.0-myswy.7"; do
+  if ! grep -Fxq "$want" <<<"$custom_tagged"; then
+    echo "  MULTICA_IMAGE_TAG override did not render $want:"
+    echo "$custom_tagged"
+    exit 1
+  fi
+done
 
 # 2. Digest rendering reproduces exactly the requested reference — no tag
 #    appended, no doubled separator.
