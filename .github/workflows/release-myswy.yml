@@ -19,12 +19,15 @@ name: Release (self-host distribution)
 #      mobile installers, does not push a Helm chart, and does not write any
 #      Homebrew tap — none of which this distribution publishes.
 #
-# Triggered by the same tag shape as upstream (`v*.*.*`), so one tag publishes
-# one release. Distribution tags are expected to look like vX.Y.Z-myswy.N.
+# The tag filter is the distribution's shape, not upstream's `v*.*.*`: an
+# upstream tag synced into this repository has nothing to publish here. The
+# filter alone is not the gate — a glob cannot express "exactly N digits then
+# -myswy.N" and would allow `v0.9.0-myswy.1-extra` — so `verify` re-checks the
+# exact pattern and refuses.
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*-myswy.*"
       - "!v*-dirty*"
   # Manual runs are deliberately NOT supported: the versions, image tags, and
   # checksums all derive from the tag, and a workflow_dispatch run would have to
@@ -50,33 +53,33 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag_name: ${{ steps.release_meta.outputs.tag_name }}
-      is_stable: ${{ steps.release_meta.outputs.is_stable }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Validate tag name
+      - name: Validate tag and repository
         id: release_meta
         shell: bash
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           echo "Triggered by tag: $tag"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tags must look like vX.Y.Z or vX.Y.Z-suffix; got '$tag'."
+          # Exactly the distribution's version shape. A looser pattern lets
+          # related-looking tags through — `v0.9.0-myswy.1-extra` and a
+          # synced upstream `v0.9.0` both fail this test, and both must: the
+          # first publishes under a name no updater resolves, the second would
+          # publish a fork build under an upstream-looking name.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-myswy\.[0-9]+$ ]]; then
+            echo "::error::Release tags must match ^v<major>.<minor>.<patch>-myswy.<build>\$; got '$tag'."
             exit 1
           fi
-          if [[ "$tag" == *-dirty* ]]; then
-            echo "::error::Refusing to release from dirty tag '$tag'."
+          if [[ "${GITHUB_REPOSITORY}" != "zzttzzmyswy/multica" ]]; then
+            echo "::error::This distribution publishes only from zzttzzmyswy/multica; refusing to release from '${GITHUB_REPOSITORY}'."
             exit 1
           fi
           echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
-          if [[ "$tag" == *-* ]]; then
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -102,15 +105,18 @@ jobs:
         run: go tool govulncheck ./...
 
   guard:
-    # Runs before ANY publish job and gates all of them. GoReleaser's
-    # replace_existing_artifacts=false protects the GitHub release's archives
-    # only — nothing protects a GHCR tag, so a rerun could replace the image a
-    # deployment is pinned to. One read-only check decides for every writer:
-    # if the release or either image tag already exists, publish nothing.
+    # Pre-flight, before anything writes: if the release or either image tag
+    # already exists, the whole release is refused (scope `all`).
     #
-    # A lookup that fails (403, 5xx, network) is NOT treated as "the tag is
-    # free": that is how an unverified overwrite happens. Only an explicit 404
-    # counts as absent.
+    # This job is NOT the protection. GitHub reuses a job's stored result when
+    # only the failed jobs of a run are re-run, so `needs: guard` on a writer
+    # proves nothing after a rerun: the edge replays a verdict from an earlier
+    # attempt. Every job that writes a tag therefore re-checks, in its own
+    # steps, right before its write — see the merge and cli jobs below.
+    #
+    # The check talks to the registry over HTTP with explicit credentials
+    # rather than through `docker`, so it needs no `docker login`: a login is
+    # per-runner, and one performed here is invisible to every other job.
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -121,10 +127,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/myswy-release-guard.sh \
             --tag "${{ needs.verify.outputs.tag_name }}" \
-            --repository "${{ github.repository }}"
+            --repository "${{ github.repository }}" \
+            --scope all
 
   cli:
     needs: [verify, guard]
@@ -142,6 +151,20 @@ jobs:
           check-latest: true
           cache-dependency-path: server/go.sum
 
+      # The write is performed by GoReleaser, so this is a separate step rather
+      # than an inline check like the image pushes. A rerun of this job replays
+      # every one of its steps, this one included, which is what makes the guard
+      # effective after `Re-run failed jobs`.
+      - name: Refuse to publish over an existing release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          bash scripts/myswy-release-guard.sh \
+            --tag "${{ needs.verify.outputs.tag_name }}" \
+            --repository "${{ github.repository }}" \
+            --scope release
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -152,6 +175,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # The build jobs push by digest only: a content-addressed blob that carries no
+  # tag. Publishing a digest twice is idempotent and cannot point a deployment
+  # at different bytes, so these jobs are allowed to run even though the tag
+  # check happens later — that is what makes "build the digest first, decide
+  # about the tag afterwards" possible.
   docker-backend-build:
     needs: [verify, guard]
     strategy:
@@ -225,7 +253,7 @@ jobs:
           retention-days: 1
 
   docker-backend-merge:
-    needs: [verify, docker-backend-build]
+    needs: [verify, guard, docker-backend-build]
     runs-on: ubuntu-latest
     concurrency:
       group: release-myswy-docker-backend-${{ github.ref }}
@@ -238,6 +266,11 @@ jobs:
           pattern: digests-backend-*
           merge-multiple: true
 
+      # The guard script is read from the tagged commit, not from a floating
+      # branch, so the check a release runs is the check that release shipped.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -246,15 +279,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/multica-backend
-          # `latest` is deliberately NOT published. Every deployment of this
-          # distribution pins an exact tag (and, at deploy time, a digest), so
-          # a floating tag would only create a way to get a different binary
-          # than the one that was verified.
+          # `latest` is deliberately NOT published, and neither is a `sha-*`
+          # tag: every deployment pins the version tag and, at deploy time, its
+          # digest. A second tag derived from the commit would be a second name
+          # for the same content that a later build of the same commit could
+          # repoint, which is the overwrite this workflow exists to prevent.
           flavor: |
             latest=false
           tags: |
             type=raw,value=${{ needs.verify.outputs.tag_name }}
-            type=sha,prefix=sha-
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -263,11 +296,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The check is in the same step as the write on purpose. A separate step
+      # could be reordered, skipped, or split off in an edit; here the write is
+      # unreachable without passing the check first, and a rerun of this job
+      # replays both.
       - name: Create manifest list and push
         working-directory: /tmp/digests
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/multica-backend
+          TAG: ${{ needs.verify.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/myswy-release-guard.sh" \
+            --tag "$TAG" --repository "$GITHUB_REPOSITORY" \
+            --scope image --image multica-backend
           # Build the argument list into an array. Upstream's version inlines
           # two unquoted command substitutions here, which shellcheck flags
           # (SC2046) and which would break on an image reference containing a
@@ -359,7 +404,7 @@ jobs:
           retention-days: 1
 
   docker-web-merge:
-    needs: [verify, docker-web-build]
+    needs: [verify, guard, docker-web-build]
     runs-on: ubuntu-latest
     concurrency:
       group: release-myswy-docker-web-${{ github.ref }}
@@ -372,6 +417,9 @@ jobs:
           pattern: digests-web-*
           merge-multiple: true
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -380,12 +428,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/multica-web
-          # See docker-backend-merge: `latest` is intentionally not published.
+          # See docker-backend-merge: no `latest`, no `sha-*`.
           flavor: |
             latest=false
           tags: |
             type=raw,value=${{ needs.verify.outputs.tag_name }}
-            type=sha,prefix=sha-
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -398,7 +445,15 @@ jobs:
         working-directory: /tmp/digests
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/multica-web
+          TAG: ${{ needs.verify.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/myswy-release-guard.sh" \
+            --tag "$TAG" --repository "$GITHUB_REPOSITORY" \
+            --scope image --image multica-web
           # Build the argument list into an array. Upstream's version inlines
           # two unquoted command substitutions here, which shellcheck flags
           # (SC2046) and which would break on an image reference containing a
@@ -436,6 +491,6 @@ jobs:
             echo "Pin deployments to the image digest, not the tag:"
             echo
             echo '```'
-            echo "docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/multica-backend:$tag"
+            echo "docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/multica-backend:$tag --format '{{json .Manifest}}' | jq -r .digest"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -5,20 +5,11 @@ It exists because the upstream project deprioritized
 [direct-to-object-storage attachment upload](https://github.com/multica-ai/multica/pull/10514),
 which this deployment depends on.
 
-Why it is needed, measured on the actual deployment (2026-11-14, NAS read-only
-inventory): the public reverse proxy in front of the backend accepts request
-bodies up to **50 MiB** (`client_max_body_size 50m`; 52,428,800 bytes reached the
-backend, 52,428,801 was rejected with 413). The backend also hardcodes a 100 MiB
-attachment cap, so attachments between 50 MiB and 100 MiB cannot be uploaded at
-all through the proxy. Two further costs are independent of that ceiling: a
-multipart upload through a slow link measured far below the link's raw rate, and
-the old path buffers the whole file in the backend and in the CLI.
-
-> Historical note: an earlier report in this project described the proxy limit as
-> 8–10 MiB. The current measurement above is 50 MiB. The older figure could not be
-> reproduced and is not used as a justification anywhere in this document; the
-> feature is needed for the 50–100 MiB gap, the slow-link behavior, and the
-> memory cost.
+Why it is needed: the reverse proxy in front of the backend caps request bodies
+well below the backend's own 100 MiB attachment limit, so large attachments
+cannot be uploaded through it at all. A multipart upload through a slow link also
+measures far below the link's raw rate, and the old path buffers the whole file
+in the backend and in the CLI. Direct upload addresses all three.
 
 Everything here is additive to upstream. The fork tracks upstream `main`, keeps
 the upstream commit history, and carries the attachment work as ordinary
@@ -85,24 +76,107 @@ the code depends on.
    pins digests, not tags.
 
 The workflow will not:
-- publish a `latest` tag for either image,
+- publish a `latest` tag or a commit-derived `sha-*` tag for either image,
 - write any Homebrew tap,
 - build Desktop or mobile installers,
 - push a Helm chart,
 - mark the release as GitHub's "latest" (it is published as a prerelease).
 
-**Nothing is overwritten.** Before any publish job starts, the `guard` job runs
-`scripts/myswy-release-guard.sh`, which checks whether the release or either
-image tag already exists and refuses the whole run if so. A failed or
-unauthorized lookup (403, 5xx, network) is *not* treated as "the tag is free":
-only an explicit 404 counts as absent, because an unverified overwrite is the
-failure this guards against.
+Only the tag shape gets this far. A tag that is not exactly
+`v<major>.<minor>.<patch>-myswy.<build>` — a synced upstream `v0.9.0`, or a
+look-alike such as `v0.9.0-myswy.1-extra` — fails the `verify` job and publishes
+nothing. The workflow and `scripts/myswy-release-guard.sh` both apply that rule,
+so a tag rejected by one is rejected by the other.
 
-This gate exists because `replace_existing_artifacts: false` only protects the
-GitHub release's archives — it protects nothing in GHCR, and without the guard
-the image jobs wrote their tag unconditionally, so a rerun could replace the
-digest a deployment was pinned to. If a release is broken partway through, cut
-the next build number (`myswy.N+1`); do not re-run the tag.
+Order within a run: `verify` (tests, race suite, `govulncheck`) gates everything;
+`guard` then refuses the whole run if anything for this version already exists;
+the two image builds push **digests only**, which carry no tag and are therefore
+harmless to repeat; the merge jobs check their own tag and only then attach it;
+the `cli` job checks the release tag and only then runs GoReleaser. Because the
+digests are built before the tag check, a first publish from an empty registry is
+not blocked by having already built something.
+
+### Published names are immutable
+
+A published version is never replaced. If a release goes wrong partway through,
+cut the next build number (`myswy.N+1`) and tag again; do not re-run the old tag.
+The protection has two layers, and both are needed.
+
+**Only the version tag is published.** Each image gets exactly one tag, the
+frozen `vX.Y.Z-myswy.N`, plus the content digest the build produced. No `latest`
+and no commit-derived `sha-*` tag: a second name for the same bytes is a second
+name a later build could repoint, and a deployment pins the version tag and its
+digest.
+
+**Every writing job checks before it writes.** `scripts/myswy-release-guard.sh`
+runs in three roles:
+
+| Role | Invocation | Question it answers |
+| --- | --- | --- |
+| Pre-flight | `--scope all` (the `guard` job) | Is anything for this version already published? If so, refuse the whole run before spending build minutes. |
+| Release writer | `--scope release` (the `cli` job) | Is this release tag already published? |
+| Image writer | `--scope image --image <name>` (each merge job, inside the pushing step) | Is *this* image tag already published? |
+
+The scoped forms exist because of how a partial rerun works. GitHub keeps the
+stored result of jobs that were not re-run, so after "Re-run failed jobs" a
+`needs: guard` edge replays the first attempt's success — it does not re-decide
+anything. The check that protects a write therefore has to live inside the job
+that writes, and the writer checks only its own artifact: during one healthy run
+the artifacts finish at different times, and a writer that refused because a
+sibling had already published would break a release that is going fine.
+`scripts/myswy-release-workflow.test.mjs` replays exactly that sequence against a
+local stub and asserts zero writes on the rerun.
+
+**Absence has to be proved, not assumed.** The guard asks the release API and
+the registry over HTTP with explicit credentials (`GHCR_USERNAME`/`GHCR_TOKEN`
+from `GITHUB_TOKEN` in the workflow). It treats a lookup as "free to publish"
+only on a positive answer:
+
+| Answer | Verdict |
+| --- | --- |
+| `404` + `MANIFEST_UNKNOWN` on the manifest, or `404` + `NAME_UNKNOWN` on the tag list | absent — may publish |
+| `200` | present — refuse |
+| `401` / `403` | refuse: a credential problem is not evidence of absence |
+| `5xx`, transport error, missing `curl`/`jq` | refuse |
+| `404` with no OCI error code | refuse: something answered "not found" without saying why |
+
+An anonymous lookup cannot make this distinction, which is why credentials are
+mandatory rather than a fallback. Observed against `ghcr.io` directly:
+
+```
+# package that does not exist yet, no credentials
+GET /token?service=ghcr.io&scope=repository:zzttzzmyswy/multica-backend:pull
+  -> 403 {"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}
+
+# same request with credentials
+  -> 200 {"token":"..."}
+GET /v2/zzttzzmyswy/multica-backend/tags/list?n=1   -> 404 NAME_UNKNOWN
+GET /v2/zzttzzmyswy/multica-backend/manifests/<tag> -> 404 MANIFEST_UNKNOWN
+
+# existing package, tag that does not exist
+GET /v2/multica-ai/multica-backend/manifests/does-not-exist -> 404 MANIFEST_UNKNOWN
+# existing package, existing tag
+GET /v2/multica-ai/multica-backend/manifests/latest        -> 200
+```
+
+The registry `/v2` API is what the guard reads, not the GitHub REST package API
+(`/users/{owner}/packages/container/{name}`): that endpoint needs `read:packages`,
+which `GITHUB_TOKEN` does not carry, and it answers `403` for a package it may
+not inspect — a second way to confuse "not allowed" with "not there". It is not
+used.
+
+Scope of the credentials: `GITHUB_TOKEN` is what the workflow passes, and the
+repository's `packages: write` permission is what makes it usable for both the
+token request and the push (it is the same credential `docker/login-action`
+already logs in with). A classic PAT with `read:packages` also works for the
+check and needs no `packages:write`. Both are read-only uses of the credential.
+
+**Not yet exercised on a real tag push.** The registry behaviour above was
+measured against `ghcr.io` with a real credential, and the workflow is tested
+against a local stub that reproduces those exact answers. What has *not* run is
+this workflow publishing `v0.9.0-myswy.1`: no tag has been pushed, so the
+`GITHUB_TOKEN` token grant inside Actions is by contract, not by observation.
+The first real release is where that gap closes.
 
 Upstream's `.github/workflows/release.yml` still exists here, but every job in it
 (including its gate) is guarded by `github.repository_owner == 'multica-ai'` and
@@ -170,7 +244,10 @@ MULTICA_BACKEND_IMAGE=ghcr.io/zzttzzmyswy/multica-backend
 MULTICA_WEB_IMAGE=ghcr.io/zzttzzmyswy/multica-web
 ```
 
-A digest is the only immutable pin — a tag can be re-pushed. Put the two
+A digest is the only immutable pin. This workflow publishes each version tag
+once and refuses to re-publish it, so a tag here should never move — but a pin
+that is meant to be immune to any future mistake should still be a digest. Put
+the two
 **complete** references in the digest override and start through it:
 
 ```bash
@@ -204,30 +281,44 @@ Database migrations apply automatically: the backend image's entrypoint runs
 
 ## Upgrading an existing deployment: not a drop-in
 
-The current production deployment is **v0.8.1 with `schema_migrations` at 616**
-(NAS read-only inventory, 2026-11-14). This distribution's feature branch ends at
-**660**. That gap is the whole upgrade, not just the four migrations this feature
-adds:
+A deployment running an older build has to cross every migration between its
+`schema_migrations` version and this branch's head, not just the migrations this
+feature adds. Check the starting point rather than assuming it:
 
-- **44 forward migrations (−617 … 660),** of which **28 create an index with
-  `CREATE INDEX CONCURRENTLY`.** Each concurrent build runs outside a
-  transaction and leaves an INVALID index if interrupted; the runner has a
-  per-version cleanup hook for that, but it means an interrupted upgrade needs a
-  re-run rather than a manual repair.
+```bash
+docker compose -f docker-compose.selfhost.yml exec postgres \
+  psql -U multica -d multica -c 'select max(version) from schema_migrations'
+```
+
+- Many of those migrations create indexes with `CREATE INDEX CONCURRENTLY`.
+  Each concurrent build runs outside a transaction and leaves an INVALID index
+  if interrupted; the runner has a per-version cleanup hook, but it means an
+  interrupted upgrade needs a re-run rather than a manual repair.
 - Migrations `657`–`660` are the only ones this feature introduces (one table,
-  three concurrent indexes). They are additive, but they are not the risk; the
-  other 40 are.
-- The NAS host had ~1 GB free on `/` at inventory time. A concurrent index build
-  on a 2 GB database needs headroom, and a failed build is worse than a slow one.
+  three concurrent indexes). They are additive. They are not the risk; the
+  migrations between an older deployment and them are.
+- A concurrent index build needs free space on the filesystem that holds
+  PostgreSQL's data directory — measured there, not on `/`, which can be a
+  separate and much larger or smaller volume. Check the mount Docker actually
+  uses before starting:
+
+  ```bash
+  docker info --format '{{.DockerRootDir}}'
+  df -h "$(docker info --format '{{.DockerRootDir}}')"
+  ```
+
+  If PostgreSQL runs outside Docker, check the data directory's own filesystem
+  instead. A failed build is worse than a slow one.
 
 **Before any upgrade:**
 
-1. Take a verified database backup (the inventory found backups had stopped
-   7 days earlier) and confirm it restores into a scratch database.
+1. Take a verified database backup and confirm it restores into a scratch
+   database. An untested backup is not a backup.
 2. Rehearse the whole upgrade on an isolated copy: restore the backup, run
-   `migrate up` to 660, start the new backend, and exercise the feature.
-3. Decide the client story: daemons running an upstream CLI will keep
-   auto-updating to upstream unless their updater is repointed (see below).
+   `migrate up` to head, start the new backend, and exercise the feature.
+3. Decide the client story: daemons whose updater still points at the upstream
+   release API will keep auto-updating to upstream builds unless it is repointed
+   or disabled (see below).
 
 ## Rolling back
 

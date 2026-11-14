@@ -136,7 +136,9 @@
     "scripts/myswy-release-guard.sh",
     "scripts/myswy-release-guard.test.sh",
     "docker-compose.selfhost.digest.yml",
-    "deploy/helm/multica/Chart.yaml"
+    "deploy/helm/multica/Chart.yaml",
+    "scripts/myswy-release-guard-stub.py",
+    "scripts/myswy-release-workflow.test.mjs"
   ],
   "installer": [
     "scripts/install.sh",
@@ -161,7 +163,9 @@
     "scripts/myswy-release-guard.sh",
     "scripts/myswy-release-guard.test.sh",
     "docker-compose.selfhost.digest.yml",
-    "deploy/helm/multica/Chart.yaml"
+    "deploy/helm/multica/Chart.yaml",
+    "scripts/myswy-release-guard-stub.py",
+    "scripts/myswy-release-workflow.test.mjs"
   ],
   "images": [
     "**/*.png",
