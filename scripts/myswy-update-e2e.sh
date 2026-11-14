@@ -118,15 +118,42 @@ fresh_target() {
   printf '%s' "$dir/multica"
 }
 
+# sha256 of a file, or the literal "missing". Used to prove a failed update left
+# the binary byte-for-byte alone: a version string can be unchanged while the
+# file was overwritten, so the digest is the assertion.
+sha_of() {
+  if [ -e "$1" ]; then sha256sum "$1" | awk '{ print $1 }'; else printf 'missing'; fi
+}
+
+# Captures `multica version` output once, then matches the captured text.
+#
+# The obvious `"$bin" version | grep -q PATTERN` is unsafe under `set -o
+# pipefail`: grep exits 0 the moment it sees a match and closes the pipe, the
+# binary then dies of SIGPIPE (141), and pipefail makes the whole pipeline 141
+# even though the match succeeded. That produced a "binary was replaced" false
+# failure in this very script. Capturing first removes the early-close race
+# instead of retrying around it.
+version_matches() {
+  local bin=$1 pattern=$2 out
+  out="$("$bin" version 2>&1)" || return 1
+  printf '%s\n' "$out" | grep -q -- "$pattern"
+}
+
+# The version line of a binary, for failure messages only.
+version_line() {
+  local bin=$1
+  "$bin" version 2>&1 | head -n 1
+}
+
 step "A pinned update installs exactly the requested tag"
 target_bin="$(fresh_target pinned)"
 before="$(requests)"
 out="$("$target_bin" update --version v0.9.0-myswy.2 2>&1)"; rc=$?
 if [ "$rc" = 0 ]; then ok "pinned update exited 0"; else bad "pinned update failed: $out"; fi
-if "$target_bin" version | grep -q "0.9.0-myswy.2"; then
+if version_matches "$target_bin" "0.9.0-myswy.2"; then
   ok "binary now reports v0.9.0-myswy.2"
 else
-  bad "binary did not change to the pinned version: $("$target_bin" version | head -1)"
+  bad "binary did not change to the pinned version: $(version_line "$target_bin")"
 fi
 new_requests="$(comm -13 <(printf '%s\n' "$before") <(requests))"
 if printf '%s\n' "$new_requests" | grep -q "/repos/zzttzzmyswy/multica/releases/tags/v0.9.0-myswy.2"; then
@@ -166,7 +193,7 @@ fi
 step "A pinned rollback installs the older tag"
 target_bin="$(fresh_target rollback)"
 out="$("$target_bin" update --version v0.9.0-myswy.1 2>&1)"; rc=$?
-if [ "$rc" = 0 ] && "$target_bin" version | grep -q "0.9.0-myswy.1"; then
+if [ "$rc" = 0 ] && version_matches "$target_bin" "0.9.0-myswy.1"; then
   ok "rolled back to v0.9.0-myswy.1"
 else
   bad "rollback failed: $out"
@@ -176,7 +203,7 @@ step "An unpinned update installs the newest release"
 target_bin="$(fresh_target latest)"
 before="$(requests)"
 out="$("$target_bin" update 2>&1)"; rc=$?
-if [ "$rc" = 0 ] && "$target_bin" version | grep -q "myswy.2"; then
+if [ "$rc" = 0 ] && version_matches "$target_bin" "myswy.2"; then
   ok "unpinned update installed v0.9.0-myswy.2"
 else
   bad "unpinned update did not install the newest release: $out"
@@ -228,35 +255,116 @@ fi
 
 step "A checksum mismatch refuses to replace the binary"
 target_bin="$(fresh_target badsum)"
-cp "$target_bin" "$WORK/before-badsum"
 # Corrupt the .2 manifest: the archive will not match.
 printf '%s  %s\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   "multica-cli-0.9.0-myswy.2-linux-amd64.tar.gz" \
   >"$ROOT/assets/v0.9.0-myswy.2/checksums.txt"
+before_sha="$(sha_of "$target_bin")"
 out="$("$target_bin" update --version v0.9.0-myswy.2 2>&1)"; rc=$?
 if [ "$rc" != 0 ]; then ok "update failed on a checksum mismatch"; else bad "update succeeded despite a checksum mismatch"; fi
-if "$target_bin" version | grep -q "0.9.0-myswy.1"; then
-  ok "the installed binary was left untouched"
+# SHA-256, not a version string: the binary is the thing that must not change.
+after_sha="$(sha_of "$target_bin")"
+if [ "$before_sha" = "$after_sha" ]; then
+  ok "the installed binary is byte-for-byte unchanged (sha256 $before_sha)"
 else
-  bad "the binary was replaced despite the failed verification"
+  bad "the binary changed despite the failed verification: $before_sha -> $after_sha"
 fi
 # Restore the good manifest for any later case.
 cp "$WORK/sums.txt" "$ROOT/assets/v0.9.0-myswy.2/checksums.txt"
 
 step "An unknown tag fails instead of installing the latest"
 target_bin="$(fresh_target unknown)"
+before_sha="$(sha_of "$target_bin")"
 out="$("$target_bin" update --version v9.9.9-myswy.99 2>&1)"; rc=$?
 if [ "$rc" != 0 ]; then ok "update failed for an unknown tag"; else bad "update succeeded for an unknown tag"; fi
-if "$target_bin" version | grep -q "0.9.0-myswy.1"; then
-  ok "the binary stayed on its installed version"
+after_sha="$(sha_of "$target_bin")"
+if [ "$before_sha" = "$after_sha" ]; then
+  ok "the binary is byte-for-byte unchanged (sha256 $before_sha)"
 else
-  bad "an unknown tag still replaced the binary"
+  bad "an unknown tag replaced the binary: $before_sha -> $after_sha"
 fi
 if printf '%s' "$out" | grep -q "zzttzzmyswy/multica"; then
   ok "the failure names the release repository it consulted"
 else
   bad "the failure does not say where it looked: $out"
+fi
+
+step "A malformed tag that outranks the valid one is never selected"
+# The reported defect: v99.0.0-myswy.1-extra contains the distribution suffix and
+# sorts higher than every real release, so a suffix-only check selected it and
+# then requested /releases/tags/v99.0.0-myswy.1-extra. The valid release must
+# still be chosen, and the malformed tag must never appear in a request path.
+target_bin="$(fresh_target malformed)"
+mv "$ROOT/releases.json" "$ROOT/releases.json.bak"
+python3 - "$ROOT" "$PORT" <<'PY'
+import json, sys
+root, port = sys.argv[1], sys.argv[2]
+tag = "v0.9.0-myswy.2"
+asset = "multica-cli-%s-linux-amd64.tar.gz" % tag[1:]
+def base_url(t, a):
+    return "http://127.0.0.1:%s/releases/download/%s/%s" % (port, t, a)
+releases = [
+    # Malformed entries that all sort above the valid one.
+    {"tag_name": "v99.0.0-myswy.1-extra", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:09:00Z",
+     "assets": [{"name": "multica-cli-99.0.0-myswy.1-extra-linux-amd64.tar.gz",
+                 "browser_download_url": base_url("v99.0.0-myswy.1-extra", "multica-cli-99.0.0-myswy.1-extra-linux-amd64.tar.gz")}]},
+    {"tag_name": "v98.0.0-myswy.1.2", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:08:00Z",
+     "assets": [{"name": "multica-cli-98.0.0-myswy.1.2-linux-amd64.tar.gz",
+                 "browser_download_url": base_url("v98.0.0-myswy.1.2", "multica-cli-98.0.0-myswy.1.2-linux-amd64.tar.gz")}]},
+    {"tag_name": "v97.0.0-myswy.", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:07:00Z",
+     "assets": [{"name": "multica-cli-97.0.0-myswy.-linux-amd64.tar.gz",
+                 "browser_download_url": base_url("v97.0.0-myswy.", "multica-cli-97.0.0-myswy.-linux-amd64.tar.gz")}]},
+    {"tag_name": "v96.0.0-myswy.x", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:06:00Z",
+     "assets": [{"name": "multica-cli-96.0.0-myswy.x-linux-amd64.tar.gz",
+                 "browser_download_url": base_url("v96.0.0-myswy.x", "multica-cli-96.0.0-myswy.x-linux-amd64.tar.gz")}]},
+    # Draft, otherwise well-formed.
+    {"tag_name": "v95.0.0-myswy.1", "prerelease": True, "draft": True,
+     "published_at": "2026-11-14T00:05:00Z",
+     "assets": [{"name": "multica-cli-95.0.0-myswy.1-linux-amd64.tar.gz",
+                 "browser_download_url": base_url("v95.0.0-myswy.1", "multica-cli-95.0.0-myswy.1-linux-amd64.tar.gz")}]},
+    # Well-formed, but no archive for this platform.
+    {"tag_name": "v94.0.0-myswy.1", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:04:00Z",
+     "assets": [{"name": "multica-cli-94.0.0-myswy.1-darwin-arm64.tar.gz",
+                 "browser_download_url": base_url("v94.0.0-myswy.1", "multica-cli-94.0.0-myswy.1-darwin-arm64.tar.gz")}]},
+    # Well-formed, but its only archive names a different version.
+    {"tag_name": "v93.0.0-myswy.1", "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:03:00Z",
+     "assets": [{"name": "multica-cli-%s" % asset,
+                 "browser_download_url": base_url("v93.0.0-myswy.1", asset)}]},
+    # The one real release.
+    {"tag_name": tag, "prerelease": True, "draft": False,
+     "published_at": "2026-11-14T00:02:00Z",
+     "assets": [{"name": asset, "browser_download_url": base_url(tag, asset)},
+                {"name": "checksums.txt",
+                 "browser_download_url": base_url(tag, "checksums.txt")}]},
+]
+json.dump({"latest": None, "tags": {r["tag_name"]: r for r in releases}},
+          open(root + "/releases.json", "w"))
+PY
+before="$(requests)"
+out="$("$target_bin" update 2>&1)"; rc=$?
+mv "$ROOT/releases.json.bak" "$ROOT/releases.json"
+if [ "$rc" = 0 ]; then
+  ok "unpinned update exited 0"
+else
+  bad "unpinned update failed against a list with malformed neighbours: $out"
+fi
+if version_matches "$target_bin" "0.9.0-myswy.2"; then
+  ok "selected the only well-formed release instead of a malformed one ranked higher"
+else
+  bad "did not install v0.9.0-myswy.2: $(version_line "$target_bin")"
+fi
+malformed_hits="$(comm -13 <(printf '%s\n' "$before") <(requests) | grep -E 'myswy\.1-extra|myswy\.1\.2|myswy\.-|myswy\.x|99\.0\.0|98\.0\.0|97\.0\.0|96\.0\.0|95\.0\.0|94\.0\.0|93\.0\.0' || true)"
+if [ -z "$malformed_hits" ]; then
+  ok "no request ever named a malformed, draft, platform-less, or version-mismatched release"
+else
+  bad "the update touched an entry it should have skipped: $malformed_hits"
 fi
 
 printf '\n'

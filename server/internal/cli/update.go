@@ -195,27 +195,37 @@ func IsNewerVersion(latest, current string) bool {
 // downgrade a developer build to a public release just because the
 // dev-describe patch happened to look numeric after trimming.
 func parseReleaseVersion(v string) ([3]int, bool) {
-	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "v"))
-	if s == "" {
+	parts, ok := parseNumericComponents(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "v")), 3)
+	if !ok {
 		return [3]int{}, false
 	}
-	parts := strings.Split(s, ".")
-	if len(parts) != 3 {
-		return [3]int{}, false
+	return [3]int{parts[0], parts[1], parts[2]}, true
+}
+
+// parseNumericComponents parses exactly count dot-separated components, each a
+// non-empty run of ASCII digits that fits in an int. Every other shape — an
+// empty component ("1..2"), a sign, a symbol, a trailing tail, or a number large
+// enough to overflow — is refused rather than coerced to 0. Coercion is what
+// makes a malformed release look installable: the caller would otherwise compare
+// it as a real version and could select it.
+func parseNumericComponents(value string, count int) ([]int, bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) != count {
+		return nil, false
 	}
-	var out [3]int
+	out := make([]int, count)
 	for i, p := range parts {
 		if p == "" {
-			return [3]int{}, false
+			return nil, false
 		}
 		for _, r := range p {
 			if r < '0' || r > '9' {
-				return [3]int{}, false
+				return nil, false
 			}
 		}
 		n, err := strconv.Atoi(p)
 		if err != nil {
-			return [3]int{}, false
+			return nil, false
 		}
 		out[i] = n
 	}
@@ -391,17 +401,17 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 	var newestVersion [4]int
 	for i := range releases {
 		release := &releases[i]
+		// Each exclusion is per-entry: one malformed, draft, or
+		// platform-less release must not stop a later, valid one from being
+		// selected.
 		if release.Draft {
-			continue
-		}
-		if !IsDistributionTag(release.TagName) {
-			continue
-		}
-		if !hasReleaseAssetFor(release.Assets, release.TagName, runtime.GOOS, runtime.GOARCH) {
 			continue
 		}
 		version, ok := parseDistributionVersion(release.TagName)
 		if !ok {
+			continue
+		}
+		if !hasVersionedReleaseAssetFor(release.Assets, release.TagName, runtime.GOOS, runtime.GOARCH) {
 			continue
 		}
 		if newest == nil || versionGreater(version, newestVersion) {
@@ -449,14 +459,32 @@ const DistributionTagSuffix = "-myswy."
 
 // IsDistributionTag reports whether tag is one of this distribution's releases
 // (vX.Y.Z-myswy.N) rather than an upstream tag synced into the same repository.
+//
+// It answers the same question as parseDistributionVersion's ok result, and is
+// defined in terms of it: a tag that merely contains the suffix — a trailing
+// "-extra", an extra component, an empty or non-numeric build — is not this
+// distribution's release and must not be selectable.
 func IsDistributionTag(tag string) bool {
-	return strings.Contains(tag, DistributionTagSuffix)
+	_, ok := parseDistributionVersion(tag)
+	return ok
 }
 
 // parseDistributionVersion splits vX.Y.Z-myswy.N into its four numeric
 // components. A tag of any other shape returns false.
+//
+// Every component must be a non-empty run of digits. Nothing is coerced and
+// nothing is truncated: a tag that says "-myswy.1-extra" or "-myswy.1.2" names a
+// version this distribution does not publish, and treating it as build 1 would
+// let a malformed release win the newest-build comparison and then be installed.
 func parseDistributionVersion(tag string) ([4]int, bool) {
-	trimmed := strings.TrimPrefix(strings.TrimSpace(tag), "v")
+	trimmed := strings.TrimSpace(tag)
+	// GitHub returns the tag as pushed, and this distribution only ever pushes
+	// v-prefixed tags (the release workflow rejects anything else), so a tag
+	// without the v is a shape this project does not publish. Pinned input may
+	// omit it; that path normalizes through normalizeReleaseTag instead.
+	if !strings.HasPrefix(trimmed, "v") {
+		return [4]int{}, false
+	}
 	base, tail, found := strings.Cut(trimmed, DistributionTagSuffix)
 	if !found {
 		return [4]int{}, false
@@ -467,21 +495,11 @@ func parseDistributionVersion(tag string) ([4]int, bool) {
 		return [4]int{}, false
 	}
 
-	// The build number is the leading digits of the tail; a trailing suffix
-	// ("1-rc1") is not something this distribution publishes, so it is refused
-	// rather than silently compared as 1.
-	digits := tail
-	if i := strings.IndexFunc(tail, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
-		digits = tail[:i]
-	}
-	if digits == "" {
+	build, ok := parseNumericComponents(tail, 1)
+	if !ok {
 		return [4]int{}, false
 	}
-	build, err := strconv.Atoi(digits)
-	if err != nil {
-		return [4]int{}, false
-	}
-	return [4]int{core[0], core[1], core[2], build}, true
+	return [4]int{core[0], core[1], core[2], build[0]}, true
 }
 
 func versionGreater(a, b [4]int) bool {
@@ -493,12 +511,24 @@ func versionGreater(a, b [4]int) bool {
 	return false
 }
 
-// hasReleaseAssetFor reports whether a release publishes an archive this
-// platform can install. A release that only built other platforms must be
-// skipped, not selected and then failed at download time.
-func hasReleaseAssetFor(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) bool {
-	_, err := findReleaseAsset(assets, targetVersion, goos, goarch)
-	return err == nil
+// hasVersionedReleaseAssetFor reports whether a release publishes the versioned
+// archive for its own tag on this platform.
+//
+// Newest-build selection uses this rather than findReleaseAsset because that
+// helper also accepts the versionless legacy name (`multica_<os>_<arch>.<ext>`).
+// A versionless archive cannot be checked against the tag it is attached to, so
+// a release whose only archive is one of those cannot prove it belongs to the
+// version it claims. The legacy name stays valid on the pinned download path,
+// which is what actually needs it: an already-installed CLI published under the
+// old scheme downloads the archive of a tag it named explicitly.
+func hasVersionedReleaseAssetFor(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) bool {
+	versioned := ReleaseAssetName(targetVersion, goos, goarch)
+	for i := range assets {
+		if assets[i].Name == versioned {
+			return true
+		}
+	}
+	return false
 }
 
 // knownBrewPrefixes lists the install roots Homebrew uses on each platform.

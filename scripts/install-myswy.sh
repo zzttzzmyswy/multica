@@ -124,11 +124,9 @@ api_get() {
 # any "split the document and match nearby strings" approach misparses real
 # responses (it passes only while the wanted asset happens to be first).
 JSON_PY='
-import json, sys
+import json, re, sys
 
 mode = sys.argv[1]
-suffix = sys.argv[2]
-asset_suffix = sys.argv[3]
 
 try:
     data = json.load(sys.stdin)
@@ -139,44 +137,58 @@ except Exception as exc:
 # A single release object, or the list endpoint. Normalize to a list.
 releases = data if isinstance(data, list) else [data]
 
-def version_key(tag):
-    """Sort key for vX.Y.Z-myswy.N: numeric X.Y.Z, then the build number N.
+# The one tag shape this distribution publishes, and the same shape the CLI
+# accepts (server/internal/cli/update.go: parseDistributionVersion). Four
+# non-empty runs of digits and nothing else: no trailing "-extra", no extra
+# component, no sign, no empty build. A looser check lets a malformed tag win the
+# comparison below and then be installed, which is how v99.0.0-myswy.1-extra
+# used to beat every real release.
+def tag_pattern(suffix):
+    return re.compile(r"^v(\d+)\.(\d+)\.(\d+)%s(\d+)$" % re.escape(suffix))
 
-    A tag missing the distribution suffix never reaches this point. Anything
-    unparsable sorts below every well-formed tag instead of crashing, so one
-    odd release cannot make the whole list unusable.
+def tag_version(tag, pattern):
+    """(major, minor, patch, build) as ints, or None for a tag that is not a
+    release of this distribution.
+
+    Python integers do not overflow, so a build number too large for the CLI
+    still parses and orders correctly here; it is the asset lookup and the
+    download that reject it, not the shape check.
     """
-    core = tag[1:] if tag.startswith("v") else tag
-    base, _, tail = core.partition("-myswy.")
-    try:
-        major, minor, patch = (int(part) for part in base.split("."))
-    except Exception:
-        return (-1, -1, -1, -1)
-    try:
-        build = int(tail.split(".")[0]) if tail else 0
-    except Exception:
-        build = 0
-    return (major, minor, patch, build)
-
-def has_asset(release, asset_suffix):
-    for asset in release.get("assets") or []:
-        name = asset.get("name") or ""
-        if name.startswith("multica-cli-") and name.endswith(asset_suffix):
-            return True
-    return False
+    if not isinstance(tag, str):
+        return None
+    match = pattern.match(tag)
+    if not match:
+        return None
+    return tuple(int(group) for group in match.groups())
 
 if mode == "highest":
-    tags = [
-        release["tag_name"]
-        for release in releases
-        if isinstance(release, dict)
-        and isinstance(release.get("tag_name"), str)
-        and suffix in release["tag_name"]
-        and has_asset(release, asset_suffix)
-    ]
-    if not tags:
+    suffix = sys.argv[2]        # e.g. -myswy.
+    platform = sys.argv[3]      # e.g. linux-amd64
+    pattern = tag_pattern(suffix)
+    best_tag = None
+    best_key = None
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        # Each exclusion is per-entry: one draft, malformed, or platform-less
+        # release must not stop a later valid one from being chosen.
+        if release.get("draft"):
+            continue
+        tag = release.get("tag_name")
+        version = tag_version(tag, pattern)
+        if version is None:
+            continue
+        # The archive must carry this release's own version, exactly as the CLI
+        # requires (hasVersionedReleaseAssetFor). A versionless legacy name
+        # cannot be tied to the tag it hangs off, so it does not count.
+        wanted = "multica-cli-%s-%s.tar.gz" % (tag[1:], platform)
+        if not any((asset.get("name") or "") == wanted for asset in release.get("assets") or []):
+            continue
+        if best_key is None or version > best_key:
+            best_tag, best_key = tag, version
+    if best_tag is None:
         sys.exit(1)
-    print(max(tags, key=version_key))
+    print(best_tag)
 elif mode == "assets":
     # Asset names of the single release on stdin, one per line.
     for asset in data.get("assets") or []:
@@ -202,7 +214,7 @@ list_distribution_tags() {
   json="$(api_get "${REPO_API_URL}/releases?per_page=100")" ||
     fail "Could not list releases from ${REPO_WEB_URL}. Check your network connection."
 
-  printf '%s' "$json" | python3 -c "$JSON_PY" highest "$DISTRIBUTION_SUFFIX" "-${OS}-${ARCH}.tar.gz"
+  printf '%s' "$json" | python3 -c "$JSON_PY" highest "$DISTRIBUTION_SUFFIX" "${OS}-${ARCH}"
 }
 
 resolve_target_version() {

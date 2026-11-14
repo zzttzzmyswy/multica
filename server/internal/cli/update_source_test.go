@@ -165,6 +165,98 @@ func TestFetchLatestReleaseReadsTheListNotTheLatestEndpoint(t *testing.T) {
 	}
 }
 
+// A tag that contains the distribution suffix but is not a well-formed
+// vX.Y.Z-myswy.N release must never win newest-build selection, no matter how
+// high it sorts. The malformed entries here all outrank the one valid release,
+// so any lenient parse (truncating "-extra", splitting off a 4th component,
+// coercing a non-numeric or empty build to 0) makes this test select them.
+func TestFetchLatestReleaseSkipsMalformedTagsEvenWhenTheySortHighest(t *testing.T) {
+	releases := []GitHubRelease{
+		// Suffix present, trailing junk: the exact tag an earlier parser read as
+		// 99.0.0 build 1 and then requested.
+		{TagName: "v99.0.0-myswy.1-extra", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-99.0.0-myswy.1-extra-linux-amd64.tar.gz"},
+		}},
+		// Extra numeric component.
+		{TagName: "v98.0.0-myswy.1.2", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-98.0.0-myswy.1.2-linux-amd64.tar.gz"},
+		}},
+		// Empty build.
+		{TagName: "v97.0.0-myswy.", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-97.0.0-myswy.-linux-amd64.tar.gz"},
+		}},
+		// Non-numeric build.
+		{TagName: "v96.0.0-myswy.x", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-96.0.0-myswy.x-linux-amd64.tar.gz"},
+		}},
+		// Signed build.
+		{TagName: "v95.0.0-myswy.-1", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-95.0.0-myswy.-1-linux-amd64.tar.gz"},
+		}},
+		// Draft, otherwise well-formed.
+		{TagName: "v94.0.0-myswy.1", Draft: true, Assets: assetsFor("94.0.0-myswy.1")},
+		// Well-formed, but the only archive is for another platform.
+		{TagName: "v93.0.0-myswy.1", Assets: assetsForPlatform("93.0.0-myswy.1", "darwin", "arm64")},
+		// Well-formed, but its archive names a different version.
+		{TagName: "v92.0.0-myswy.1", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-0.9.0-myswy.1-linux-amd64.tar.gz"},
+		}},
+		// Well-formed, but publishes only the versionless legacy archive, which
+		// cannot be tied to this tag.
+		{TagName: "v91.0.0-myswy.1", Assets: []GitHubReleaseAsset{
+			{Name: "multica_linux_amd64.tar.gz"},
+		}},
+		// The only release that is actually installable.
+		{TagName: "v0.9.0-myswy.2", Assets: assetsFor("0.9.0-myswy.2")},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(releases)
+	}))
+	defer srv.Close()
+	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
+
+	got, err := FetchLatestRelease()
+	if err != nil {
+		t.Fatalf("FetchLatestRelease() error = %v", err)
+	}
+	if got.TagName != "v0.9.0-myswy.2" {
+		t.Fatalf("selected %q; every higher-ranked entry is malformed, a draft, for another platform, or carries the wrong archive", got.TagName)
+	}
+}
+
+// One unusable entry must not hide the valid ones around it: selection has to
+// skip each bad release individually rather than stop at the first.
+func TestFetchLatestReleaseSkipsBadEntriesIndividually(t *testing.T) {
+	releases := []GitHubRelease{
+		{TagName: "v0.9.0-myswy.3", Draft: true, Assets: assetsFor("0.9.0-myswy.3")},
+		{TagName: "v0.9.0-myswy.1-extra", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-0.9.0-myswy.1-extra-linux-amd64.tar.gz"},
+		}},
+		{TagName: "v0.9.0-myswy.2", Assets: assetsFor("0.9.0-myswy.2")},
+		{TagName: "v0.9.0-myswy.", Assets: []GitHubReleaseAsset{
+			{Name: "multica-cli-0.9.0-myswy.-linux-amd64.tar.gz"},
+		}},
+		{TagName: "v0.9.0-myswy.1", Assets: assetsFor("0.9.0-myswy.1")},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(releases)
+	}))
+	defer srv.Close()
+	t.Setenv(releaseAPIBaseURLEnv, srv.URL)
+
+	got, err := FetchLatestRelease()
+	if err != nil {
+		t.Fatalf("FetchLatestRelease() error = %v", err)
+	}
+	if got.TagName != "v0.9.0-myswy.2" {
+		t.Fatalf("selected %q, want v0.9.0-myswy.2", got.TagName)
+	}
+}
+
 func assetsFor(version string) []GitHubReleaseAsset {
 	return []GitHubReleaseAsset{{
 		Name:               ReleaseAssetName(version, "linux", "amd64"),
@@ -241,17 +333,32 @@ func TestFetchLatestReleaseReportsWhenNothingIsInstalled(t *testing.T) {
 }
 
 func TestIsDistributionTagRejectsUpstreamTags(t *testing.T) {
-	distribution := []string{"v0.9.0-myswy.1", "0.9.0-myswy.1", "v1.2.3-myswy.10"}
-	upstream := []string{"v0.9.0", "v1.2.3", "v0.2.15-235-gdaf0e935", ""}
+	distribution := []string{"v0.9.0-myswy.1", "v1.2.3-myswy.10"}
+	// A tag without the v is not what this distribution's workflow publishes,
+	// and release selection reads API tags verbatim. Pinned input may omit it,
+	// but that path normalizes before it reaches this predicate.
+	rejected := []string{
+		"0.9.0-myswy.1",
+		"v0.9.0",
+		"v1.2.3",
+		"v0.2.15-235-gdaf0e935",
+		"",
+		// Contains the suffix, but is not a version this distribution publishes.
+		"v99.0.0-myswy.1-extra",
+		"v0.9.0-myswy.1.2",
+		"v0.9.0-myswy.",
+		"v0.9.0-myswy.x",
+		"v0.9.0-myswy.-1",
+	}
 
 	for _, tag := range distribution {
 		if !IsDistributionTag(tag) {
 			t.Fatalf("IsDistributionTag(%q) = false, want true", tag)
 		}
 	}
-	for _, tag := range upstream {
+	for _, tag := range rejected {
 		if IsDistributionTag(tag) {
-			t.Fatalf("IsDistributionTag(%q) = true; an upstream tag must never be selected", tag)
+			t.Fatalf("IsDistributionTag(%q) = true; it must never be selected", tag)
 		}
 	}
 }
@@ -263,11 +370,20 @@ func TestParseDistributionVersion(t *testing.T) {
 		ok   bool
 	}{
 		{"v0.9.0-myswy.1", [4]int{0, 9, 0, 1}, true},
-		{"0.9.0-myswy.10", [4]int{0, 9, 0, 10}, true},
+		{"v0.9.0-myswy.10", [4]int{0, 9, 0, 10}, true},
 		{"v1.2.3-myswy.0", [4]int{1, 2, 3, 0}, true},
-		{"v0.9.0", [4]int{}, false},
+		// Four non-empty numeric components, all of them required.
+		{"v0.9.0-myswy.1-extra", [4]int{}, false},
+		{"v0.9.0-myswy.1.2", [4]int{}, false},
 		{"v0.9.0-myswy.", [4]int{}, false},
+		{"v0.9.0-myswy.x", [4]int{}, false},
+		{"v0.9.0-myswy.-1", [4]int{}, false},
+		{"v0.9.0-myswy.+1", [4]int{}, false},
+		{"v0.9..0-myswy.1", [4]int{}, false},
+		{"v0.9.0-myswy.99999999999999999999", [4]int{}, false}, // overflows int
+		{"v0.9.0", [4]int{}, false},
 		{"v0.9-myswy.1", [4]int{}, false},
+		{"0.9.0-myswy.10", [4]int{}, false},
 		{"v0.2.15-235-gdaf0e935", [4]int{}, false},
 	}
 	for _, tt := range tests {
