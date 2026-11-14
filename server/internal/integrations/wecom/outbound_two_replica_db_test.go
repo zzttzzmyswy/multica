@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -988,25 +989,47 @@ func TestProvablyNotSent_Classification(t *testing.T) {
 // local retry nobody ever comes back — each replica reads a stream frame
 // exactly once. The bounded requeue is what rescues it: B's losing attempt
 // retries, finds the claim free, and delivers.
+//
+// The four steps are a barrier chain rather than a race, and each one is
+// observable: the test offers B its copy only once A holds the claim, A
+// returns from its delivery only once B has lost that race, and B's re-offers
+// cannot reach the store until A's release has landed (leaseMoveStore). What
+// is left on a timer is the backoff between B's own offers, and the final wait
+// is a bounded safety net.
+//
+// REVERSE VERIFICATION: make perform's losing branch stop re-offering (return
+// true where it returns false) and this fails — A owns nothing after the flip,
+// B's one attempt loses, and no frame reaches the socket. That depends on A
+// owning the socket ONCE: a handler that keeps answering yes re-wins the claim
+// after every release and starves B, which is precisely how this test used to
+// pass or time out on scheduling.
 func TestRelay_LeaseMoveMidFlightIsRescuedByRetry(t *testing.T) {
 	t.Parallel()
-	relay, dedupe := &fanoutRelay{}, newSharedDedupe()
+	relay, store := &fanoutRelay{}, newLeaseMoveStore()
 	instID := mustTestUUID(t)
+	// Explicit short clocks, so the only wait paid is B's own backoff. The
+	// production chain and lease poll are pinned by their own tests
+	// (TestDedupeTTL_CoversTheReplayWindow, relay_ordering_db_test.go).
+	cfg := RelayConfig{
+		Shards: 1, LeaseSettle: 120 * time.Millisecond,
+		RetryBackoff: 20 * time.Millisecond, DeliveryBudget: 20 * time.Millisecond,
+	}
 
-	// Replica A: passes ownsSocket, then finds the sender gone at delivery —
-	// a handler whose ownership answer and whose delivery disagree, which is
-	// exactly what a lease moving between the two moments looks like.
-	aRouter := NewRelayOutbound(relay, dedupe, RelayConfig{}, slog.Default())
+	// Replica A: passes ownsSocket for the delivery it was dispatched under,
+	// then finds the sender gone — a lease that moved between the check and
+	// the send.
+	holder := newLeaseMoveHandler(store)
+	aRouter := NewRelayOutbound(relay, store, cfg, slog.Default())
 	actx, acancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { acancel(); aRouter.Wait() })
 	aRouter.Start(actx)
-	aRouter.Attach(&flipHandler{})
+	aRouter.Attach(holder)
 
 	// Replica B: genuinely holds the socket throughout.
 	conn := &recordingConn{}
 	bReg := newSendersRegistry()
 	bReg.set(instID, conn.autoAck(newWSSender(conn, nil)))
-	bRouter := NewRelayOutbound(relay, dedupe, RelayConfig{}, slog.Default())
+	bRouter := NewRelayOutbound(relay, store, cfg, slog.Default())
 	bctx, bcancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { bcancel(); bRouter.Wait() })
 	bRouter.Start(bctx)
@@ -1019,24 +1042,215 @@ func TestRelay_LeaseMoveMidFlightIsRescuedByRetry(t *testing.T) {
 		Kind: relayKindReply, InstallationID: util.UUIDToString(instID),
 		ChatID: "CHAT_1", ChatType: chatTypeSingleInt, Content: "hello",
 	})
-	// Both replicas read the frame, as every replica does.
+	// A's copy first, and B's only after A is holding the claim: that is the
+	// ordering the race used to decide on its own.
 	aRouter.DeliverWecomOutbound(util.UUIDToString(instID), body, "ev-move")
+	waitFor(t, "replica A to take the claim", func() bool { return holder.holdsClaim() })
 	bRouter.DeliverWecomOutbound(util.UUIDToString(instID), body, "ev-move")
 
-	// Whichever ordering the race takes, the retry must land the reply.
-	waitLong(t, "the reply to be rescued", func() bool { return conn.frameCount() == 1 })
-	time.Sleep(100 * time.Millisecond)
+	waitFor(t, "the reply to be rescued by B's local retry", func() bool { return conn.frameCount() == 1 })
+
+	// The path, not just the ending: A claimed and released, B lost and then
+	// won a second attempt. Ordering is asserted because each step is what
+	// makes the next one meaningful.
+	want := []string{"A:claim", "B:claim-lost", "A:release", "B:claim-won"}
+	if got := store.trace(); !slices.Equal(got, want) {
+		t.Fatalf("claim trace = %v, want %v", got, want)
+	}
+	if got := holder.deliveryCount(); got != 1 {
+		t.Fatalf("A performed %d delivery attempt(s), want 1: it must be the "+
+			"attempt that discovers the lease gone, not a sender that keeps trying", got)
+	}
 	if got := conn.frameCount(); got != 1 {
 		t.Fatalf("frames = %d, want exactly 1", got)
 	}
+
+	// A replay of the same event must not write a second copy. It is offered
+	// to a replica that never saw it — a restart's replay, with a fresh
+	// in-process seen-set — so what stops it is the claim B settled, not a
+	// cache. Give it its whole re-offer chain to try.
+	fresh := NewRelayOutbound(relay, store, cfg, slog.Default())
+	fctx, fcancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { fcancel(); fresh.Wait() })
+	fresh.Start(fctx)
+	fresh.Attach(&Outbound{senders: bReg, logger: slog.Default()})
+	fresh.DeliverWecomOutbound(util.UUIDToString(instID), body, "ev-move")
+
+	chain := cfg.retryPlan()
+	var chainTotal time.Duration
+	for _, d := range chain {
+		chainTotal += d
+	}
+	time.Sleep(chainTotal + 100*time.Millisecond)
+	if got := conn.frameCount(); got != 1 {
+		t.Fatalf("frames = %d after a replay, want 1: the rescue retries the same "+
+			"delivery, it does not make the reply at-least-once", got)
+	}
+	if got := store.winCount(); got != 1 {
+		t.Fatalf("the claim was won %d time(s), want 1", got)
+	}
 }
 
-// flipHandler owns the socket when asked and does not when delivering — the
-// deterministic shape of a lease that moved between the check and the send.
-type flipHandler struct{}
+// leaseMoveStore turns the claim race into the sequence this test is about: A
+// takes the key, B's first attempt loses to it, and every attempt after that
+// waits for A's release before it reaches the store. No scheduler luck
+// decides whether the retry finds the key free.
+type leaseMoveStore struct {
+	*sharedDedupe
 
-func (*flipHandler) ownsSocket(string) bool { return true }
-func (*flipHandler) deliverRelayed(context.Context, relayFrame) relayResult {
+	mu         sync.Mutex
+	winner     string
+	events     []string
+	losses     int
+	wins       int
+	lostCh     chan struct{}
+	releasedCh chan struct{}
+	lostOnce   sync.Once
+	releaseOne sync.Once
+
+	// gateBudget bounds the barrier itself, so a broken fixture fails the
+	// test instead of hanging it.
+	gateBudget time.Duration
+}
+
+func newLeaseMoveStore() *leaseMoveStore {
+	return &leaseMoveStore{
+		sharedDedupe: newSharedDedupe(),
+		lostCh:       make(chan struct{}),
+		releasedCh:   make(chan struct{}),
+		gateBudget:   5 * time.Second,
+	}
+}
+
+func (s *leaseMoveStore) record(event string) { s.events = append(s.events, event) }
+
+func (s *leaseMoveStore) trace() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.events...)
+}
+
+func (s *leaseMoveStore) winCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wins
+}
+
+func (s *leaseMoveStore) Claim(ctx context.Context, key, token string, ttl time.Duration) (bool, error) {
+	s.mu.Lock()
+	if s.winner == "" {
+		s.winner = token
+		s.record("A:claim")
+		s.mu.Unlock()
+		return s.sharedDedupe.Claim(ctx, key, token, ttl)
+	}
+	if token == s.winner {
+		s.record("A:re-claim")
+		s.mu.Unlock()
+		return s.sharedDedupe.Claim(ctx, key, token, ttl)
+	}
+	first := s.losses == 0
+	if first {
+		s.losses++
+		s.record("B:claim-lost")
+	}
+	s.mu.Unlock()
+
+	if first {
+		// Losing to A's held claim is the event A's delivery is waiting for:
+		// A only gives the claim back once B is already a loser. A free key
+		// here would mean this fake fabricated the loss the test rests on.
+		if s.sharedDedupe.holds(key) {
+			s.lostOnce.Do(func() { close(s.lostCh) })
+			return false, nil
+		}
+		return false, errors.New("lease-move fixture: B was offered the claim while the key was free")
+	}
+
+	gate := time.NewTimer(s.gateBudget)
+	defer gate.Stop()
+	select {
+	case <-s.releasedCh:
+	case <-gate.C:
+		return false, errors.New("lease-move fixture: the claim was never released")
+	}
+	won, err := s.sharedDedupe.Claim(ctx, key, token, ttl)
+	if won && err == nil {
+		s.mu.Lock()
+		s.wins++
+		s.record("B:claim-won")
+		s.mu.Unlock()
+	}
+	return won, err
+}
+
+func (s *leaseMoveStore) Release(ctx context.Context, key, token string) (bool, error) {
+	released, err := s.sharedDedupe.Release(ctx, key, token)
+	if released && err == nil {
+		s.mu.Lock()
+		s.record("A:release")
+		s.mu.Unlock()
+		s.releaseOne.Do(func() { close(s.releasedCh) })
+	}
+	return released, err
+}
+
+// leaseMoveHandler is replica A's stand-in for a lease that has already moved:
+// it owns the socket for the ownership check its delivery was dispatched
+// under, and by the time that delivery runs the socket is B's. Answering yes
+// more than once is a different scenario — A then re-wins the claim after
+// every release and B never sees a free key.
+type leaseMoveHandler struct {
+	store *leaseMoveStore
+
+	mu         sync.Mutex
+	owns       int
+	deliveries int
+	held       chan struct{}
+	heldOnce   sync.Once
+}
+
+func newLeaseMoveHandler(store *leaseMoveStore) *leaseMoveHandler {
+	return &leaseMoveHandler{store: store, held: make(chan struct{})}
+}
+
+func (h *leaseMoveHandler) ownsSocket(string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.owns++
+	return h.owns == 1
+}
+
+// holdsClaim reports whether A has reached the delivery that its winning claim
+// put it in, which is the moment B's copy may be offered.
+func (h *leaseMoveHandler) holdsClaim() bool {
+	select {
+	case <-h.held:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *leaseMoveHandler) deliveryCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.deliveries
+}
+
+func (h *leaseMoveHandler) deliverRelayed(context.Context, relayFrame) relayResult {
+	h.mu.Lock()
+	h.deliveries++
+	h.mu.Unlock()
+	h.heldOnce.Do(func() { close(h.held) })
+	// A's half of the barrier: the lease is only given back after B has lost
+	// the race for it, so B's winning attempt cannot precede it either.
+	gate := time.NewTimer(h.store.gateBudget)
+	defer gate.Stop()
+	select {
+	case <-h.store.lostCh:
+	case <-gate.C:
+	}
 	return relayResult{outcome: outcomeNotOurs}
 }
 
