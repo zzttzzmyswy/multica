@@ -15,7 +15,7 @@ disk so a separate shell can watch progress.
 | | |
 | --- | --- |
 | Freezes every writer before backing up | Stops both timers **and** the services they may already have started, the daemon, and the backend/frontend containers; each is confirmed by reading its real state |
-| Snapshots before touching anything | `prepare` records the compose file, image digests, CLI binary, upgrade script (hash, mode, owner) and all unit states; a re-run never overwrites that snapshot |
+| Snapshots before touching anything | `prepare` records the compose file, image identity (the image the container runs plus its repo digests), CLI binary, upgrade script (hash, mode, owner) and all unit states, then publishes them with one rename; a second `prepare` only re-verifies that snapshot read-only and refuses if anything has drifted |
 | Migrates with the exact image | `docker run --entrypoint /app/migrate <pinned .2 backend> up` — no server, no worker |
 | Verifies what actually runs | Health commit, both container digests, ledger/table/index shape, CLI version and hash, unit entry point |
 | Rolls back images, config, CLI and script | `rollback-r1` restores each one from the snapshot and verifies it, and keeps the current database |
@@ -69,8 +69,18 @@ path is refused too.
 or `multica-attachment-gc.service` still running): freezing a half-applied
 update would leave a state the snapshot cannot describe.
 
-Re-running `prepare` re-verifies the assets and **keeps** the original snapshot.
-Once the journal has moved past `prepared`, `prepare` refuses outright.
+Re-running `prepare` re-verifies the assets against the hashes the journal
+recorded and **keeps** the original snapshot: it does not rebuild it. That is a
+read-only comparison of both the snapshot files and the live ones, so if the live
+updater, CLI or compose file has changed since the first run the command exits
+`20` and leaves the recorded originals untouched. A snapshot file that no longer
+matches its recorded hash is reported the same way rather than silently
+repaired. Once the journal has moved past `prepared`, `prepare` refuses outright.
+
+The publish itself is transactional: every file is written under
+`assets.new/` and renamed into place only after the whole snapshot and every
+journal key is complete, so a failure midway leaves the previous snapshot intact
+rather than half-replaced.
 
 Config keys (`KEY=VALUE`, one per line, `#` comments):
 
@@ -101,9 +111,14 @@ APPROVED_UPGRADE_SHA256=a777090243e1bcf237856486d9759ff596dbf95c1751c928a41ef193
 ```
 
 Timeouts (`STOP_TIMEOUT`, `BACKUP_TIMEOUT`, `TOC_TIMEOUT`, `MIGRATE_TIMEOUT`,
-`UP_TIMEOUT`, `HEALTH_TIMEOUT`, `QUERY_TIMEOUT`, `PROBE_TIMEOUT`) are optional,
-in seconds; the defaults are in the script header. A timeout is a failure, never
-an unbounded wait.
+`UP_TIMEOUT`, `HEALTH_TIMEOUT`, `QUERY_TIMEOUT`, `PROBE_TIMEOUT`,
+`HEALTH_POLL_INTERVAL`) default to the values in the script header, but an
+explicitly configured one must be a **positive integer**: a blank, zero or
+non-numeric value is refused (exit `2`). `timeout(1)` is required; without it no
+external call can be bounded, so the tool refuses to run rather than degrade to
+an unbounded call. Every external command — including `<cli> --version` — goes
+through that ceiling. See the remaining gap in "Limits" below about calls that
+are still unbounded.
 
 ## The window
 
@@ -155,6 +170,23 @@ A failure records the step in the journal and prints the real state. Re-running
 `run --intent=switch` resumes at that step; it does not repeat completed steps,
 and it never re-takes the backup or replaces the initial snapshot.
 
+The stage is a position, not evidence, so every resume re-proves the facts the
+remaining steps depend on:
+
+- past the freeze and before the application is started, all five writers must
+  still be down — the API or a oneshot timer service can come back between runs;
+- past the backup, the recorded dump must exist and still match its SHA-256;
+- a **failed migration is a latch**: `migrate_failed` is recorded, and a re-run
+  refuses with exit `80` instead of treating the same command as permission to
+  continue over a possibly half-migrated database. Inspecting the real schema and
+  choosing the next step is the operator's decision, not the tool's;
+- the staged CLI and approved upgrade script must still hash as recorded.
+
+The journal is validated per stage before anything runs: required keys, legal
+unit-state values, a `config_sha256` binding, and no duplicate keys. A truncated
+or hand-edited journal is refused (exit `80`) rather than resumed with an empty
+snapshot.
+
 Watch progress from another shell at any time:
 
 ```bash
@@ -180,10 +212,12 @@ state:
 
 1. Stop the writers again (the upgrade timer must not swap the CLI back
    mid-restore).
-2. Restore the snapshotted compose file and verify its hash, `up -d`, then
-   require `/health` to report the **old** revision and both containers to run
-   the **old** digests. Restarting the new configuration and calling it a
-   rollback is exactly the failure this replaces.
+2. Restore the snapshotted compose file and verify its hash, then start the
+   containers from a **digest-pinned copy** of it, and require `/health` to
+   report the **old** revision, both containers to run the **old** digests, and
+   the frontend to actually answer. Restarting the new configuration and calling
+   it a rollback is exactly the failure this replaces; starting from a file that
+   names `latest` would let the registry decide which build comes back.
 3. Restore the CLI from the snapshot; verify hash and version.
 4. Restore the upgrade script from the snapshot with its recorded mode; verify
    hash. This is what stops the upgrade timer from pulling `.2` back onto a
@@ -231,7 +265,8 @@ explicitly **not** covered and belong to the NAS window:
 1. A real `run --intent=switch` end to end against live systemd, docker and
    PostgreSQL 16.15 / vector 0.8.5.
 2. A real `rollback-r1` drill on the resulting state, including that the
-   restored unit states match what `prepare` recorded.
+   restored unit states match what `prepare` recorded, and that the derived
+   digest-pinned rollback compose file starts the expected builds.
 3. The browser upload matrix (0/50/100 MiB) through the **production** reverse
    proxy — the isolated HTTPS edge used earlier does not prove the production
    path.
@@ -241,9 +276,33 @@ explicitly **not** covered and belong to the NAS window:
 5. Real timing: the isolated rehearsal measured R1 at 2.26 s and an empty-volume
    restore at 76.3 s; production compose rebuild and reverse-proxy readiness
    will be slower. Treat those numbers as a lower bound, not a promise.
+6. The frontend readiness probe against the real reverse proxy: the URL, its
+   expected status, and whether a 200 from the proxy actually reflects a serving
+   Next.js app. The offline suite proves the gate reacts to the status code, not
+   that the configured URL is the right one for this deployment.
+7. The real image-identity check on a host whose compose file names
+   `ghcr.io/multica-ai/multica-{backend,web}:latest`. The rule is implemented and
+   tested against stubs, but confirming that the NAS's live containers carry the
+   validated repo digests is a read-only check that must run on the box.
+
+## Limits that are known and deliberate
+
+- **Not every external call is time-bounded.** Everything that goes through
+  `bounded` is; `docker`/`systemctl`/`psql` readiness checks and the mounted
+  filesystem operations are not individually wall-clocked. A hung `flock`,
+  `install`, or `mv` on a stalled NFS mount would still block. The maintenance
+  window is supervised for that reason.
+- **`prepare` cannot prove the future.** It proves the assets and the baseline
+  at the moment it runs; a change made after it is caught by the drift checks in
+  the `prepared` re-verification and the resume preconditions, not prevented.
+- **The migration latch needs a human.** After a failed migration the tool
+  refuses to continue and refuses to roll back an unrecognized schema shape. That
+  is intentional: neither build is verified against a half-migrated database, so
+  the next step is a decision, not a command.
 
 The offline suite (`bash scripts/nas-maintenance.test.sh`) drives the executor
 against command stubs for `systemctl`, `docker` and `curl`. It pins the freeze
-order, the six failure modes reported in review, the digest and revision
-assertions, journal handling, locking, resumption and every R1 restore item. It
-proves the executor's decisions, not the behaviour of real systemd or PostgreSQL.
+order, the digest/revision identity rules, journal validation, the resume
+preconditions, the migration latch, frontend readiness, R1's schema gate and
+every R1 restore item. It proves the executor's decisions, not the behaviour of
+real systemd, PostgreSQL or the registry.

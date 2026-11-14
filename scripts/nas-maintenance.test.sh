@@ -120,7 +120,8 @@ new_case() {
     CUR_CONFIG="$CUR/maintenance.conf"
     rm -rf "$CUR"
     mkdir -p "$CUR/state/units" "$CUR/state/containers" "$CUR/state/opt" \
-        "$CUR/scripts" "$CUR/compose" "$CUR/backup" "$CUR/state-dir" "$CUR/work" "$CUR/cli-bin"
+        "$CUR/state/images" "$CUR/scripts" "$CUR/compose" "$CUR/backup" \
+        "$CUR/state-dir" "$CUR/work" "$CUR/cli-bin"
     : >"$CUR/state/calls.log"
     : >"$CUR/state/exec.log"
     : >"$CUR/state/compose.log"
@@ -130,6 +131,13 @@ new_case() {
     set_unit multica-upgrade.service inactive
     set_unit multica-attachment-gc.timer active
     set_unit multica-attachment-gc.service inactive
+    # The old builds are present locally and carry their release digests, and
+    # the two containers run them. That is the shape prepare verifies identity
+    # against — not how the compose file happens to spell the reference.
+    image_carries "$BACKEND_IMAGE_OLD" "$BACKEND_DIGEST_OLD"
+    image_carries "$WEB_IMAGE_OLD" "$WEB_DIGEST_OLD"
+    image_carries "$BACKEND_IMAGE_NEW" "$BACKEND_DIGEST_NEW"
+    image_carries "$WEB_IMAGE_NEW" "$WEB_DIGEST_NEW"
     set_container multica-backend-1 "$BACKEND_IMAGE_OLD"
     set_container multica-frontend-1 "$WEB_IMAGE_OLD"
 
@@ -157,10 +165,33 @@ STUB
 
 set_unit() { printf '%s\n' "$2" >"$CUR/state/units/$1.state"; }
 
+# image_id_of_ref mirrors the docker stub: the same reference on the same host
+# is the same image, and the digest table records what that image carries.
+image_id_of_ref() {
+    printf 'image-id-%s\n' "$(printf '%s' "$1" | cksum | awk '{print $1}')"
+}
+
+# image_carries <ref> <digest...>: record the repo digests this reference's
+# image reports. A tag resolves to the digests recorded here, so a case can
+# express "latest currently points at the validated build" and then move it.
+image_carries() {
+    local ref=$1
+    shift
+    local id
+    id=$(image_id_of_ref "$ref")
+    mkdir -p "$CUR/state/images"
+    : >"$CUR/state/images/$id.digests"
+    local d
+    for d in "$@"; do
+        printf '%s@%s\n' "${ref%%@*}" "$d" >>"$CUR/state/images/$id.digests"
+    done
+}
+
 set_container() {
     printf '%s\n' "$2" >"$CUR/state/containers/$1.image"
     printf 'running\n' >"$CUR/state/containers/$1.status"
     printf 'true\n' >"$CUR/state/containers/$1.running"
+    image_id_of_ref "$2" >"$CUR/state/containers/$1.image_id"
 }
 
 # stub_opt <name> [value] — sets (or with no value, clears) one stub behaviour.
@@ -189,6 +220,7 @@ write_config() {
         printf 'UPGRADE_TIMER=multica-upgrade.timer\n'
         printf 'GC_TIMER=multica-attachment-gc.timer\n'
         printf 'BACKEND_URL=http://127.0.0.1:8080/health\n'
+        printf 'FRONTEND_URL=http://127.0.0.1:3000/\n'
         printf 'CLI_BIN=%s\n' "$CUR/cli-bin/multica"
         printf 'UPGRADE_SCRIPT=%s\n' "$CUR/scripts/upgrade-multica.sh"
         printf 'CLI_ARCHIVE=%s\n' "$CUR/multica-cli.tar.gz"
@@ -354,10 +386,38 @@ world_post_switch() {
     printf '684\n' >"$CUR/state/ledger_rows"
     printf '148\n' >"$CUR/state/tables"
     printf '799/0/0\n' >"$CUR/state/indexes"
-    sed -i 's/^stage=prepared/stage=cli/' "$CUR/state-dir/journal"
+    # A journal that legitimately reached 'cli' also records every earlier
+    # stage; the fixture has to look like one, or the completeness gate (rightly)
+    # refuses it.
+    jset stage cli
+    jset freeze_at '2026-01-01 00:00:00'
+    jset backup_path "$CUR/backup/world.dump"
+    printf 'world-dump' >"$CUR/backup/world.dump"
+    jset backup_sha256 "$(sha256sum "$CUR/backup/world.dump" | awk '{ print $1 }')"
+    jset backup_bytes 10
+    jset backup_toc_lines 500
+    jset migrate_rc 0
+    jset ledger_after 660_attachment_upload_session_workspace
+    jset switched_commit "$REV_NEW"
+    # Reaching 'cli' means switch already started the new application: the units
+    # are still stopped, but the containers are up and serving.
     set_unit multica-daemon inactive
     set_unit multica-upgrade.timer inactive
+    set_unit multica-upgrade.service inactive
     set_unit multica-attachment-gc.timer inactive
+    set_unit multica-attachment-gc.service inactive
+    set_unit multica-upgrade.timer inactive
+    set_unit multica-attachment-gc.timer inactive
+}
+
+# jset <key> <value> — writes one journal key directly, for fixtures that need
+# to stand in for a stage a normal run would have produced.
+jset() {
+    local f="$CUR/state-dir/journal" k="$1=" v=$2
+    [ -f "$f" ] || : >"$f"
+    awk -v k="$k" 'index($0, k) != 1' "$f" >"$f.tmp"
+    printf '%s%s\n' "$k" "$v" >>"$f.tmp"
+    mv -f "$f.tmp" "$f"
 }
 
 dump_count() { find "$CUR/backup" -name '*.dump' 2>/dev/null | wc -l | tr -d ' '; }
@@ -518,7 +578,8 @@ new_case wrong-digest
 set_container multica-backend-1 "ghcr.io/zzttzzmyswy/multica-backend@sha256:9999999999999999999999999999999999999999999999999999999999999999"
 run_script prepare --config "$CUR_CONFIG"
 expect_rc 20
-expect_log 'expected the pre-change pin' 'refuses an unexpected running image'
+expect_log 'repo digests do not include' 'refuses an unexpected running image'
+expect_log 'the validated backend digest' 'names the digest the baseline requires'
 
 step "prepare refuses a schema, table or index baseline that drifted"
 new_case wrong-ledger
@@ -572,17 +633,21 @@ prepare_ok
 expect_no_call 'curl' 'prepare probes no endpoint'
 expect_no_call 'docker run' 'prepare runs no container'
 
-step "Re-running prepare keeps the original snapshot"
+step "Re-running prepare never rewrites the original snapshot"
 new_case prepare-twice
 prepare_ok
 snapshot_compose="$(journal_get initial_compose_sha256)"
 snapshot_cli="$(journal_get initial_cli_sha256)"
-write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_NEW"
+snapshot_script="$(journal_get initial_upgrade_script_sha256)"
+asset_script="$(sha256sum "$CUR/state-dir/assets/previous/upgrade-multica.sh" | awk '{ print $1 }')"
+# An unchanged host: the re-run is a read-only re-verification and succeeds.
 run_script prepare --config "$CUR_CONFIG"
 expect_rc 0
-expect_log 'keeping the original snapshot' 'says the snapshot is kept'
+expect_log 'snapshot kept as recorded' 'says the snapshot is kept'
 expect_journal initial_compose_sha256 "$snapshot_compose"
 expect_journal initial_cli_sha256 "$snapshot_cli"
+expect_journal initial_upgrade_script_sha256 "$snapshot_script"
+expect_sha "$CUR/state-dir/assets/previous/upgrade-multica.sh" "$asset_script"
 
 step "prepare refuses once maintenance has started"
 new_case prepare-after-run
@@ -1039,7 +1104,7 @@ step "rollback-r1 refuses without a snapshot to restore from"
 new_case r1-no-snapshot
 run_script rollback-r1 --config "$CUR_CONFIG"
 expect_rc 80
-expect_log 'cannot restore a state that was never recorded' 'refuses to improvise'
+expect_log 'no complete prepare snapshot' 'refuses to improvise'
 expect_no_call 'compose .* up' 'changes nothing'
 
 step "rollback-r2 is refused and only prints a read-only plan"
@@ -1156,20 +1221,418 @@ run_script run --intent=switch --config "$CUR_CONFIG"
 expect_rc 80
 expect_log 'already completed' 'refuses to run twice'
 
-step "an interrupted run resumes at the step it stopped on"
+step "a run interrupted before the migration resumes at the step it stopped on"
+# Interrupting at `switch` (rather than at `migrate`) is the resume the tool
+# supports on its own: a failed migration is a latch that needs an operator, so
+# it gets its own case below.
 new_case resume
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_log "resuming at 'switch'" 'resumes at the failed step'
+expect_no_log '== freeze:' 'the resume does not repeat the freeze'
+expect_no_log '== final backup' 'the resume does not re-take the backup'
+expect_journal stage "done"
+if [ "$(dump_count)" = 1 ]; then ok "the backup was taken exactly once"; else bad "$(dump_count) dumps exist; a resume re-took the backup"; fi
+expect_order 'systemctl stop multica-upgrade.timer' 'exec .* pg_dump'
+
+# ---------------------------------------------------------------------------
+# Regressions for the first acceptance round (MYS-2872 review).
+#
+# Each case below reproduces a state the reviewer observed the executor accept,
+# and pins the behaviour that must replace it. They are grouped by finding so a
+# future change that reopens one is attributed to the right cause.
+# ---------------------------------------------------------------------------
+
+step "review 1: a real production tag reference prepares without rebuilding"
+# The NAS compose file names ghcr.io/multica-ai/multica-{backend,web}:latest while
+# the containers actually run the validated build. Identity comes from the image
+# the container runs and the digests that image carries, not from the spelling.
+new_case tag-reference
+image_carries "ghcr.io/multica-ai/multica-backend:latest" "$BACKEND_DIGEST_OLD"
+image_carries "ghcr.io/multica-ai/multica-web:latest" "$WEB_DIGEST_OLD"
+set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
+set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
+prepare_ok
+expect_log 'identity ok by image ID' 'accepts a tag whose image carries the validated digest'
+expect_journal initial_backend_image "ghcr.io/multica-ai/multica-backend:latest"
+expect_journal initial_backend_digest "$BACKEND_DIGEST_OLD"
+# The rollback configuration must pin the digest, so `latest` cannot decide R1.
+rollback_compose="$CUR/state-dir/assets/compose/docker-compose.rollback.yml"
+if [ -f "$rollback_compose" ]; then
+    ok "a digest-pinned rollback compose file was derived"
+else
+    bad "no rollback compose file was recorded"
+fi
+if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr.io/zzttzzmyswy/multica-backend@$BACKEND_DIGEST_OLD\$" "$rollback_compose" 2>/dev/null; then
+    ok "the rollback file pins the backend digest"
+else
+    bad "the rollback file does not pin the backend digest: $(grep -E 'image:' "$rollback_compose" 2>/dev/null | tr '\n' '|')"
+fi
+if grep -q 'latest' "$rollback_compose" 2>/dev/null; then
+    bad "the rollback file still contains a floating tag"
+else
+    ok "no floating tag survives in the rollback file"
+fi
+expect_sha "$CUR/compose/docker-compose.yml" "$(sha256sum "$FIXTURES/compose-live.yml" | awk '{ print $1 }')"
+
+step "review 1: a tag that has drifted to another build is refused"
+new_case tag-drift
+image_carries "ghcr.io/multica-ai/multica-backend:latest" "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+image_carries "ghcr.io/multica-ai/multica-web:latest" "$WEB_DIGEST_OLD"
+set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
+set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'repo digests do not include' 'refuses a tag pointing somewhere else'
+expect_log 'recorded: ' 'prints the digests it actually saw'
+expect_no_journal initial_compose_sha256
+
+step "review 1: a container on an unexpected image is refused"
+new_case identity-wrong-image
+# The image exists and carries a digest, just not the validated one.
+set_container multica-backend-1 "ghcr.io/zzttzzmyswy/multica-backend@sha256:9999999999999999999999999999999999999999999999999999999999999999"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'repo digests do not include' 'compares digests, not reference text'
+
+step "review 2: a second prepare cannot overwrite the original snapshot"
+new_case snapshot-protected
+prepare_ok
+recorded_script="$(journal_get initial_upgrade_script_sha256)"
+snapshot_script="$(sha256sum "$CUR/state-dir/assets/previous/upgrade-multica.sh" | awk '{ print $1 }')"
+snapshot_cli="$(sha256sum "$CUR/state-dir/assets/previous/multica" | awk '{ print $1 }')"
+snapshot_compose="$(sha256sum "$CUR/state-dir/assets/compose/docker-compose.initial.yml" | awk '{ print $1 }')"
+# The live updater changes, then prepare runs again.
+printf '# changed after preparation\n' >>"$CUR/scripts/upgrade-multica.sh"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'changed after prepare' 'detects the drift and refuses'
+expect_sha "$CUR/state-dir/assets/previous/upgrade-multica.sh" "$snapshot_script"
+expect_sha "$CUR/state-dir/assets/previous/multica" "$snapshot_cli"
+expect_sha "$CUR/state-dir/assets/compose/docker-compose.initial.yml" "$snapshot_compose"
+expect_journal initial_upgrade_script_sha256 "$recorded_script"
+# And R1 must still find the recorded original, not the drifted live file.
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$recorded_script"
+
+step "review 2: a snapshot damaged after prepare is refused, not rebuilt"
+new_case snapshot-damaged
+prepare_ok
+printf '# corrupted\n' >"$CUR/state-dir/assets/previous/upgrade-multica.sh"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'snapshot file .* is .* but the journal recorded' 'reports the mismatch'
+if [ "$(sha256sum "$CUR/state-dir/assets/previous/upgrade-multica.sh" | awk '{ print $1 }')" = "$(printf '# corrupted\n' | sha256sum | awk '{ print $1 }')" ]; then
+    ok "the corrupted file was left as evidence, not silently repaired"
+else
+    bad "the damaged snapshot was rewritten"
+fi
+
+step "review 2: a failing prepare leaves the previous snapshot intact"
+new_case prepare-transactional
+prepare_ok
+snapshot_compose="$(sha256sum "$CUR/state-dir/assets/compose/docker-compose.initial.yml" | awk '{ print $1 }')"
+# Force a failure after staging but before the publish: the rollback compose
+# cannot be derived from a live file with the backend image line removed.
+grep -v 'multica-backend@' "$CUR/compose/docker-compose.yml" >"$CUR/compose/tmp.yml"
+mv "$CUR/compose/tmp.yml" "$CUR/compose/docker-compose.yml"
+run_script prepare --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then
+    ok "the re-prepare failed as arranged"
+else
+    bad "prepare succeeded on a compose file with no backend image line"
+fi
+expect_sha "$CUR/state-dir/assets/compose/docker-compose.initial.yml" "$snapshot_compose"
+if [ -d "$CUR/state-dir/assets.new" ]; then bad "a staging directory was left behind"; else ok "no staging directory was left behind"; fi
+
+step "review 3: a resume refuses when the backup is gone or the writers came back"
+new_case resume-writers-back
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+# Between runs the API and a oneshot service come back, which the old executor
+# did not notice before migrating.
+set_unit multica-attachment-gc.service active
+set_container multica-backend-1 "$BACKEND_IMAGE_OLD"
+mark_calls resume-writers
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'the writers are running now' 'refuses to inherit a stale "frozen" claim'
+expect_log 'writes are not frozen' 'names the running writer'
+expect_no_call_since_mark 'docker run' 'no migration was attempted'
+
+new_case resume-backup-missing
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+rm -f "$(journal_get backup_path)"
+mark_calls resume-no-backup
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'the recorded backup .* is missing' 'refuses without a recovery point'
+expect_no_call_since_mark 'docker run' 'no migration was attempted'
+
+new_case resume-backup-altered
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+printf 'tampered' >>"$(journal_get backup_path)"
+mark_calls resume-altered-backup
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'but the journal recorded' 'detects a dump that no longer matches its hash'
+expect_no_call_since_mark 'docker run' 'no migration was attempted'
+
+step "review 3: a failed migration is a latch, not a checkpoint"
+new_case migrate-latch
 prepare_ok
 stub_opt migrate-rc 1
 run_script run --intent=switch --config "$CUR_CONFIG"
 expect_rc 40
+expect_journal migrate_failed 1
 stub_opt migrate-rc
 run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'a migration already failed here' 'refuses to treat a re-run as permission'
+expect_no_log 'Do not re-run this command as a way past a failed migration' 'never offers the re-run as the remedy'
+expect_no_call 'compose .* up' 'does not start the application over a half-migrated database'
+if [ "$(dump_count)" = 1 ]; then ok "no extra backup was taken"; else bad "$(dump_count) dumps exist"; fi
+
+step "review 4: an incomplete journal cannot claim completion"
+new_case journal-truncated
+prepare_ok
+# Keep only a late stage: the old executor accepted this and printed success with
+# an empty snapshot and three missing unit states.
+printf 'stage=verified\n' >"$CUR/state-dir/journal"
+set_unit multica-daemon inactive
+set_unit multica-upgrade.timer inactive
+set_unit multica-attachment-gc.timer inactive
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'no config_sha256|missing required key' 'refuses a journal with no snapshot'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_unit multica-daemon inactive
+
+new_case journal-missing-unit-state
+prepare_ok
+sed -i '/^initial_daemon_state=/d' "$CUR/state-dir/journal"
+sed -i 's/^stage=prepared/stage=verified/' "$CUR/state-dir/journal"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log "missing required key 'initial_daemon_state'" 'names the missing fact'
+expect_no_log 'maintenance complete' 'never claims completion'
+
+new_case journal-missing-backup
+prepare_ok
+# A journal that reached 'verified' without ever recording a backup could not
+# have had a recovery point; the old executor resumed straight to thaw.
+sed -i 's/^stage=prepared/stage=verified/' "$CUR/state-dir/journal"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log "missing required key 'backup_path'" 'refuses a stage whose evidence is absent'
+expect_no_log 'maintenance complete' 'never claims completion'
+
+new_case journal-duplicate-key
+prepare_ok
+printf 'stage=done\n' >>"$CUR/state-dir/journal"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'duplicate key' 'refuses an ambiguous journal'
+expect_no_log 'maintenance complete' 'never claims completion'
+
+new_case journal-illegal-unit-state
+prepare_ok
+world_post_switch
+sed -i 's/^initial_daemon_state=active/initial_daemon_state=maybe/' "$CUR/state-dir/journal"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'is not a legal unit state' 'rejects an impossible recorded state'
+
+step "review 5: R1 refuses a database shape it has not verified"
+new_case r1-partial-schema
+prepare_ok
+stub_opt migrate-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 40
+# The half-migrated shape the reviewer reproduced.
+printf '650_partial\n' >"$CUR/state/ledger"
+printf '670\n' >"$CUR/state/ledger_rows"
+mark_calls r1-partial
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'not a verified one' 'refuses an unknown schema shape'
+expect_log '650_partial' 'reports the shape it saw'
+expect_no_call_since_mark 'compose .* up' 'starts no container'
+expect_no_call_since_mark 'systemctl start' 'restarts no unit'
+expect_unit multica-daemon inactive
+
+new_case r1-post-schema-ok
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+# The migration completed; the old backend is verified against both shapes.
+run_script rollback-r1 --config "$CUR_CONFIG"
 expect_rc 0
-expect_log "resuming at 'migrate'" 'resumes at the failed step'
-expect_no_log '== freeze:' 'the resume does not repeat the freeze'
-expect_journal stage "done"
-if [ "$(dump_count)" = 1 ]; then ok "the backup was taken exactly once"; else bad "$(dump_count) dumps exist; a resume re-took the backup"; fi
-expect_order 'systemctl stop multica-upgrade.timer' 'exec .* pg_dump'
+expect_log 'current schema shape: post' 'accepts the complete 660 schema'
+expect_container_image multica-backend-1 "$BACKEND_IMAGE_OLD"
+
+new_case r1-partial-tables
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+# Right ledger, wrong table count: not a shape anyone verified.
+printf '140\n' >"$CUR/state/tables"
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 80
+expect_log 'not a verified one' 'refuses a shape mismatch'
+
+step "review 6: a frontend that is up but not serving is not acceptable"
+new_case frontend-not-serving
+prepare_ok
+stub_opt frontend-never 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+expect_log "answered 'no response'|frontend at" 'reports the missing frontend'
+expect_no_log 'candidate ok' 'never accepts the switch'
+
+new_case frontend-500
+prepare_ok
+stub_opt frontend-code 500
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+expect_log "answered '500'" 'reports the status code'
+
+new_case frontend-exits-before-verify
+prepare_ok
+# The frontend passes the switch and then dies before final acceptance.
+stub_opt frontend-never 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+expect_no_log 'maintenance complete' 'does not report completion'
+
+new_case verify-rechecks-frontend
+prepare_ok
+world_post_switch
+# A world that reached 'cli' with the frontend now failing the probe.
+stub_opt frontend-code 502
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+expect_log 'MISMATCH: frontend is not serving' 'verify re-asks the frontend'
+expect_no_log 'maintenance complete' 'never claims completion'
+
+new_case r1-frontend-not-serving
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+stub_opt frontend-code 503
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 70
+expect_log "answered '503'" 'R1 refuses an unrestored frontend'
+
+step "review 7: execution stays bounded and every failure is reported"
+new_case zero-timeout
+prepare_ok
+write_config 'PROBE_TIMEOUT=0'
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 2
+expect_log 'must be greater than zero' 'rejects a zero timeout instead of running unbounded'
+
+new_case blank-timeout-key
+prepare_ok
+# An explicitly blank timeout is a configuration mistake, not a request for the
+# default: the tool refuses instead of guessing or running unbounded.
+sed -i 's/^QUERY_TIMEOUT=.*/QUERY_TIMEOUT=/' "$CUR_CONFIG"
+rm -f "$CUR/state-dir/journal"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 2
+expect_log 'timeout QUERY_TIMEOUT must be a positive integer' 'rejects a blank timeout'
+
+new_case nonnumeric-timeout
+sed -i 's/^STOP_TIMEOUT=.*/STOP_TIMEOUT=ten/' "$CUR_CONFIG"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 2
+expect_log 'timeout STOP_TIMEOUT must be a positive integer' 'rejects a non-numeric timeout'
+
+new_case terminal-journal-write-fails
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+# The rollback restores every file and unit, and the journal breaks at the last
+# possible moment (during the final unit start). The exit code must not claim
+# the terminal state was recorded.
+stub_opt break-journal-on-start 1
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 70
+expect_log 'cannot record stage' 'reports the failed terminal write'
+expect_log 'aborting rather than continuing unrecorded' 'says why it aborted'
+# The restore work itself did happen; only the record failed, and that is exactly
+# what the non-zero exit reports. The original hashes were captured before the
+# journal broke.
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$(sha256sum "$CUR/state-dir/assets/previous/upgrade-multica.sh" | awk '{ print $1 }')"
+expect_sha "$CUR/cli-bin/multica" "$(sha256sum "$CUR/state-dir/assets/previous/multica" | awk '{ print $1 }')"
+
+
+step "review 7: a CLI that hangs cannot hold the window open"
+new_case cli-hangs
+prepare_ok
+# The installed CLI never returns from --version; the bounded probe must time out
+# and the step must fail instead of waiting forever.
+cat >"$CUR/cli-bin/multica" <<'STUB'
+#!/usr/bin/env bash
+sleep 600
+STUB
+chmod 755 "$CUR/cli-bin/multica"
+write_config 'PROBE_TIMEOUT=2'
+start=$(date +%s)
+run_script prepare --config "$CUR_CONFIG"
+elapsed=$(( $(date +%s) - start ))
+if [ "$RC" -ne 0 ]; then
+    ok "a hanging CLI fails the probe (exit $RC)"
+else
+    bad "a hanging CLI was accepted"
+fi
+if [ "$elapsed" -le 120 ]; then
+    ok "the probe was bounded (${elapsed}s)"
+else
+    bad "the probe ran for ${elapsed}s"
+fi
+
+step "review 7: ownership is restored on both paths"
+new_case ownership-forward
+if [ "$(id -u)" != "0" ]; then
+    ok "skipped: ownership assertions need root"
+else
+    prepare_ok
+    chown 1234:5678 "$CUR/scripts/upgrade-multica.sh"
+    run_script prepare --config "$CUR_CONFIG"
+    expect_rc 0
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 0
+    if [ "$(stat -c '%u:%g' "$CUR/scripts/upgrade-multica.sh")" = "1234:5678" ]; then
+        ok "the installed script keeps its owner"
+    else
+        bad "owner is $(stat -c '%u:%g' "$CUR/scripts/upgrade-multica.sh"), expected 1234:5678"
+    fi
+fi
 
 step "the release pins match the reviewed release"
 pin_of() { grep -E "^readonly $1=" "$EXECUTOR" | head -1 | sed 's/.*=//'; }

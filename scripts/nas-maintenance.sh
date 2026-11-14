@@ -38,6 +38,12 @@
 #     operation.
 #   * Every assertion reads real state (systemctl is-active, docker inspect,
 #     psql, curl). A command's exit status alone never proves a state.
+#   * An image is identified by the image the container runs and the digests that
+#     image carries, not by how the compose file spells the reference: the real
+#     deployment names `:latest` while running the validated build.
+#   * A stage in the journal is a position, not evidence. Every resume re-proves
+#     the writers are stopped, the backup is intact and the assets still hash as
+#     recorded, and a failed migration is a latch that needs an operator.
 #   * Write commands refuse to run without an explicit config file, so a
 #     forgotten parameter can never fall back to a built-in production path.
 #
@@ -92,6 +98,7 @@ DEFAULT_DAEMON_UNIT=multica-daemon
 DEFAULT_UPGRADE_TIMER=multica-upgrade.timer
 DEFAULT_GC_TIMER=multica-attachment-gc.timer
 DEFAULT_BACKEND_URL=http://127.0.0.1:8080/health
+DEFAULT_FRONTEND_URL=http://127.0.0.1:3000/
 DEFAULT_CLI_BIN=/usr/local/bin/multica
 DEFAULT_UPGRADE_SCRIPT=/home/myswy/scripts/upgrade-multica.sh
 DEFAULT_STATE_DIR=/home/myswy/.local/state/multica-maintenance
@@ -116,6 +123,7 @@ GC_TIMER=""
 UPGRADE_SERVICE=""
 GC_SERVICE=""
 BACKEND_URL=""
+FRONTEND_URL=""
 CLI_BIN=""
 UPGRADE_SCRIPT=""
 CLI_ARCHIVE=""
@@ -164,14 +172,39 @@ log() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # bounded <seconds> <command...>: every external call gets a hard ceiling.
+#
+# Without `timeout` there is no ceiling, and a hung systemctl, docker or CLI
+# would silently hold the maintenance window open. Refuse instead: a missing or
+# non-positive timeout is an execution failure, not an invitation to run
+# unbounded.
 bounded() {
     local secs=$1
     shift
-    if have timeout; then
-        timeout "$secs" "$@"
-    else
-        "$@"
+    case $secs in
+        ''|*[!0-9]*)
+            log "ERROR: invalid timeout '$secs' for: $*"
+            return 124
+            ;;
+    esac
+    if [ "$secs" -le 0 ]; then
+        log "ERROR: timeout must be positive, got $secs for: $*"
+        return 124
     fi
+    if ! have timeout; then
+        log "ERROR: 'timeout' is required to bound '$*'; refusing to run it unbounded"
+        return 127
+    fi
+    timeout "$secs" "$@"
+}
+
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+file_uid()  { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null; }
+file_gid()  { stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1" 2>/dev/null; }
+
+# cli_version_of <path>: the second field of `<cli> --version`. Bounded, because
+# an installed CLI that hangs or waits on stdin must not hold the window open.
+cli_version_of() {
+    bounded "$PROBE_TIMEOUT" "$1" --version </dev/null 2>/dev/null | head -1 | awk '{print $2}'
 }
 
 sha256_of() {
@@ -204,7 +237,15 @@ atomic_install() {
 # ---------------------------------------------------------------------------
 journal_errors() {
     [ -f "$JOURNAL" ] || return 0
-    awk 'NF && $0 !~ /^[A-Za-z0-9_.-]+=/ { print "malformed line " NR ": " $0; bad = 1 }
+    # A duplicate key makes the journal ambiguous: two runs could read different
+    # values for the same fact, so it is corruption rather than a late write.
+    awk 'NF == 0 { next }
+         $0 !~ /^[A-Za-z0-9_.-]+=/ { print "malformed line " NR ": " $0; bad = 1; next }
+         {
+             k = $0
+             sub(/=.*/, "", k)
+             if (seen[k]++) { print "duplicate key " NR ": " k; bad = 1 }
+         }
          END { exit bad ? 1 : 0 }' "$JOURNAL" 2>/dev/null
 }
 
@@ -257,7 +298,15 @@ journal_guard() {
     local want actual
     want=$(config_sha256)
     actual=$(jget config_sha256 2>/dev/null || true)
-    if [ -n "$actual" ] && [ "$actual" != "$want" ]; then
+    if [ -z "$actual" ] && [ -f "$JOURNAL" ]; then
+        # A journal that exists but cannot name its config is not a fresh start:
+        # it is a partial or edited file, and every later stage would be acting
+        # on facts nobody recorded.
+        log "REFUSE: $JOURNAL has no config_sha256, so it cannot be bound to this deployment"
+        log "        an unbound journal cannot prove which host or config its stages belong to"
+        return $EXIT_REFUSED
+    fi
+    if [ -f "$JOURNAL" ] && [ "$actual" != "$want" ]; then
         log "REFUSE: the journal was prepared with a different config (journal=$actual config=$want)"
         log "        re-running with a changed config would apply a different snapshot; use the original config"
         return $EXIT_REFUSED
@@ -267,6 +316,93 @@ journal_guard() {
         return $EXIT_PREPARE
     fi
     rm -f "$JOURNAL.probe"
+    return 0
+}
+
+# Required journal keys per stage. A stage is only meaningful when every fact the
+# later steps rely on is present: without them a truncated or hand-edited journal
+# would let `run` resume with an empty snapshot and declare success. The list is
+# cumulative — each stage includes what all earlier stages wrote.
+journal_required_keys() {
+    local stage=$1
+    case $stage in
+        prepared)
+            printf '%s\n' stage config_sha256 intent stage_at initial_prepared_at
+            printf '%s\n' initial_compose_sha256 initial_cli_sha256 initial_upgrade_script_sha256
+            printf '%s\n' initial_backend_digest initial_web_digest
+            printf '%s\n' initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state
+            printf '%s\n' initial_upgrade_service_state initial_gc_service_state
+            printf '%s\n' initial_ledger_max initial_ledger_rows initial_tables initial_indexes
+            printf '%s\n' initial_backend_image_id initial_web_image_id
+            printf '%s\n' cli_binary_sha256 cli_archive_sha256 cli_version_new approved_upgrade_sha256
+            ;;
+        frozen|backup|migrated|switched|cli|verified|done|*)
+            printf '%s\n' stage config_sha256 intent stage_at initial_prepared_at
+            printf '%s\n' initial_compose_sha256 initial_cli_sha256 initial_upgrade_script_sha256
+            printf '%s\n' initial_backend_digest initial_web_digest
+            printf '%s\n' initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state
+            printf '%s\n' initial_upgrade_service_state initial_gc_service_state
+            printf '%s\n' initial_ledger_max initial_ledger_rows initial_tables initial_indexes
+            printf '%s\n' initial_backend_image_id initial_web_image_id
+            printf '%s\n' cli_binary_sha256 cli_archive_sha256 cli_version_new approved_upgrade_sha256
+            printf '%s\n' freeze_at backup_path backup_sha256 backup_bytes backup_toc_lines
+            ;;
+    esac
+    # Anything past `backup` also has a finished migration to describe.
+    case $stage in
+        migrated|switched|cli|verified|done)
+            printf '%s\n' migrate_rc ledger_after
+            ;;
+    esac
+    case $stage in
+        switched|cli|verified|done)
+            printf '%s\n' switched_commit
+            ;;
+    esac
+    return 0
+}
+
+# journal_complete <stage>: every required key is present, the enumerated values
+# are legal, and the recorded stage matches. Returns non-zero on the first gap.
+journal_complete() {
+    local stage=$1 k v missing=0
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        if ! jget "$k" >/dev/null 2>&1; then
+            log "ERROR: journal stage '$stage' is missing required key '$k'"
+            missing=1
+        fi
+    done < <(journal_required_keys "$stage")
+    [ "$missing" -eq 0 ] || return 1
+
+    case $(jget intent 2>/dev/null) in
+        switch) ;;
+        *) log "ERROR: journal intent is '$(jget intent 2>/dev/null)' not 'switch'"; return 1 ;;
+    esac
+    for k in initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state \
+             initial_upgrade_service_state initial_gc_service_state; do
+        v=$(jget "$k" 2>/dev/null)
+        case $v in
+            active|inactive|failed) ;;
+            *) log "ERROR: journal $k='$v' is not a legal unit state"; return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# journal_stage_ok <expected-stage>: the journal must be complete for that stage
+# and actually record it. Any mismatch is a refusal, never a resume.
+journal_stage_ok() {
+    local want=$1 have
+    have=$(jget stage 2>/dev/null || true)
+    if [ "$have" != "$want" ]; then
+        log "REFUSE: journal stage is '${have:-missing}', expected '$want'"
+        return $EXIT_REFUSED
+    fi
+    journal_complete "$want" || {
+        log "REFUSE: journal is incomplete for stage '$want'; refusing to act on it"
+        return $EXIT_REFUSED
+    }
     return 0
 }
 
@@ -334,6 +470,7 @@ load_config() {
             UPGRADE_SERVICE) UPGRADE_SERVICE=$v ;;
             GC_SERVICE) GC_SERVICE=$v ;;
             BACKEND_URL) BACKEND_URL=$v ;;
+            FRONTEND_URL) FRONTEND_URL=$v ;;
             CLI_BIN) CLI_BIN=$v ;;
             UPGRADE_SCRIPT) UPGRADE_SCRIPT=$v ;;
             CLI_ARCHIVE) CLI_ARCHIVE=$v ;;
@@ -387,6 +524,7 @@ apply_readonly_defaults() {
     UPGRADE_TIMER=$DEFAULT_UPGRADE_TIMER
     GC_TIMER=$DEFAULT_GC_TIMER
     BACKEND_URL=$DEFAULT_BACKEND_URL
+    FRONTEND_URL=$DEFAULT_FRONTEND_URL
     CLI_BIN=$DEFAULT_CLI_BIN
     UPGRADE_SCRIPT=$DEFAULT_UPGRADE_SCRIPT
     STATE_DIR=$DEFAULT_STATE_DIR
@@ -414,13 +552,24 @@ require_config() {
         log "REFUSE: config is incomplete; missing:$missing"
         return $EXIT_USAGE
     fi
+    # A zero or missing timeout would make `bounded` run the command with no
+    # ceiling at all, which is the one thing this tool must never do during a
+    # maintenance window. Require every one of them to be a positive integer.
     for k in STOP_TIMEOUT BACKUP_TIMEOUT TOC_TIMEOUT MIGRATE_TIMEOUT UP_TIMEOUT \
-             HEALTH_TIMEOUT QUERY_TIMEOUT PROBE_TIMEOUT; do
+             HEALTH_TIMEOUT QUERY_TIMEOUT PROBE_TIMEOUT HEALTH_POLL_INTERVAL; do
         eval "v=\${$k:-}"
         case $v in
             ''|*[!0-9]*) log "REFUSE: timeout $k must be a positive integer, got '$v'"; return $EXIT_USAGE ;;
         esac
+        if [ "$v" -le 0 ]; then
+            log "REFUSE: timeout $k must be greater than zero, got $v"
+            return $EXIT_USAGE
+        fi
     done
+    if ! have timeout; then
+        log "REFUSE: 'timeout' is required; without it no external call can be bounded"
+        return $EXIT_USAGE
+    fi
     case $COMPOSE_FILE in
         /*) ;;
         *) log "REFUSE: COMPOSE_FILE must be an absolute path"; return $EXIT_USAGE ;;
@@ -468,6 +617,28 @@ image_id() {
     bounded "$PROBE_TIMEOUT" docker image inspect -f '{{.Id}}' "$1" 2>/dev/null
 }
 
+# container_image_id: the image ID the container actually runs (.Image). This is
+# what identifies the build on a host whose compose file names a moving tag.
+container_image_id() {
+    bounded "$PROBE_TIMEOUT" docker inspect -f '{{.Image}}' "$1" 2>/dev/null
+}
+
+# image_repo_digests <image-id>: every repo digest recorded for that image.
+image_repo_digests() {
+    bounded "$PROBE_TIMEOUT" docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null
+}
+
+# image_is_digest <image-id> <digest>: the local image carries that exact
+# content digest. Checked against RepoDigests, because a deployment that pulls
+# by tag still records the digest the tag resolved to.
+image_is_digest() {
+    local id=$1 want=${2#sha256:}
+    case $want in
+        ''|"$2") return 1 ;;
+    esac
+    image_repo_digests "$id" | grep -q "@sha256:$want\$"
+}
+
 psql_value() {
     bounded "$QUERY_TIMEOUT" docker exec "$PG_CONTAINER" \
         psql -U "$PG_USER" -d "$PG_DATABASE" -tAc "$1" 2>/dev/null | tr -d '[:space:]'
@@ -479,6 +650,24 @@ table_count() { psql_value "select count(*) from information_schema.tables where
 index_state() { psql_value "select count(*)||'/'||count(*) filter (where not indisvalid)||'/'||count(*) filter (where not indisready) from pg_index;"; }
 
 health_body() { bounded "$PROBE_TIMEOUT" curl -fsS --max-time "$PROBE_TIMEOUT" "$BACKEND_URL" 2>/dev/null; }
+
+# frontend_ready: the web container answers HTTP at its own URL. A container
+# that is "running" but not listening, or answering 5xx, is not a working
+# frontend — the service is the response, not the process state.
+frontend_status() {
+    bounded "$PROBE_TIMEOUT" curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time "$PROBE_TIMEOUT" "$FRONTEND_URL" 2>/dev/null
+}
+
+frontend_ready() {
+    local code
+    code=$(frontend_status)
+    case $code in
+        2*|3*) return 0 ;;
+    esac
+    log "ERROR: frontend at $FRONTEND_URL answered '${code:-no response}', expected 2xx/3xx"
+    return 1
+}
 
 health_field() {
     printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
@@ -516,7 +705,7 @@ report_state() {
     log "    containers: backend=$(container_status "$BACKEND_CONTAINER") frontend=$(container_status "$FRONTEND_CONTAINER")"
     log "    images: backend=$(container_image_ref "$BACKEND_CONTAINER") frontend=$(container_image_ref "$FRONTEND_CONTAINER")"
     local cli cli_sha
-    cli=$([ -x "$CLI_BIN" ] && "$CLI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+    cli=$([ -x "$CLI_BIN" ] && cli_version_of "$CLI_BIN")
     cli_sha=$([ -f "$CLI_BIN" ] && sha256_of "$CLI_BIN")
     log "    cli: version=${cli:-missing} sha256=${cli_sha:-missing}"
     log "    upgrade_script: sha256=$([ -f "$UPGRADE_SCRIPT" ] && sha256_of "$UPGRADE_SCRIPT" || printf 'missing')"
@@ -527,15 +716,29 @@ report_state() {
 record_failure() {
     local step=$1 code=$2
     log "FAILED at '$step' (exit $code); journal stage stays at '$(jget stage 2>/dev/null || printf 'unknown')' so a re-run resumes here"
-    jset last_error "$step failed" >/dev/null 2>&1
+    if ! jset last_error "$step failed"; then
+        log "WARNING: cannot record the failure in the journal; the log above and the exit code are the record"
+        return 0
+    fi
     jset last_error_code "$code" >/dev/null 2>&1
     jset last_error_at "$(date '+%F %T')" >/dev/null 2>&1
+    return 0
 }
 
+# stage_set: advance the journal. A write failure here would leave the run
+# believing it is further along than the journal says, so it is fatal: the
+# caller must treat a non-zero return as its own failure code.
 stage_set() {
-    jset stage "$1" || return 1
-    jset stage_at "$(date '+%F %T')" || return 1
-    log "stage -> $1"
+    local stage=$1
+    if ! jset stage "$stage"; then
+        log "ERROR: cannot record stage '$stage' in $JOURNAL; aborting rather than continuing unrecorded"
+        return 1
+    fi
+    if ! jset stage_at "$(date '+%F %T')"; then
+        log "ERROR: cannot record stage_at in $JOURNAL; aborting rather than continuing unrecorded"
+        return 1
+    fi
+    log "stage -> $stage"
     return 0
 }
 
@@ -586,7 +789,7 @@ stage_assets() {
     bounded 300 tar xzf "$CLI_ARCHIVE" -C "$ASSETS/cli/unpack" || { log "ERROR: cannot extract $CLI_ARCHIVE"; return $EXIT_PREPARE; }
     [ -f "$ASSETS/cli/unpack/multica" ] || { log "ERROR: CLI archive does not contain a 'multica' binary"; return $EXIT_PREPARE; }
     chmod 755 "$ASSETS/cli/unpack/multica" 2>/dev/null
-    ver=$("$ASSETS/cli/unpack/multica" --version 2>/dev/null | head -1 | awk '{print $2}')
+    ver=$(cli_version_of "$ASSETS/cli/unpack/multica")
     if [ "$ver" != "$PIN_CLI_VERSION_NEW" ]; then
         log "ERROR: staged CLI reports version '${ver:-none}', expected $PIN_CLI_VERSION_NEW"
         return $EXIT_PREPARE
@@ -614,36 +817,134 @@ stage_assets() {
     return 0
 }
 
+# resolve_running_identity <container> <want-digest> <label>
+#
+# Identifies the running build without trusting how the compose file spells it.
+# The real NAS keeps `image: ghcr.io/multica-ai/multica-backend:latest` while the
+# container actually runs the validated build, so the reference alone says
+# nothing. What decides identity is the image ID the container runs plus the
+# repo digests recorded for that image.
+#
+# Sets RESOLVED_REF and RESOLVED_IMAGE_ID. It must not print: every line it logs
+# would otherwise be captured by the caller's command substitution.
+RESOLVED_REF=""
+RESOLVED_IMAGE_ID=""
+resolve_running_identity() {
+    local container=$1 want=$2 label=$3 ref id
+    ref=$(container_image_ref "$container")
+    if [ -z "$ref" ]; then
+        log "ERROR: cannot read the $label image reference of container $container"
+        return 1
+    fi
+    id=$(container_image_id "$container")
+    if [ -z "$id" ]; then
+        log "ERROR: cannot read the $label image ID of container $container"
+        return 1
+    fi
+    if ! image_is_digest "$id" "$want"; then
+        log "ERROR: $container runs $ref (image $id), whose repo digests do not include"
+        log "       the validated $label digest $want"
+        image_repo_digests "$id" | while IFS= read -r d; do log "       recorded: ${d:-none}"; done
+        log "       the rollback baseline was gathered on that exact digest; re-verify it on the NAS"
+        return 1
+    fi
+    if [ "$(digest_of_ref "$ref")" = "$want" ]; then
+        log "$label identity ok: $ref pinned by digest, image $id"
+    else
+        log "$label identity ok by image ID: compose names $ref, which resolves to image $id carrying $want"
+    fi
+    RESOLVED_REF=$ref
+    RESOLVED_IMAGE_ID=$id
+    return 0
+}
+
+# write_rollback_compose <new-file> <backend-ref> <web-ref>
+#
+# The rollback config pins the old builds by digest. It is derived from the live
+# file so nothing else changes, but `latest` never decides what R1 starts: the
+# digest written here is the one just proved to be running.
+write_rollback_compose() {
+    local dest=$1 backend_ref=$2 web_ref=$3
+    awk -v be="$backend_ref" -v fe="$web_ref" '
+        function indent(line,   copy) {
+            copy = line
+            sub(/[^ ].*/, "", copy)
+            return length(copy)
+        }
+        /^[[:space:]]*#/ { print; next }
+        /^services:[[:space:]]*$/ { in_services = 1; svc_indent = -1; print; next }
+        {
+            if (in_services && $0 !~ /^[[:space:]]*$/ && indent($0) == 0) in_services = 0
+            if (in_services && svc_indent < 0 && $0 ~ /^[[:space:]]+[A-Za-z0-9_.-]+:[[:space:]]*$/) {
+                svc_indent = indent($0)
+            }
+            if (in_services && svc_indent >= 0 && indent($0) == svc_indent && $0 ~ /:[[:space:]]*$/) {
+                svc = $0
+                sub(/^[[:space:]]+/, "", svc)
+                sub(/:.*/, "", svc)
+                print
+                next
+            }
+            if (in_services && svc != "" && indent($0) > svc_indent && $0 ~ /^[[:space:]]+image:[[:space:]]*/) {
+                if (svc == "backend") { sub(/image:.*/, "image: " be) }
+                else if (svc == "frontend" || svc == "web") { sub(/image:.*/, "image: " fe) }
+                print
+                next
+            }
+            print
+        }
+    ' "$COMPOSE_FILE" >"$dest" || return 1
+    # Both replacements must have landed exactly once, and no other image line
+    # may have moved: a silent no-op would hand R1 the new build again.
+    [ "$(grep -cE "^[[:space:]]*image:[[:space:]]*$backend_ref\$" "$dest")" -eq 1 ] || return 1
+    [ "$(grep -cE "^[[:space:]]*image:[[:space:]]*$web_ref\$" "$dest")" -eq 1 ] || return 1
+    [ "$(grep -cE '^[[:space:]]*image:' "$dest")" -eq "$(grep -cE '^[[:space:]]*image:' "$COMPOSE_FILE")" ] || return 1
+    return 0
+}
+
 snapshot_state() {
-    local backend_ref web_ref backend_digest web_digest compose_sha cli_sha cli_ver script_sha script_mode script_uid script_gid
+    local backend_ref web_ref backend_id web_id backend_digest web_digest compose_sha
+    local cli_sha cli_ver script_sha script_mode script_uid script_gid
     log "== snapshot of the pre-change state =="
 
-    backend_ref=$(container_image_ref "$BACKEND_CONTAINER")
-    web_ref=$(container_image_ref "$FRONTEND_CONTAINER")
-    [ -n "$backend_ref" ] || { log "ERROR: cannot read the backend image of container $BACKEND_CONTAINER"; return $EXIT_PREPARE; }
-    [ -n "$web_ref" ] || { log "ERROR: cannot read the web image of container $FRONTEND_CONTAINER"; return $EXIT_PREPARE; }
-    backend_digest=$(digest_of_ref "$backend_ref")
-    web_digest=$(digest_of_ref "$web_ref")
-    if [ "$backend_digest" != "$PIN_BACKEND_DIGEST_OLD" ]; then
-        log "ERROR: running backend digest is '${backend_digest:-unpinned}', expected the pre-change pin $PIN_BACKEND_DIGEST_OLD"
-        log "       ($backend_ref) — re-verify the rollback baseline on the NAS before switching"
-        return $EXIT_PREPARE
-    fi
-    if [ "$web_digest" != "$PIN_WEB_DIGEST_OLD" ]; then
-        log "ERROR: running web digest is '${web_digest:-unpinned}', expected the pre-change pin $PIN_WEB_DIGEST_OLD"
-        return $EXIT_PREPARE
-    fi
+    resolve_running_identity "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_OLD" backend || return $EXIT_PREPARE
+    backend_ref=$RESOLVED_REF
+    backend_id=$RESOLVED_IMAGE_ID
+    resolve_running_identity "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_OLD" web || return $EXIT_PREPARE
+    web_ref=$RESOLVED_REF
+    web_id=$RESOLVED_IMAGE_ID
+    backend_digest=$PIN_BACKEND_DIGEST_OLD
+    web_digest=$PIN_WEB_DIGEST_OLD
 
     compose_sha=$(sha256_of "$COMPOSE_FILE")
     cp -p "$COMPOSE_FILE" "$ASSETS/compose/docker-compose.initial.yml" || return $EXIT_PREPARE
     [ "$(sha256_of "$ASSETS/compose/docker-compose.initial.yml")" = "$compose_sha" ] || {
         log "ERROR: compose snapshot does not match the live file"; return $EXIT_PREPARE; }
 
+    # The live file may name a moving tag. R1 restores *this* file (so the box
+    # returns to exactly what it ran before) but starts it from a digest-pinned
+    # copy, because `latest` must never decide which build comes back.
+    local rollback_frontend_ref
+    case $web_ref in
+        *@sha256:*) rollback_frontend_ref=$web_ref ;;
+        *) rollback_frontend_ref="ghcr.io/zzttzzmyswy/multica-web@$PIN_WEB_DIGEST_OLD" ;;
+    esac
+    local rollback_backend_ref
+    case $backend_ref in
+        *@sha256:*) rollback_backend_ref=$backend_ref ;;
+        *) rollback_backend_ref="ghcr.io/zzttzzmyswy/multica-backend@$PIN_BACKEND_DIGEST_OLD" ;;
+    esac
+    write_rollback_compose "$ASSETS/compose/docker-compose.rollback.yml" \
+        "$rollback_backend_ref" "$rollback_frontend_ref" || {
+        log "ERROR: cannot derive a digest-pinned rollback compose file from $COMPOSE_FILE"
+        return $EXIT_PREPARE; }
+    log "rollback compose pins backend=$rollback_backend_ref web=$rollback_frontend_ref"
+
     if [ -f "$CLI_BIN" ]; then
         cp -p "$CLI_BIN" "$ASSETS/previous/multica" || return $EXIT_PREPARE
         cli_sha=$(sha256_of "$CLI_BIN")
         [ "$(sha256_of "$ASSETS/previous/multica")" = "$cli_sha" ] || { log "ERROR: CLI snapshot hash mismatch"; return $EXIT_PREPARE; }
-        cli_ver=$("$CLI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+        cli_ver=$(cli_version_of "$CLI_BIN")
         [ -n "$cli_ver" ] || { log "ERROR: cannot read the version of the installed CLI $CLI_BIN"; return $EXIT_PREPARE; }
     else
         cli_sha=""; cli_ver=""
@@ -654,9 +955,9 @@ snapshot_state() {
         cp -p "$UPGRADE_SCRIPT" "$ASSETS/previous/upgrade-multica.sh" || return $EXIT_PREPARE
         [ "$(sha256_of "$ASSETS/previous/upgrade-multica.sh")" = "$script_sha" ] || {
             log "ERROR: upgrade script snapshot hash mismatch"; return $EXIT_PREPARE; }
-        script_mode=$(stat -c '%a' "$UPGRADE_SCRIPT" 2>/dev/null || stat -f '%Lp' "$UPGRADE_SCRIPT" 2>/dev/null)
-        script_uid=$(stat -c '%u' "$UPGRADE_SCRIPT" 2>/dev/null || stat -f '%u' "$UPGRADE_SCRIPT" 2>/dev/null)
-        script_gid=$(stat -c '%g' "$UPGRADE_SCRIPT" 2>/dev/null || stat -f '%g' "$UPGRADE_SCRIPT" 2>/dev/null)
+        script_mode=$(file_mode "$UPGRADE_SCRIPT")
+        script_uid=$(file_uid "$UPGRADE_SCRIPT")
+        script_gid=$(file_gid "$UPGRADE_SCRIPT")
     else
         script_sha=""; script_mode=""; script_uid=""; script_gid=""
     fi
@@ -670,13 +971,13 @@ snapshot_state() {
            return $EXIT_PREPARE ;;
     esac
 
-    local d_state ut_state gs_state us_state
+    local d_state ut_state gs_state us_state gc_state
     d_state=$(unit_state "$DAEMON_UNIT")
     ut_state=$(unit_state "$UPGRADE_TIMER")
     gs_state=$(unit_state "$GC_TIMER")
     us_state=$(unit_state "$UPGRADE_SERVICE")
-    local gc_state
     gc_state=$(unit_state "$GC_SERVICE")
+    local pair
     for pair in "$DAEMON_UNIT=$d_state" "$UPGRADE_TIMER=$ut_state" "$UPGRADE_SERVICE=$us_state" \
                 "$GC_TIMER=$gs_state" "$GC_SERVICE=$gc_state"; do
         case ${pair#*=} in
@@ -687,14 +988,13 @@ snapshot_state() {
                 ;;
         esac
     done
+
     # A oneshot timer job that is running right now is mid-flight: freezing it
     # would leave a half-applied update behind, and the snapshot could not
     # describe the state it returns to. Wait for it to finish and re-run.
-    local unit_name
     for pair in "$UPGRADE_SERVICE=$us_state" "$GC_SERVICE=$gc_state"; do
         if [ "${pair#*=}" = "active" ]; then
-            unit_name=${pair%%=*}
-            log "ERROR: $unit_name is running; a timer job is in flight. Wait for it to finish and re-run prepare"
+            log "ERROR: ${pair%%=*} is running; a timer job is in flight. Wait for it to finish and re-run prepare"
             return $EXIT_PREPARE
         fi
     done
@@ -705,9 +1005,6 @@ snapshot_state() {
         log "ERROR: ledger is '${lm:-unreadable}', expected the pre-change $PIN_LEDGER_BEFORE"
         return $EXIT_PREPARE
     fi
-    # These three are the baseline the rollback evidence was gathered on. A
-    # drift here means that evidence no longer describes this box, so record the
-    # observed values and stop rather than switching onto an unverified base.
     if [ "$lr" != "$PIN_LEDGER_ROWS_BEFORE" ] || [ "$tc" != "$PIN_TABLES_BEFORE" ] || [ "$ix" != "$PIN_INDEXES_BEFORE/0/0" ]; then
         log "ERROR: baseline is rows=$lr tables=$tc indexes=$ix, expected"
         log "       rows=$PIN_LEDGER_ROWS_BEFORE tables=$PIN_TABLES_BEFORE indexes=$PIN_INDEXES_BEFORE/0/0"
@@ -716,9 +1013,11 @@ snapshot_state() {
 
     local k v
     for k in "backend_image=$backend_ref" "web_image=$web_ref" \
+             "backend_image_id=$backend_id" "web_image_id=$web_id" \
              "backend_digest=$backend_digest" "web_digest=$web_digest" \
              "compose_path=$COMPOSE_FILE" "compose_sha256=$compose_sha" \
              "compose_new_sha256=$(sha256_of "$ASSETS/compose/docker-compose.new.yml")" \
+             "compose_rollback_sha256=$(sha256_of "$ASSETS/compose/docker-compose.rollback.yml")" \
              "cli_sha256=$cli_sha" "cli_version=$cli_ver" \
              "upgrade_script_sha256=$script_sha" "upgrade_script_mode=$script_mode" \
              "upgrade_script_uid=$script_uid" "upgrade_script_gid=$script_gid" \
@@ -733,7 +1032,105 @@ snapshot_state() {
         jset "initial_$k" "$v" --once || return $EXIT_PREPARE
     done
     log "snapshot: compose=$compose_sha cli=${cli_sha:-absent} script=${script_sha:-absent} ledger=$lm/$lr tables=$tc indexes=$ix"
+    log "snapshot: images backend=$backend_ref($backend_id) web=$web_ref($web_id)"
     log "snapshot: daemon=$d_state upgrade_timer=$ut_state gc_timer=$gs_state"
+    return 0
+}
+
+# commit_snapshot: publish a fully staged snapshot in one rename.
+#
+# `assets.new` is built beside `assets` and renamed over it only after every
+# file and every journal key is in place, so a failure mid-prepare leaves the
+# previous snapshot untouched instead of half-replacing it.
+commit_snapshot() {
+    local staging=$1 final=$2
+    rm -rf "$final.old"
+    if [ -d "$final" ]; then
+        mv -f "$final" "$final.old" || { log "ERROR: cannot move the previous snapshot aside"; return 1; }
+    fi
+    if ! mv -f "$staging" "$final"; then
+        log "ERROR: cannot publish the staged snapshot; restoring the previous one"
+        [ -d "$final.old" ] && mv -f "$final.old" "$final"
+        return 1
+    fi
+    rm -rf "$final.old"
+    return 0
+}
+
+# verify_existing_snapshot: read-only re-check of a completed snapshot.
+#
+# A second `prepare` must never rewrite the pre-change files: the journal keeps
+# the first hashes, so overwriting them would leave R1 restoring nothing. This
+# re-verifies the assets against those recorded hashes and reports whether the
+# live host has since drifted, without touching a byte.
+verify_existing_snapshot() {
+    local drift=0 k want path got
+    log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
+
+    for k in compose_sha256 cli_sha256 upgrade_script_sha256 compose_new_sha256 compose_rollback_sha256; do
+        want=$(jget "initial_$k" 2>/dev/null || true)
+        case $k in
+            compose_sha256) path=$ASSETS/compose/docker-compose.initial.yml ;;
+            compose_new_sha256) path=$ASSETS/compose/docker-compose.new.yml ;;
+            compose_rollback_sha256) path=$ASSETS/compose/docker-compose.rollback.yml ;;
+            cli_sha256) path=$ASSETS/previous/multica ;;
+            upgrade_script_sha256) path=$ASSETS/previous/upgrade-multica.sh ;;
+        esac
+        [ -n "$want" ] || continue          # recorded as absent at prepare
+        if [ ! -f "$path" ]; then
+            log "ERROR: snapshot file missing: $path"
+            drift=1
+            continue
+        fi
+        got=$(sha256_of "$path")
+        if [ "$got" != "$want" ]; then
+            log "ERROR: snapshot file $path is $got but the journal recorded $want"
+            log "       the snapshot has been modified since prepare; R1 could not restore this item"
+            drift=1
+        fi
+    done
+    for k in cli_binary_sha256 approved_upgrade_sha256; do
+        want=$(jget "$k" 2>/dev/null || true)
+        case $k in
+            cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
+            approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
+        esac
+        [ -n "$want" ] || continue
+        if [ ! -f "$path" ]; then
+            log "ERROR: staged asset missing: $path"
+            drift=1
+            continue
+        fi
+        [ "$(sha256_of "$path")" = "$want" ] || { log "ERROR: staged asset $path no longer matches $want"; drift=1; }
+    done
+    [ "$drift" -eq 0 ] || return $EXIT_PREPARE
+
+    # The live host is allowed to keep running, but a change to the things the
+    # snapshot describes breaks the equivalence R1 relies on.
+    local live_compose live_cli live_script
+    live_compose=$(sha256_of "$COMPOSE_FILE")
+    [ "$live_compose" = "$(jget initial_compose_sha256)" ] || {
+        log "ERROR: $COMPOSE_FILE changed after prepare ($live_compose vs $(jget initial_compose_sha256));"
+        log "       the recorded snapshot no longer describes this host"
+        drift=1
+    }
+    live_script=$(sha256_of "$UPGRADE_SCRIPT")
+    [ "$live_script" = "$(jget initial_upgrade_script_sha256)" ] || {
+        log "ERROR: $UPGRADE_SCRIPT changed after prepare ($live_script vs $(jget initial_upgrade_script_sha256));"
+        log "       the recorded snapshot no longer describes this host"
+        drift=1
+    }
+    live_cli=$(sha256_of "$CLI_BIN")
+    [ "$live_cli" = "$(jget initial_cli_sha256)" ] || {
+        log "ERROR: $CLI_BIN changed after prepare ($live_cli vs $(jget initial_cli_sha256))"
+        drift=1
+    }
+    [ "$drift" -eq 0 ] || {
+        log "REFUSE: the prepared snapshot no longer matches this host; nothing was rewritten."
+        log "        Restore the live files to the recorded versions, or archive $STATE_DIR and start again."
+        return $EXIT_PREPARE
+    }
+    log "verify ok: snapshot and live files still match the recorded hashes"
     return 0
 }
 
@@ -751,9 +1148,14 @@ cmd_prepare() {
     local stage
     stage=$(jget stage 2>/dev/null || true)
     case $stage in
-        '') ;;
+        '')
+            ;;
         prepared)
-            log "note: a prepared snapshot already exists; re-verifying assets, keeping the original snapshot"
+            # Never rebuild: the first snapshot is the only true pre-change copy,
+            # and the journal still records its hashes. Re-verify it read-only.
+            verify_existing_snapshot || return $?
+            log "prepare already complete at $(jget initial_prepared_at 2>/dev/null || printf 'unknown'); snapshot kept as recorded"
+            return $EXIT_OK
             ;;
         *)
             log "REFUSE: maintenance already reached stage '$stage'; the initial snapshot must not be replaced"
@@ -764,7 +1166,14 @@ cmd_prepare() {
     log "== prepare (intent: verify assets and snapshot; no service is stopped) =="
     WORK=$(mktemp -d "$STATE_DIR/tmp.XXXXXX") || { log "ERROR: cannot create a work directory under $STATE_DIR"; return $EXIT_PREPARE; }
 
-    local rc=0 ref
+    local rc=0 ref staging="$ASSETS.new"
+    rm -rf "$staging"
+    mkdir -p "$staging" || { rm -rf "$WORK"; return $EXIT_PREPARE; }
+    # Everything from here writes into $staging, and ASSETS points at it so the
+    # staging helpers need no second parameter.
+    local final_assets=$ASSETS
+    ASSETS=$staging
+
     for ref in "$COMPOSE_FILE" "$COMPOSE_FILE_NEW" "$CLI_ARCHIVE" "$APPROVED_UPGRADE_SCRIPT"; do
         [ -f "$ref" ] || { log "ERROR: required input missing: $ref"; rc=$EXIT_PREPARE; break; }
     done
@@ -785,15 +1194,25 @@ cmd_prepare() {
             log "image present: $ref"
         done
     fi
+    if [ "$rc" -eq 0 ]; then stage_assets || rc=$?; fi
+    if [ "$rc" -eq 0 ]; then snapshot_state || rc=$?; fi
+    if [ "$rc" -eq 0 ]; then
+        # The publish is the commit point: before it, nothing outside the
+        # staging directory and the journal exists.
+        commit_snapshot "$staging" "$final_assets" || rc=$EXIT_PREPARE
+        ASSETS=$final_assets
+    fi
     if [ "$rc" -eq 0 ]; then
         jset config_sha256 "$(config_sha256)" --once || rc=$EXIT_PREPARE
     fi
     if [ "$rc" -eq 0 ]; then
         jset intent switch --once || rc=$EXIT_PREPARE
     fi
-    if [ "$rc" -eq 0 ]; then stage_assets || rc=$?; fi
-    if [ "$rc" -eq 0 ]; then snapshot_state || rc=$?; fi
     if [ "$rc" -eq 0 ]; then stage_set prepared || rc=$EXIT_PREPARE; fi
+    if [ "$rc" -ne 0 ]; then
+        ASSETS=$final_assets
+        rm -rf "$staging"
+    fi
     rm -rf "$WORK"
     WORK=""
     [ "$rc" -eq 0 ] || return "$rc"
@@ -855,14 +1274,40 @@ stop_writers() {
             *) log "ERROR: $name is in state '$st' after stop; writes are not frozen"; return $EXIT_FREEZE ;;
         esac
     done
+    writers_stopped || { log "ERROR: refusing to call the database frozen"; return $EXIT_FREEZE; }
     log "writes frozen: timers+services stopped, daemon stopped, backend/frontend exited"
+    return 0
+}
+
+# writers_stopped: every writer is provably down right now. Checked before the
+# backup and again before migrate, because a resume must not inherit a stage's
+# claim: between two runs an operator, a timer or a crash restart can bring the
+# API or a oneshot service back.
+writers_stopped() {
+    local name st running failed=0 u
+    for name in "$BACKEND_CONTAINER" "$FRONTEND_CONTAINER"; do
+        running=$(container_running "$name")
+        st=$(container_status "$name")
+        if [ "$running" != "false" ]; then
+            log "ERROR: $name is running (status=$st); writes are not frozen"
+            failed=1
+        fi
+    done
+    for u in "$DAEMON_UNIT" "$UPGRADE_TIMER" "$UPGRADE_SERVICE" "$GC_TIMER" "$GC_SERVICE"; do
+        st=$(unit_state "$u")
+        unit_state_stopped "$st" || {
+            log "ERROR: $u is '$st'; writes are not frozen"
+            failed=1
+        }
+    done
+    [ "$failed" -eq 0 ] || return 1
     return 0
 }
 
 step_freeze() {
     local rc
     stop_writers || return $?
-    jset freeze_at "$(date '+%F %T')" || return $EXIT_FREEZE
+    jset freeze_at "$(date '+%F %T')" || { log "ERROR: cannot record freeze_at"; return $EXIT_FREEZE; }
     stage_set frozen || return $EXIT_FREEZE
     return 0
 }
@@ -871,13 +1316,7 @@ step_backup() {
     local dump stamp rc toc_out toc_rc toc_lines sha size
     log "== final backup (writes are frozen) =="
     # Re-confirm the writers are still stopped right before the dump.
-    local name running
-    for name in "$BACKEND_CONTAINER" "$FRONTEND_CONTAINER"; do
-        running=$(container_running "$name")
-        [ "$running" = "false" ] || { log "ERROR: $name started again (running=$running); refusing to dump a live database"; return $EXIT_FREEZE; }
-    done
-    [ "$(unit_state "$DAEMON_UNIT")" = "inactive" ] || [ "$(unit_state "$DAEMON_UNIT")" = "failed" ] || {
-        log "ERROR: $DAEMON_UNIT is '$(unit_state "$DAEMON_UNIT")' before the dump"; return $EXIT_FREEZE; }
+    writers_stopped || { log "ERROR: refusing to dump a live database"; return $EXIT_FREEZE; }
 
     stamp=$(date '+%Y%m%d-%H%M%S')
     mkdir -p "$BACKUP_DIR" || { log "ERROR: cannot create $BACKUP_DIR"; return $EXIT_FREEZE; }
@@ -925,9 +1364,63 @@ database_url() {
         sed -n 's/^DATABASE_URL=//p' | head -1
 }
 
+# backup_usable: the recorded dump is on disk and still matches its hash. Every
+# entry point that resumes past the freeze re-proves this instead of trusting
+# the stage: without a usable dump there is no recovery point, so migrating
+# would strand the site.
+# schema_shape: classify the live database as exactly the pre-change schema, the
+# post-migration schema, or anything else. R1 may only start the old images on
+# one of the two known-good shapes: the old backend fits both (it does not roll
+# the ledger back), but a half-migrated schema is understood by neither build
+# and has no verified recovery path in this tool.
+schema_shape() {
+    local lm lr tc ix
+    lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
+    if [ "$lm" = "$PIN_LEDGER_BEFORE" ] && [ "$lr" = "$PIN_LEDGER_ROWS_BEFORE" ] \
+       && [ "$tc" = "$PIN_TABLES_BEFORE" ] && [ "$ix" = "$PIN_INDEXES_BEFORE/0/0" ]; then
+        printf 'pre'
+        return 0
+    fi
+    if [ "$lm" = "$PIN_LEDGER_AFTER" ] && [ "$lr" = "$PIN_LEDGER_ROWS_AFTER" ] \
+       && [ "$tc" = "$PIN_TABLES_AFTER" ] && [ "$ix" = "$PIN_INDEXES_AFTER/0/0" ]; then
+        printf 'post'
+        return 0
+    fi
+    printf 'unknown:ledger=%s rows=%s tables=%s indexes=%s' "${lm:-?}" "${lr:-?}" "${tc:-?}" "${ix:-?}"
+    return 0
+}
+
+backup_usable() {
+    local path want got
+    path=$(jget backup_path 2>/dev/null || true)
+    want=$(jget backup_sha256 2>/dev/null || true)
+    if [ -z "$path" ] || [ -z "$want" ]; then
+        log "ERROR: the journal records no backup; there is no recovery point for this switch"
+        return 1
+    fi
+    if [ ! -f "$path" ]; then
+        log "ERROR: the recorded backup $path is missing"
+        return 1
+    fi
+    got=$(sha256_of "$path")
+    if [ "$got" != "$want" ]; then
+        log "ERROR: the recorded backup $path is $got but the journal recorded $want"
+        return 1
+    fi
+    log "backup verified: $path sha256=$got"
+    return 0
+}
+
 step_migrate() {
     local dburl rc lm lr tc ix
     log "== migrate: /app/migrate up from the exact .2 backend image (no server, no worker) =="
+
+    # Both preconditions are re-proved here, not inherited from the stage: a
+    # resumed run must not migrate a database whose backup has since been
+    # deleted, nor one whose writers have come back.
+    backup_usable || { log "ERROR: migrate was not attempted"; return $EXIT_FREEZE; }
+    writers_stopped || { log "ERROR: migrate was not attempted; stop the writers first"; return $EXIT_FREEZE; }
+
     dburl=$(database_url)
     if [ -z "$dburl" ]; then
         log "ERROR: cannot read DATABASE_URL from $BACKEND_CONTAINER; migrate was not attempted"
@@ -941,17 +1434,22 @@ step_migrate() {
     rc=$?
     log "migrate exit=$rc"
     if [ "$rc" -ne 0 ]; then
-        jset migrate_rc "$rc" >/dev/null 2>&1
+        jset migrate_rc "$rc" || log "WARNING: cannot record migrate_rc in the journal"
         log "MIGRATION FAILED. Real state: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
         log "No automatic continuation and no claim that an intermediate schema is recoverable:"
         log "the site is preserved. Decide with the operator; rollback-r1 restores the old images only."
+        record_failure migrate "$EXIT_MIGRATE"
+        # A latch, not just a stage: a re-run of the same command is not an
+        # automatic licence to continue over a database that may be half
+        # migrated. Naming the latch explicitly is the operator's decision.
+        jset migrate_failed "$rc" || log "WARNING: cannot record the migration failure latch"
         return $EXIT_MIGRATE
     fi
 
     lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
     log "post-migrate: ledger=$lm rows=$lr tables=$tc indexes(ok/invalid/notready)=$ix"
-    jset migrate_rc 0 >/dev/null 2>&1
-    jset ledger_after "$lm" --once >/dev/null 2>&1
+    jset migrate_rc 0 || { log "ERROR: cannot record migrate_rc"; return $EXIT_MIGRATE; }
+    jset ledger_after "$lm" --once || { log "ERROR: cannot record ledger_after"; return $EXIT_MIGRATE; }
     if [ "$lm" != "$PIN_LEDGER_AFTER" ]; then
         log "ERROR: ledger is '$lm', expected $PIN_LEDGER_AFTER; not continuing on a partial schema"
         return $EXIT_MIGRATE
@@ -1038,7 +1536,10 @@ step_switch() {
         log "ERROR: frontend container is not running (status=$(container_status "$FRONTEND_CONTAINER"))"
         return $EXIT_CANDIDATE
     fi
-    jset switched_commit "$commit" --once >/dev/null 2>&1
+    # Running is not serving: a web container can be up and still return 500 or
+    # refuse connections. Ask it, the same way the backend is asked.
+    frontend_ready || return $EXIT_CANDIDATE
+    jset switched_commit "$commit" --once || { log "ERROR: cannot record switched_commit"; return $EXIT_CANDIDATE; }
     log "candidate ok: commit=$commit backend=$PIN_BACKEND_DIGEST_NEW web=$PIN_WEB_DIGEST_NEW"
     stage_set switched || return $EXIT_CANDIDATE
     return 0
@@ -1067,12 +1568,12 @@ step_cli() {
         log "ERROR: installed CLI hash $installed_sha does not match the staged binary $(jget cli_binary_sha256)"
         return $EXIT_CLI
     fi
-    installed_ver=$("$CLI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+    installed_ver=$(cli_version_of "$CLI_BIN")
     if [ "$installed_ver" != "$PIN_CLI_VERSION_NEW" ]; then
         log "ERROR: installed CLI reports '${installed_ver:-none}', expected $PIN_CLI_VERSION_NEW"
         return $EXIT_CLI
     fi
-    jset cli_installed_sha256 "$installed_sha" --once >/dev/null 2>&1
+    jset cli_installed_sha256 "$installed_sha" --once || { log "ERROR: cannot record cli_installed_sha256"; return $EXIT_CLI; }
     log "CLI installed: version=$installed_ver sha256=$installed_sha"
 
     # The approved script replaces the upstream one verbatim, keeping the mode
@@ -1087,12 +1588,17 @@ step_cli() {
         chown "$old_uid:$old_gid" "$UPGRADE_SCRIPT" 2>/dev/null || {
             log "ERROR: cannot restore ownership $old_uid:$old_gid on $UPGRADE_SCRIPT"; return $EXIT_CLI; }
     fi
+    if [ -n "$old_uid" ] && [ -n "$old_gid" ] && [ "$(file_uid "$UPGRADE_SCRIPT")" != "$old_uid" ]; then
+        log "ERROR: $UPGRADE_SCRIPT is owned by $(file_uid "$UPGRADE_SCRIPT"):$(file_gid "$UPGRADE_SCRIPT"), expected $old_uid:$old_gid"
+        return $EXIT_CLI
+    fi
     if [ "$(sha256_of "$UPGRADE_SCRIPT")" != "$(jget approved_upgrade_sha256)" ]; then
         log "ERROR: $UPGRADE_SCRIPT does not match the approved input hash after install"
         return $EXIT_CLI
     fi
 
-    jset upgrade_script_installed_sha256 "$(sha256_of "$UPGRADE_SCRIPT")" --once >/dev/null 2>&1
+    jset upgrade_script_installed_sha256 "$(sha256_of "$UPGRADE_SCRIPT")" --once \
+        || { log "ERROR: cannot record upgrade_script_installed_sha256"; return $EXIT_CLI; }
     log "approved upgrade script installed: $(sha256_of "$UPGRADE_SCRIPT") (unit entry point verified)"
     stage_set cli || return $EXIT_CLI
     return 0
@@ -1104,7 +1610,7 @@ step_verify() {
     body=$(health_body)
     commit=$(health_field "$body" commit)
     lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
-    cli_ver=$([ -x "$CLI_BIN" ] && "$CLI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+    cli_ver=$([ -x "$CLI_BIN" ] && cli_version_of "$CLI_BIN")
     cli_sha=$([ -f "$CLI_BIN" ] && sha256_of "$CLI_BIN")
     log "  commit=$commit ledger=$lm rows=$lr tables=$tc indexes=$ix cli=${cli_ver:-none}"
 
@@ -1121,6 +1627,13 @@ step_verify() {
     [ "$cli_sha" = "$(jget cli_binary_sha256)" ] || { log "  MISMATCH: cli sha256"; rc=$EXIT_CLI; }
     assert_container_digest "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_NEW" || rc=$EXIT_CANDIDATE
     assert_container_digest "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_NEW" || rc=$EXIT_CANDIDATE
+    # Re-asked here rather than remembered from `switch`: the frontend can exit
+    # or start failing between the two steps, and this is the last gate before
+    # the operator is told the switch is good.
+    if ! frontend_ready; then
+        log "  MISMATCH: frontend is not serving"
+        rc=$EXIT_CANDIDATE
+    fi
     [ "$(unit_state "$DAEMON_UNIT")" != "active" ] || { log "  MISMATCH: daemon is active before thaw"; rc=$EXIT_FREEZE; }
     [ "$rc" -eq 0 ] || return "$rc"
     stage_set verified || return $EXIT_CANDIDATE
@@ -1177,6 +1690,73 @@ step_thaw() {
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
+
+# resume_preconditions <stage> <first-step>
+#
+# A stage in the journal says what a previous run got through; it does not say
+# the world still looks like that. Before any step runs:
+#   * past the freeze, every writer must still be down (the API or a oneshot
+#     service can come back between runs);
+#   * past the backup, the recorded dump must exist and still match its hash;
+#   * a failed migration is a latch, not a checkpoint to step over;
+#   * the assets the remaining steps install must still hash as recorded.
+resume_preconditions() {
+    local stage=$1 start=$2
+    case $start in
+        # Up to and including `switch`, the application is deliberately down:
+        # the backup and the migration both require it. From `cli` onward the
+        # new application is up by design, so a running backend there is
+        # expected rather than a violation.
+        backup|migrate|switch)
+            writers_stopped || {
+                log "REFUSE: stage '$stage' precedes the application start, but the writers are running now."
+                log "        Stop them again (or re-run from a clean state) before continuing; nothing was changed."
+                return 1
+            }
+            ;;
+        *) return 0 ;;
+    esac
+    case $start in
+        backup) return 0 ;;
+    esac
+    backup_usable || {
+        log "REFUSE: stage '$stage' claims a final backup exists, but it is missing or altered."
+        log "        Without a recovery point the switch cannot continue; nothing was changed."
+        return 1
+    }
+    local latch
+    latch=$(jget migrate_failed 2>/dev/null || true)
+    if [ -n "$latch" ]; then
+        log "REFUSE: a migration already failed here (migrate_failed=$latch)."
+        log "        Re-running is not an automatic licence to continue over a possibly half-migrated"
+        log "        database. Inspect the real schema, then hand the decision to the operator:"
+        log "          ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
+        log "        rollback-r1 restores the old images only and refuses an unknown schema shape."
+        return 1
+    fi
+    local k want path got
+    case $start in
+        migrate) return 0 ;;
+    esac
+    for k in cli_binary_sha256 approved_upgrade_sha256; do
+        want=$(jget "$k" 2>/dev/null || true)
+        case $k in
+            cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
+            approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
+        esac
+        if [ -z "$want" ] || [ ! -f "$path" ]; then
+            log "REFUSE: staged asset for '$k' is missing; the remaining steps cannot install it"
+            return 1
+        fi
+        got=$(sha256_of "$path")
+        if [ "$got" != "$want" ]; then
+            log "REFUSE: staged asset $path is $got but the journal recorded $want"
+            return 1
+        fi
+    done
+    return 0
+}
+
 cmd_run() {
     require_config || return $?
     derive_paths
@@ -1214,6 +1794,16 @@ cmd_run() {
             return $EXIT_REFUSED
             ;;
     esac
+
+    # The stage is a position, not evidence. Every fact the remaining steps rely
+    # on is re-proved here, so a resumed run cannot inherit a claim that has
+    # since stopped being true.
+    journal_complete "$stage" || {
+        log "REFUSE: the journal is incomplete for stage '$stage'; it cannot authorise continuing"
+        return $EXIT_REFUSED
+    }
+    resume_preconditions "$stage" "$start" || return $EXIT_REFUSED
+
     log "== run --intent=switch (resuming at '$start', stage '$stage') =="
     log "initial snapshot: compose=$(jget initial_compose_sha256) cli=$(jget initial_cli_sha256) ledger=$(jget initial_ledger_max)"
 
@@ -1226,8 +1816,14 @@ cmd_run() {
         if [ "$rc" -ne 0 ]; then
             record_failure "$step" "$rc"
             report_state
-            log "next: fix the reported condition and re-run 'run --intent=switch' (it resumes at '$step'),"
-            log "      or restore the pre-change state with 'rollback-r1'"
+            if [ "$step" = "migrate" ]; then
+                log "next: the schema state must be reviewed by the operator before anything else runs."
+                log "      Do not re-run this command as a way past a failed migration."
+                log "      rollback-r1 restores the old images (database kept) and refuses an unknown schema shape."
+            else
+                log "next: fix the reported condition and re-run 'run --intent=switch' (it resumes at '$step'),"
+                log "      or restore the pre-change state with 'rollback-r1'"
+            fi
             return "$rc"
         fi
     done
@@ -1247,6 +1843,13 @@ cmd_rollback_r1() {
     acquire_lock || return $?
     journal_guard || return $?
 
+    # R1 restores what `prepare` recorded. A journal without a complete prepared
+    # stage describes no such state, so there is nothing to restore from.
+    journal_complete prepared || {
+        log "REFUSE: the journal has no complete prepare snapshot; R1 cannot restore an unrecorded state"
+        return $EXIT_REFUSED
+    }
+
     local snapshot_compose snapshot_cli snapshot_script
     snapshot_compose=$(jget initial_compose_sha256 2>/dev/null || true)
     snapshot_cli=$(jget initial_cli_sha256 2>/dev/null || true)
@@ -1260,12 +1863,50 @@ cmd_rollback_r1() {
         log "ERROR: snapshot compose file no longer matches the recorded hash $snapshot_compose"; return $EXIT_ROLLBACK; }
 
     log "== rollback-r1: restore the pre-change images, compose, cli and upgrade script (database stays) =="
+
+    # The old backend is verified against the 616 and the 660 schema, not against
+    # whatever a half-finished migration left behind. Starting it on an unknown
+    # shape and reporting success because /health answers would hide a database
+    # that neither build understands.
+    local shape
+    shape=$(schema_shape)
+    case $shape in
+        pre|post)
+            log "current schema shape: $shape (verified for the old backend)"
+            ;;
+        *)
+            log "REFUSE: the database shape is not a verified one: $shape"
+            log "        R1 only starts the old images on the complete 616 or 660 schema."
+            log "        Nothing was changed: the writers stay as they are, and the database keeps the"
+            log "        evidence a manual NAS recovery needs. Hand this state to the operator."
+            return $EXIT_REFUSED
+            ;;
+    esac
+
+    backup_usable || log "WARNING: no usable backup is recorded; R1 keeps the current database anyway"
+
     stage_set rb-stopping || return $EXIT_ROLLBACK
     # Stop writers first: the upgrade timer must not swap the CLI back while we
     # are restoring it, and the old backend must not meet a new schema mid-write.
     stop_writers || { record_failure rollback-r1-stop $?; report_state; return $EXIT_ROLLBACK; }
 
     stage_set rb-images || return $EXIT_ROLLBACK
+
+    # Two files, two jobs. The live file goes back to exactly what the box ran
+    # before (so a later inspection sees the original configuration), but the
+    # containers are started from the digest-pinned copy, because a compose file
+    # naming a moving tag would let `latest` decide which build comes back.
+    local rollback_compose="$ASSETS/compose/docker-compose.rollback.yml" rollback_sha
+    rollback_sha=$(jget initial_compose_rollback_sha256 2>/dev/null || true)
+    if [ ! -f "$rollback_compose" ]; then
+        log "ERROR: the digest-pinned rollback compose file is missing: $rollback_compose"
+        return $EXIT_ROLLBACK
+    fi
+    if [ -n "$rollback_sha" ] && [ "$(sha256_of "$rollback_compose")" != "$rollback_sha" ]; then
+        log "ERROR: $rollback_compose no longer matches the hash recorded at prepare ($rollback_sha)"
+        report_state; return $EXIT_ROLLBACK
+    fi
+
     atomic_install "$ASSETS/compose/docker-compose.initial.yml" "$COMPOSE_FILE" || {
         log "ERROR: cannot restore $COMPOSE_FILE"; return $EXIT_ROLLBACK; }
     if [ "$(sha256_of "$COMPOSE_FILE")" != "$snapshot_compose" ]; then
@@ -1273,10 +1914,10 @@ cmd_rollback_r1() {
         report_state; return $EXIT_ROLLBACK
     fi
     local rc body commit
-    bounded "$UP_TIMEOUT" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d backend frontend
+    bounded "$UP_TIMEOUT" docker compose -f "$rollback_compose" -p "$PROJECT" up -d backend frontend
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        log "ERROR: compose up with the restored file exited $rc; backend=$(container_status "$BACKEND_CONTAINER")"
+        log "ERROR: compose up with the rollback file exited $rc; backend=$(container_status "$BACKEND_CONTAINER")"
         report_state; return $EXIT_ROLLBACK
     fi
     body=$(wait_candidate) || {
@@ -1293,6 +1934,7 @@ cmd_rollback_r1() {
         log "ERROR: frontend is not running after the restore (status=$(container_status "$FRONTEND_CONTAINER"))"
         report_state; return $EXIT_ROLLBACK
     fi
+    frontend_ready || { report_state; return $EXIT_ROLLBACK; }
     log "images restored: commit=$commit"
 
     stage_set rb-cli || return $EXIT_ROLLBACK
@@ -1305,7 +1947,7 @@ cmd_rollback_r1() {
             log "ERROR: $CLI_BIN hash is $(sha256_of "$CLI_BIN"), expected $snapshot_cli"; report_state; return $EXIT_ROLLBACK
         fi
         local ver
-        ver=$("$CLI_BIN" --version 2>/dev/null | head -1 | awk '{print $2}')
+        ver=$(cli_version_of "$CLI_BIN")
         if [ "$ver" != "$(jget initial_cli_version)" ]; then
             log "ERROR: restored CLI reports '${ver:-none}', expected $(jget initial_cli_version)"; report_state; return $EXIT_ROLLBACK
         fi
@@ -1319,11 +1961,23 @@ cmd_rollback_r1() {
         [ -f "$ASSETS/previous/upgrade-multica.sh" ] || { log "ERROR: upgrade script snapshot missing"; return $EXIT_ROLLBACK; }
         [ "$(sha256_of "$ASSETS/previous/upgrade-multica.sh")" = "$snapshot_script" ] || {
             log "ERROR: upgrade script snapshot no longer matches $snapshot_script"; return $EXIT_ROLLBACK; }
-        local mode
+        local mode uid gid
         mode=$(jget initial_upgrade_script_mode 2>/dev/null || true)
+        uid=$(jget initial_upgrade_script_uid 2>/dev/null || true)
+        gid=$(jget initial_upgrade_script_gid 2>/dev/null || true)
         [ -n "$mode" ] || mode=755
         atomic_install "$ASSETS/previous/upgrade-multica.sh" "$UPGRADE_SCRIPT" "$mode" || {
             log "ERROR: cannot restore $UPGRADE_SCRIPT"; return $EXIT_ROLLBACK; }
+        # The forward path restores ownership; the rollback must undo it the same
+        # way, or the unit runs a file the wrong user owns.
+        if [ -n "$uid" ] && [ -n "$gid" ] && [ "$(id -u)" = "0" ]; then
+            chown "$uid:$gid" "$UPGRADE_SCRIPT" 2>/dev/null || {
+                log "ERROR: cannot restore ownership $uid:$gid on $UPGRADE_SCRIPT"; return $EXIT_ROLLBACK; }
+        fi
+        if [ -n "$uid" ] && [ -n "$gid" ] && [ "$(file_uid "$UPGRADE_SCRIPT")" != "$uid" ]; then
+            log "ERROR: $UPGRADE_SCRIPT is owned by $(file_uid "$UPGRADE_SCRIPT"):$(file_gid "$UPGRADE_SCRIPT"), expected $uid:$gid"
+            report_state; return $EXIT_ROLLBACK
+        fi
         if [ "$(sha256_of "$UPGRADE_SCRIPT")" != "$snapshot_script" ]; then
             log "ERROR: $UPGRADE_SCRIPT hash is $(sha256_of "$UPGRADE_SCRIPT"), expected $snapshot_script"
             report_state; return $EXIT_ROLLBACK
@@ -1337,7 +1991,9 @@ cmd_rollback_r1() {
     restore_units || { record_failure rollback-r1-services $?; report_state; return $EXIT_ROLLBACK; }
     log "rollback-r1 done: old images/compose/cli/script restored, services back to their prepare states"
     log "database kept: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count)"
-    stage_set rolled-back || return $EXIT_OK
+    # A journal that cannot record the terminal state means the next reader
+    # cannot tell this rollback finished, so the exit code must not claim it did.
+    stage_set rolled-back || return $EXIT_ROLLBACK
     return $EXIT_OK
 }
 
@@ -1398,7 +2054,7 @@ cmd_status() {
     printf 'containers: backend=%s frontend=%s\n' "$(container_status "$BACKEND_CONTAINER")" "$(container_status "$FRONTEND_CONTAINER")"
     printf 'images:  backend=%s frontend=%s\n' "$(container_image_ref "$BACKEND_CONTAINER")" "$(container_image_ref "$FRONTEND_CONTAINER")"
     printf 'cli:     %s sha256=%s\n' \
-        "$([ -x "$CLI_BIN" ] && "$CLI_BIN" --version 2>/dev/null | head -1 || printf 'missing')" \
+        "$([ -x "$CLI_BIN" ] && cli_version_of "$CLI_BIN" || printf 'missing')" \
         "$([ -f "$CLI_BIN" ] && sha256_of "$CLI_BIN" || printf 'missing')"
     printf 'upgrade script: sha256=%s\n' "$([ -f "$UPGRADE_SCRIPT" ] && sha256_of "$UPGRADE_SCRIPT" || printf 'missing')"
     printf 'database: ledger=%s rows=%s tables=%s indexes=%s\n' \

@@ -50,6 +50,12 @@ case ${1:-} in
         if [ "$unit" = "$(opt start-fail-unit)" ]; then
             exit 1
         fi
+        # A case can break the journal at the last possible moment, to prove a
+        # terminal journal write failure is reported instead of swallowed.
+        if [ -f "$S/opt/break-journal-on-start" ]; then
+            rm -f "$S/../state-dir/journal"
+            mkdir -p "$S/../state-dir/journal"
+        fi
         # A start that reports success but leaves the unit down.
         if [ "$unit" = "$(opt start-ignore-unit)" ]; then
             exit 0

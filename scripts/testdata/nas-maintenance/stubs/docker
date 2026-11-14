@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Stub `docker` for scripts/nas-maintenance.test.sh.
 #
-# Per-container status/image files, the migration ledger and the shape counters
-# all live under $TB/state; every call is appended to calls.log so a case can
-# assert call order (stop before dump, no restore against the live database).
-# Case-specific behaviour comes from files under $TB/state/opt. Nothing here
-# talks to a real daemon, and the /health answer is produced by the fake
-# backend's image rather than by this script.
+# Per-container status/image/image-ID files, the local image table, the migration
+# ledger and the shape counters all live under $TB/state; every call is appended
+# to calls.log so a case can assert call order (stop before dump, no restore
+# against the live database). Case-specific behaviour comes from files under
+# $TB/state/opt. Nothing here talks to a real daemon.
 set -u
 
 S=${TB:?TB must point at the case directory}/state
-mkdir -p "$S/containers" "$S/opt"
+mkdir -p "$S/containers" "$S/opt" "$S/images"
 printf 'docker %s\n' "$*" >>"$S/calls.log"
 
 # opt <name>: prints the recorded value, or nothing. Fails when unset so a
@@ -70,6 +69,9 @@ write_container() {
     printf '%s\n' "$2" >"$S/containers/$1.image"
     printf '%s\n' "$3" >"$S/containers/$1.status"
     printf '%s\n' "$4" >"$S/containers/$1.running"
+    # A container's image ID follows the image it was started from, the way a
+    # real daemon records it.
+    printf '%s\n' "$(image_id_of_ref "$2")" >"$S/containers/$1.image_id"
 }
 
 read_container() {
@@ -79,6 +81,28 @@ read_container() {
 
 counter() {
     if [ -f "$S/$1" ]; then cat "$S/$1"; else printf '%s\n' "$2"; fi
+}
+
+# image_id_of_ref <ref>: a stable synthetic ID. The same ref (tag or digest) on
+# the same host yields the same ID, and the image table records which digests
+# that ID carries, mirroring `docker image inspect .RepoDigests`.
+image_id_of_ref() {
+    printf 'image-id-%s\n' "$(printf '%s' "$1" | cksum | awk '{print $1}')"
+}
+
+# repo_digests_of <ref>: consult $S/images/<id>.digests, which the case fixture
+# writes. A tag resolves to whatever digests the fixture recorded for it. A ref
+# that is already an image ID (as `docker inspect .Image` returns) is looked up
+# directly, the way a real daemon accepts either form.
+repo_digests_of() {
+    local ref=$1 id
+    if [ -f "$S/images/$ref.digests" ]; then
+        cat "$S/images/$ref.digests"
+        return 0
+    fi
+    id=$(image_id_of_ref "$ref")
+    [ -f "$S/images/$id.digests" ] && cat "$S/images/$id.digests"
+    return 0
 }
 
 query() {
@@ -93,13 +117,33 @@ query() {
 
 case ${1:-} in
     image)
+        # image inspect [-f <format>] <ref>
+        fmt=""
+        if [ "${3:-}" = "-f" ]; then
+            fmt=${4:-}
+        fi
         ref=${!#}
-        for miss in $(opt missing-images); do
-            case $ref in
-                *"$miss"*) printf 'Error: No such image: %s\n' "$ref" >&2; exit 1 ;;
-            esac
-        done
-        printf 'image-id-%s\n' "$(printf '%s' "$ref" | cksum | awk '{print $1}')"
+        case $fmt in
+            *RepoDigests*)
+                repo_digests_of "$ref"
+                ;;
+            *Id*)
+                for miss in $(opt missing-images || true); do
+                    case $ref in
+                        *"$miss"*) printf 'Error: No such image: %s\n' "$ref" >&2; exit 1 ;;
+                    esac
+                done
+                image_id_of_ref "$ref"
+                ;;
+            *)
+                for miss in $(opt missing-images || true); do
+                    case $ref in
+                        *"$miss"*) printf 'Error: No such image: %s\n' "$ref" >&2; exit 1 ;;
+                    esac
+                done
+                image_id_of_ref "$ref"
+                ;;
+        esac
         ;;
     inspect)
         fmt=${3:-}
@@ -108,6 +152,7 @@ case ${1:-} in
             *State.Status*) read_container "$name" status ;;
             *State.Running*) read_container "$name" running ;;
             *Config.Image*) read_container "$name" image ;;
+            *"{{.Image}}"*) read_container "$name" image_id ;;
             *Config.Env*)
                 printf 'PATH=/usr/bin\nDATABASE_URL=postgres://multica:secret@pg:5432/multica?sslmode=disable\n'
                 ;;
@@ -166,6 +211,7 @@ case ${1:-} in
             printf '%s\n' "$(opt indexes-after || printf '799/0/0')" >"$S/indexes"
         elif [ -n "$(opt partial-ledger)" ]; then
             printf '%s\n' "$(opt partial-ledger)" >"$S/ledger"
+            printf '%s\n' "$(opt partial-rows || printf '670')" >"$S/ledger_rows"
         fi
         exit "$(opt migrate-rc || printf '0')"
         ;;
@@ -198,13 +244,15 @@ case ${1:-} in
                     name=$(name_of "$svc")
                     img=$(image_for_service "$file" "$svc")
                     [ -n "$img" ] || continue
-                    # A daemon that brings the container up on another image
-                    # (a stale tag, a silently reused container).
+                    # A daemon that brings the container up on another image (a
+                    # stale tag, a silently reused container).
                     override=$(opt "up-image-$svc" || true)
                     [ -n "$override" ] && img=$override
-                    # After this point the fake backend answers /health with the
-                    # commit baked into its image file, so a wrong digest cannot
-                    # also report the right revision.
+                    # A frontend that starts but never serves its port.
+                    if [ "$svc" = frontend ] && [ -f "$S/opt/frontend-down" ]; then
+                        write_container "$name" "$img" running true
+                        continue
+                    fi
                     write_container "$name" "$img" running true
                 done
                 exit 0
