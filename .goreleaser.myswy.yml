@@ -44,6 +44,11 @@ release:
   # a same-tag rerun must fail rather than swap the artifact underneath it. The
   # documented recovery for a partial publish is a new build number (myswy.N+1),
   # which costs one tag and keeps every version immutable and auditable.
+  #
+  # This protects the release's archives only, and only from GoReleaser. It is
+  # not the publish guard: scripts/myswy-release-guard.sh runs first and refuses
+  # the run before GoReleaser is invoked, so this setting is a second line, not
+  # the first one.
   replace_existing_artifacts: false
 
 builds:
