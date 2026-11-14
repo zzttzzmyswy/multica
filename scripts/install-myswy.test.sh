@@ -505,6 +505,97 @@ for order in archive-first checksums-first with-noise; do
   fi
 done
 
+step "Malformed tags that outrank the valid one are never installed"
+# The installer must apply the same shape rule as the CLI
+# (server/internal/cli/update.go: parseDistributionVersion): four non-empty
+# numeric components. Every entry below contains the distribution suffix and
+# sorts above v0.9.0-myswy.2, so a suffix-only check installs one of them.
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+build_release_assets "0.9.0-myswy.2" >/dev/null
+write_releases_json "$TMP/releases.json" "v0.9.0-myswy.2"
+python3 - "$TMP/releases.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+releases = json.load(open(path))
+higher = [
+    # Trailing junk, an extra component, an empty build, a non-numeric build,
+    # and a signed build.
+    ("v99.0.0-myswy.1-extra", "multica-cli-99.0.0-myswy.1-extra-linux-amd64.tar.gz", False),
+    ("v98.0.0-myswy.1.2", "multica-cli-98.0.0-myswy.1.2-linux-amd64.tar.gz", False),
+    ("v97.0.0-myswy.", "multica-cli-97.0.0-myswy.-linux-amd64.tar.gz", False),
+    ("v96.0.0-myswy.x", "multica-cli-96.0.0-myswy.x-linux-amd64.tar.gz", False),
+    ("v95.0.0-myswy.-1", "multica-cli-95.0.0-myswy.-1-linux-amd64.tar.gz", False),
+    # Matching assets cannot make overflowing or non-ASCII components valid.
+    ("v9223372036854775808.0.0-myswy.1", "multica-cli-9223372036854775808.0.0-myswy.1-linux-amd64.tar.gz", False),
+    ("v９９.0.0-myswy.1", "multica-cli-９９.0.0-myswy.1-linux-amd64.tar.gz", False),
+    # A draft with a perfectly good archive.
+    ("v94.0.0-myswy.1", "multica-cli-94.0.0-myswy.1-linux-amd64.tar.gz", True),
+]
+for tag, asset, draft in higher:
+    releases.insert(0, {
+        "tag_name": tag,
+        "prerelease": True,
+        "draft": draft,
+        "assets": [{"name": asset}],
+    })
+# Well-formed, but its only archive names a different version: the asset cannot
+# be tied to the tag, so it is not installable either.
+releases.insert(0, {
+    "tag_name": "v93.0.0-myswy.1",
+    "prerelease": True,
+    "draft": False,
+    "assets": [{"name": "multica-cli-0.9.0-myswy.2-linux-amd64.tar.gz"}],
+})
+json.dump(releases, open(path, "w"))
+PY
+
+run_installer malformed || true
+if "$TMP/install-bin/multica" version 2>/dev/null | grep -q "0.9.0-myswy.2"; then
+  ok "skipped every malformed/draft/version-mismatched release and installed v0.9.0-myswy.2"
+else
+  bad "selected an entry it should have skipped: $("$TMP/install-bin/multica" version 2>/dev/null || echo missing)"
+fi
+malformed_downloads="$(grep -E 'myswy\.1-extra|myswy\.1\.2|myswy\.-|myswy\.x|9[3-9]\.0\.0|9223372036854775808|９９' "$TMP/curl.log" || true)"
+if [ -z "$malformed_downloads" ]; then
+  ok "never downloaded an archive from a skipped release"
+else
+  bad "downloaded from a release it should have skipped: $malformed_downloads"
+fi
+
+step "Every malformed tag alone means no installable build, not a crash"
+# With only malformed tags published, the installer must report the same
+# "no published build" failure as an empty list — not install one of them and
+# not fail with a Python traceback.
+reset_sandbox
+write_curl_stub "$TMP/stub-bin"
+build_release_assets "0.9.0-myswy.2" >/dev/null
+write_releases_json "$TMP/releases.json" "v0.9.0-myswy.2"
+python3 - "$TMP/releases.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+releases = json.load(open(path))
+releases[0]["tag_name"] = "v0.9.0-myswy.2-extra"
+releases[0]["assets"][0]["name"] = "multica-cli-0.9.0-myswy.2-extra-linux-amd64.tar.gz"
+json.dump(releases, open(path, "w"))
+PY
+
+if run_installer onlymalformed; then
+  bad "installer succeeded with only a malformed tag published"
+else
+  ok "installer failed with only a malformed tag published"
+fi
+if [ -e "$TMP/install-bin/multica" ]; then
+  bad "installed a binary from a malformed tag"
+else
+  ok "installed nothing"
+fi
+if grep -qi "no published build" "$TMP/onlymalformed.err"; then
+  ok "reported it as a missing build, not as a parser crash"
+else
+  bad "reported the situation as: $(cat "$TMP/onlymalformed.err" 2>/dev/null)"
+fi
+
 step "A release whose assets lack this platform's archive is skipped, not fatal"
 # A darwin-only release sorts highest; the installer must skip it and fall back
 # to the newest release that actually has a linux/amd64 archive.
