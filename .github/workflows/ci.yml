@@ -1039,6 +1039,25 @@ jobs:
       - name: Test build output naming
         run: bash scripts/makefile-build.test.sh
 
+      - name: Test the NAS maintenance executor
+        # Stub-driven: no systemd, docker daemon, PostgreSQL, SSH or network.
+        # The suite pins the reasons a switch may and may not proceed — a live
+        # writer during backup, a half-migrated schema, a candidate on the wrong
+        # digest, a rollback that only restarts the new configuration.
+        run: |
+          bash -n scripts/nas-maintenance.sh scripts/nas-maintenance.test.sh
+          bash scripts/nas-maintenance.test.sh
+
+      - name: Test snapshot compose resolution against real Docker Compose
+        # Not stubbed: this runs `docker compose config`, which parses and
+        # interpolates locally. It catches the failure a stub cannot — a compose
+        # snapshot whose `env_file: .env` and `${VAR}` interpolations resolve
+        # against the snapshot directory instead of the deployment. Requires only
+        # the Compose CLI, never a daemon; the suite skips if neither is present.
+        run: |
+          bash -n scripts/nas-maintenance-compose.test.sh
+          bash scripts/nas-maintenance-compose.test.sh
+
       - name: Test the distribution CLI update path
         # Runs the real CLI against a loopback release server, so the update
         # path is covered end to end: pinned and unpinned resolution, checksum
