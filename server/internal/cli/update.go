@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,11 +32,31 @@ import (
 // changes one place.
 const ChecksumManifestName = "checksums.txt"
 
+// ReleaseRepository is the single source of truth for where this build's
+// release metadata, archives, and checksum manifests live. Every request path
+// in this file derives from it — latest, by-tag, archive, and checksums.txt —
+// so a distribution cannot read release metadata from one repository and
+// download archives from another.
+//
+// It is a constant rather than a variable on purpose. This repository is a
+// maintained fork whose builds carry features the upstream releases lack, so
+// there is no configuration under which pointing an installed binary at
+// upstream is correct: that would silently replace the operator's build with
+// one that has different behavior. Operators who need a mirror set
+// MULTICA_RELEASE_API_BASE_URL / MULTICA_RELEASE_DOWNLOAD_BASE_URL, which
+// change the host but keep this repository in the path.
+const ReleaseRepository = "zzttzzmyswy/multica"
+
+// defaultReleaseAPIBaseURL is the GitHub Releases API root. A mirror only
+// rewrites the host; the /repos/<ReleaseRepository>/releases/... path is
+// preserved.
 const defaultReleaseAPIBaseURL = "https://api.github.com"
 
 // MULTICA_RELEASE_API_BASE_URL points at a GitHub Releases API-compatible
 // mirror. MULTICA_RELEASE_DOWNLOAD_BASE_URL points at an artifact mirror
 // serving /<tag>/<asset-name>; when unset, the release-provided URLs win.
+// Both are host overrides only: the repository in the request path stays
+// ReleaseRepository.
 const releaseAPIBaseURLEnv = "MULTICA_RELEASE_API_BASE_URL"
 const releaseDownloadBaseURLEnv = "MULTICA_RELEASE_DOWNLOAD_BASE_URL"
 
@@ -46,6 +67,31 @@ func releaseAPIBaseURL() string {
 		return value
 	}
 	return defaultReleaseAPIBaseURL
+}
+
+// releaseRepository is the "owner/name" used for every latest/tag lookup.
+func releaseRepository() string {
+	return ReleaseRepository
+}
+
+// ReleaseWebURL is the human-facing page an operator should visit for this
+// build's releases. Diagnostics and install instructions print it instead of
+// hardcoding a URL, so they cannot point somewhere the binary does not update
+// from.
+func ReleaseWebURL() string {
+	return "https://github.com/" + ReleaseRepository
+}
+
+// ReleaseArchiveURL is the download URL for one asset of one release tag.
+func ReleaseArchiveURL(targetVersion, assetName string) string {
+	return fmt.Sprintf("%s/releases/download/%s/%s",
+		ReleaseWebURL(), url.PathEscape(normalizeReleaseTag(targetVersion)), url.PathEscape(assetName))
+}
+
+// releaseAPIPath builds the /repos/<repo>/releases/... path shared by the
+// latest and by-tag lookups, so the two can never disagree about the source.
+func releaseAPIPath(suffix string) string {
+	return "/repos/" + releaseRepository() + "/releases/" + suffix
 }
 
 func releaseDownloadBaseURL() string {
@@ -60,11 +106,37 @@ func releaseAssetDownloadURL(assetName, targetVersion, fallback string) string {
 	return fmt.Sprintf("%s/%s/%s", base, url.PathEscape(normalizeReleaseTag(targetVersion)), url.PathEscape(assetName))
 }
 
+// ErrNoBrewFormula reports that this build has no Homebrew formula to upgrade
+// through. The caller must surface it as an explicit failure rather than
+// silently falling back to a different formula.
+var ErrNoBrewFormula = errors.New("this build publishes no Homebrew formula")
+
+// BrewInstallBlockedError explains why a Homebrew-installed copy of this build
+// cannot be updated in place, and what to run instead. Both the CLI's `update`
+// command and the daemon's update path return it, so the two cannot give an
+// operator different instructions for the same situation.
+//
+// Replacing a keg's binary in place is not an option: brew owns that path, and
+// the next `brew upgrade` or `brew doctor` would either overwrite the
+// replacement or report a corrupted keg.
+func BrewInstallBlockedError(targetVersion, goos, goarch string) error {
+	return fmt.Errorf("this build is installed via Homebrew, but %s publishes no Homebrew formula;\n"+
+		"reinstall from this build's release archives instead:\n  %s",
+		ReleaseRepository,
+		ReleaseArchiveURL(targetVersion, ReleaseAssetName(targetVersion, goos, goarch)))
+}
+
 // GitHubRelease is the subset of the GitHub releases API response we need.
 type GitHubRelease struct {
-	TagName string               `json:"tag_name"`
-	HTMLURL string               `json:"html_url"`
-	Assets  []GitHubReleaseAsset `json:"assets"`
+	TagName    string               `json:"tag_name"`
+	HTMLURL    string               `json:"html_url"`
+	Assets     []GitHubReleaseAsset `json:"assets"`
+	Prerelease bool                 `json:"prerelease"`
+	Draft      bool                 `json:"draft"`
+	// PublishedAt orders releases for newest-build selection. GitHub returns
+	// the list newest-first, but sorting on this field keeps the choice
+	// independent of that guarantee.
+	PublishedAt string `json:"published_at"`
 }
 
 // IsReleaseVersion reports whether v looks like a tagged release version
@@ -123,27 +195,37 @@ func IsNewerVersion(latest, current string) bool {
 // downgrade a developer build to a public release just because the
 // dev-describe patch happened to look numeric after trimming.
 func parseReleaseVersion(v string) ([3]int, bool) {
-	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "v"))
-	if s == "" {
+	parts, ok := parseNumericComponents(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "v")), 3)
+	if !ok {
 		return [3]int{}, false
 	}
-	parts := strings.Split(s, ".")
-	if len(parts) != 3 {
-		return [3]int{}, false
+	return [3]int{parts[0], parts[1], parts[2]}, true
+}
+
+// parseNumericComponents parses exactly count dot-separated components, each a
+// non-empty run of ASCII digits that fits in an int. Every other shape — an
+// empty component ("1..2"), a sign, a symbol, a trailing tail, or a number large
+// enough to overflow — is refused rather than coerced to 0. Coercion is what
+// makes a malformed release look installable: the caller would otherwise compare
+// it as a real version and could select it.
+func parseNumericComponents(value string, count int) ([]int, bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) != count {
+		return nil, false
 	}
-	var out [3]int
+	out := make([]int, count)
 	for i, p := range parts {
 		if p == "" {
-			return [3]int{}, false
+			return nil, false
 		}
 		for _, r := range p {
 			if r < '0' || r > '9' {
-				return [3]int{}, false
+				return nil, false
 			}
 		}
 		n, err := strconv.Atoi(p)
 		if err != nil {
-			return [3]int{}, false
+			return nil, false
 		}
 		out[i] = n
 	}
@@ -170,6 +252,8 @@ func normalizeReleaseTag(targetVersion string) string {
 	return tag
 }
 
+// releaseAssetCandidates lists the archive names a release may publish for one
+// platform, most-preferred first.
 func releaseAssetCandidates(targetVersion, goos, goarch string) []string {
 	tag := normalizeReleaseTag(targetVersion)
 	version := strings.TrimPrefix(tag, "v")
@@ -177,9 +261,18 @@ func releaseAssetCandidates(targetVersion, goos, goarch string) []string {
 	// Prefer the versioned name (current scheme); fall back to the legacy
 	// `multica_{os}_{arch}` name for releases that still ship it.
 	return []string{
-		fmt.Sprintf("multica-cli-%s-%s-%s.%s", version, goos, goarch, ext),
+		ReleaseAssetName(version, goos, goarch),
 		fmt.Sprintf("multica_%s_%s.%s", goos, goarch, ext),
 	}
+}
+
+// ReleaseAssetName is the versioned archive name for one platform, matching
+// .goreleaser.yml's `versioned` archive template. Exported so install
+// instructions and error messages print the exact asset the updater looks for
+// instead of a hand-written approximation that drifts.
+func ReleaseAssetName(version, goos, goarch string) string {
+	return fmt.Sprintf("multica-cli-%s-%s-%s.%s",
+		strings.TrimPrefix(normalizeReleaseTag(version), "v"), goos, goarch, releaseArchiveExtension(goos))
 }
 
 func findReleaseAsset(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) (*GitHubReleaseAsset, error) {
@@ -252,9 +345,17 @@ func verifyAssetSHA256(data []byte, expectedHex, assetName string) error {
 	return nil
 }
 
+// FetchReleaseByTag fetches one release's metadata from ReleaseRepository.
+// Unlike FetchLatestRelease it can name a specific tag, which is what a pinned
+// update and a rolled-back install both need: `latest` is a moving target, and
+// pinning is the only way to install a version that is not the newest one.
+func FetchReleaseByTag(tag string) (*GitHubRelease, error) {
+	return fetchReleaseByTag(normalizeReleaseTag(tag))
+}
+
 func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/tags/"+url.PathEscape(tag), nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("tags/"+url.PathEscape(tag)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -277,10 +378,60 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from the multica GitHub repo.
+// FetchLatestRelease fetches the newest release of ReleaseRepository that this
+// build can actually install.
+//
+// It does NOT use the `/releases/latest` endpoint. Every distribution release is
+// a prerelease, and GitHub excludes prereleases from that endpoint — it would
+// return 404 no matter how many builds were published, which is exactly the
+// failure an operator would hit running `multica update` with no arguments.
+//
+// So the list endpoint is used and the newest distribution tag that carries an
+// archive for this platform is selected. Upstream releases that happen to share
+// the repository (a synced `v0.9.0`) are never selected: their tags lack the
+// distribution suffix, and installing one would replace this build with a
+// binary that has different behavior.
 func FetchLatestRelease() (*GitHubRelease, error) {
+	releases, err := listReleases()
+	if err != nil {
+		return nil, err
+	}
+
+	var newest *GitHubRelease
+	var newestVersion [4]int
+	for i := range releases {
+		release := &releases[i]
+		// Each exclusion is per-entry: one malformed, draft, or
+		// platform-less release must not stop a later, valid one from being
+		// selected.
+		if release.Draft {
+			continue
+		}
+		version, ok := parseDistributionVersion(release.TagName)
+		if !ok {
+			continue
+		}
+		if !hasVersionedReleaseAssetFor(release.Assets, release.TagName, runtime.GOOS, runtime.GOARCH) {
+			continue
+		}
+		if newest == nil || versionGreater(version, newestVersion) {
+			newest, newestVersion = release, version
+		}
+	}
+	if newest == nil {
+		return nil, fmt.Errorf("no published distribution build for %s/%s in %s",
+			runtime.GOOS, runtime.GOARCH, ReleaseRepository)
+	}
+	return newest, nil
+}
+
+// listReleases fetches one page of releases. The list endpoint includes
+// prereleases, which is the whole reason it is used instead of `latest`.
+func listReleases() ([]GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/latest", nil)
+	// per_page=100 is GitHub's maximum; the newest distribution build is always
+	// in the first page because releases are returned newest-first.
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+releaseAPIPath("?per_page=100"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -296,11 +447,88 @@ func FetchLatestRelease() (*GitHubRelease, error) {
 		return nil, fmt.Errorf("release API returned %d", resp.StatusCode)
 	}
 
-	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return nil, err
+	var releases []GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("decode release list: %w", err)
 	}
-	return &release, nil
+	return releases, nil
+}
+
+// DistributionTagSuffix marks a release as this distribution's build.
+const DistributionTagSuffix = "-myswy."
+
+// IsDistributionTag reports whether tag is one of this distribution's releases
+// (vX.Y.Z-myswy.N) rather than an upstream tag synced into the same repository.
+//
+// It answers the same question as parseDistributionVersion's ok result, and is
+// defined in terms of it: a tag that merely contains the suffix — a trailing
+// "-extra", an extra component, an empty or non-numeric build — is not this
+// distribution's release and must not be selectable.
+func IsDistributionTag(tag string) bool {
+	_, ok := parseDistributionVersion(tag)
+	return ok
+}
+
+// parseDistributionVersion splits vX.Y.Z-myswy.N into its four numeric
+// components. A tag of any other shape returns false.
+//
+// Every component must be a non-empty run of digits. Nothing is coerced and
+// nothing is truncated: a tag that says "-myswy.1-extra" or "-myswy.1.2" names a
+// version this distribution does not publish, and treating it as build 1 would
+// let a malformed release win the newest-build comparison and then be installed.
+func parseDistributionVersion(tag string) ([4]int, bool) {
+	trimmed := strings.TrimSpace(tag)
+	// GitHub returns the tag as pushed, and this distribution only ever pushes
+	// v-prefixed tags (the release workflow rejects anything else), so a tag
+	// without the v is a shape this project does not publish. Pinned input may
+	// omit it; that path normalizes through normalizeReleaseTag instead.
+	if !strings.HasPrefix(trimmed, "v") {
+		return [4]int{}, false
+	}
+	base, tail, found := strings.Cut(trimmed, DistributionTagSuffix)
+	if !found {
+		return [4]int{}, false
+	}
+
+	core, ok := parseReleaseVersion(base)
+	if !ok {
+		return [4]int{}, false
+	}
+
+	build, ok := parseNumericComponents(tail, 1)
+	if !ok {
+		return [4]int{}, false
+	}
+	return [4]int{core[0], core[1], core[2], build[0]}, true
+}
+
+func versionGreater(a, b [4]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
+}
+
+// hasVersionedReleaseAssetFor reports whether a release publishes the versioned
+// archive for its own tag on this platform.
+//
+// Newest-build selection uses this rather than findReleaseAsset because that
+// helper also accepts the versionless legacy name (`multica_<os>_<arch>.<ext>`).
+// A versionless archive cannot be checked against the tag it is attached to, so
+// a release whose only archive is one of those cannot prove it belongs to the
+// version it claims. The legacy name stays valid on the pinned download path,
+// which is what actually needs it: an already-installed CLI published under the
+// old scheme downloads the archive of a tag it named explicitly.
+func hasVersionedReleaseAssetFor(assets []GitHubReleaseAsset, targetVersion, goos, goarch string) bool {
+	versioned := ReleaseAssetName(targetVersion, goos, goarch)
+	for i := range assets {
+		if assets[i].Name == versioned {
+			return true
+		}
+	}
+	return false
 }
 
 // knownBrewPrefixes lists the install roots Homebrew uses on each platform.
@@ -346,10 +574,28 @@ func GetBrewPrefix() string {
 	return strings.TrimSpace(string(out))
 }
 
-// UpdateViaBrew runs `brew upgrade multica-ai/tap/multica`.
+// BrewFormulaName is the Homebrew formula this build upgrades through. It is a
+// build-time property for the same reason ReleaseRepository is: a distribution
+// build must never run `brew upgrade multica-ai/tap/multica`, because that
+// replaces it with an upstream binary that lacks its features.
+//
+// This distribution publishes no tap, so the default is empty and the brew
+// route fails closed. Defaulting to the upstream formula would make every
+// mistyped build silently downgrade to upstream, which is exactly the failure
+// the fork exists to prevent. A build that does ship a tap sets this at link
+// time via `-X .../cli.BrewFormulaName=owner/tap/name`.
+var BrewFormulaName = ""
+
+// UpdateViaBrew runs `brew upgrade <BrewFormulaName>`.
 // Returns the combined output and any error.
 func UpdateViaBrew() (string, error) {
-	cmd := exec.Command("brew", "upgrade", "multica-ai/tap/multica")
+	if BrewFormulaName == "" {
+		// Fail loudly rather than picking some other formula. An install with
+		// no tap of its own must update through the release archives, and the
+		// caller turns this into a message telling the operator how.
+		return "", ErrNoBrewFormula
+	}
+	cmd := exec.Command("brew", "upgrade", BrewFormulaName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("brew upgrade failed: %w", err)

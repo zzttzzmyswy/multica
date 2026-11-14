@@ -5,7 +5,10 @@ description: |
   Self-host the backend, frontend, and PostgreSQL on a Kubernetes cluster.
 type: application
 version: 0.1.0
-appVersion: "latest"
+# Pinned to a real distribution release. `latest` is not published by this
+# distribution, so an empty image tag resolving to it produced a reference that
+# never pulls (ghcr.io/zzttzzmyswy/multica-backend:latest).
+appVersion: "v0.9.0-myswy.1"
 home: https://multica.ai
 sources:
   - https://github.com/multica-ai/multica

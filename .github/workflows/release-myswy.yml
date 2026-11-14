@@ -1,0 +1,496 @@
+name: Release (self-host distribution)
+
+# Publishing path for the self-host distribution (zzttzzmyswy/multica).
+#
+# This is a SEPARATE workflow from .github/workflows/release.yml rather than an
+# edit of it, for three reasons:
+#
+#   1. Ownership. release.yml's publishing jobs are already guarded by
+#      `github.repository_owner == 'multica-ai'`, so in this repository they
+#      skip and only its `verify` job runs. Editing that file would mean the
+#      fork's rules leak upstream the next time the two are synced; a separate
+#      file leaves upstream's behavior byte-identical.
+#   2. Assets. GoReleaser writes the CLI archives and checksums.txt to the
+#      GitHub release, and release.yml only runs GoReleaser for multica-ai.
+#      Exactly one workflow therefore ever writes CLI assets in this
+#      repository. The two cannot race on a tag.
+#   3. Scope. This workflow builds only what the distribution ships: backend
+#      and web images, CLI archives, checksums. It does not build Desktop or
+#      mobile installers, does not push a Helm chart, and does not write any
+#      Homebrew tap — none of which this distribution publishes.
+#
+# The tag filter is the distribution's shape, not upstream's `v*.*.*`: an
+# upstream tag synced into this repository has nothing to publish here. The
+# filter alone is not the gate — a glob cannot express "exactly N digits then
+# -myswy.N" and would allow `v0.9.0-myswy.1-extra` — so `verify` re-checks the
+# exact pattern and refuses.
+on:
+  push:
+    tags:
+      - "v*-myswy.*"
+      - "!v*-dirty*"
+  # Manual runs are deliberately NOT supported: the versions, image tags, and
+  # checksums all derive from the tag, and a workflow_dispatch run would have to
+  # invent one.
+
+permissions:
+  contents: write
+  packages: write
+
+# Serialize per ref so two runs of THIS workflow can never publish the same
+# tag's assets concurrently. cancel-in-progress stays false: a half-published
+# release is worse than a queued one.
+concurrency:
+  group: release-myswy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    # Same gate as upstream's release: the artifacts are only published from a
+    # tree whose tests and vulnerability scan pass. No bypass shortcut is
+    # added here — a distribution release either passes the gate or does not
+    # ship.
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.release_meta.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and repository
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          echo "Triggered by tag: $tag"
+          # Exactly the distribution's version shape. A looser pattern lets
+          # related-looking tags through — `v0.9.0-myswy.1-extra` and a
+          # synced upstream `v0.9.0` both fail this test, and both must: the
+          # first publishes under a name no updater resolves, the second would
+          # publish a fork build under an upstream-looking name.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-myswy\.[0-9]+$ ]]; then
+            echo "::error::Release tags must match ^v<major>.<minor>.<patch>-myswy.<build>\$; got '$tag'."
+            exit 1
+          fi
+          if [[ "${GITHUB_REPOSITORY}" != "zzttzzmyswy/multica" ]]; then
+            echo "::error::This distribution publishes only from zzttzzmyswy/multica; refusing to release from '${GITHUB_REPOSITORY}'."
+            exit 1
+          fi
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "~1.27.4"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      - name: Record Go toolchain
+        run: go version
+
+      - name: Verify Go test wrapper
+        run: bash scripts/test-go.test.sh
+
+      - name: Run tests
+        run: bash scripts/test-go.sh --race
+
+      - name: Scan Go vulnerabilities
+        # Fail closed. Allowing a bypass would let a release ship without the
+        # scan, and this distribution has no operator who could review that
+        # decision before the images are pulled.
+        working-directory: server
+        run: go tool govulncheck ./...
+
+  guard:
+    # Pre-flight, before anything writes: if the release or either image tag
+    # already exists, the whole release is refused (scope `all`).
+    #
+    # This job is NOT the protection. GitHub reuses a job's stored result when
+    # only the failed jobs of a run are re-run, so `needs: guard` on a writer
+    # proves nothing after a rerun: the edge replays a verdict from an earlier
+    # attempt. Every job that writes a tag therefore re-checks, in its own
+    # steps, right before its write — see the merge and cli jobs below.
+    #
+    # The check talks to the registry over HTTP with explicit credentials
+    # rather than through `docker`, so it needs no `docker login`: a login is
+    # per-runner, and one performed here is invisible to every other job.
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse to publish over an existing release or image tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/myswy-release-guard.sh \
+            --tag "${{ needs.verify.outputs.tag_name }}" \
+            --repository "${{ github.repository }}" \
+            --scope all
+
+  cli:
+    needs: [verify, guard]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "~1.27.4"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      # The write is performed by GoReleaser, so this is a separate step rather
+      # than an inline check like the image pushes. A rerun of this job replays
+      # every one of its steps, this one included, which is what makes the guard
+      # effective after `Re-run failed jobs`.
+      - name: Refuse to publish over an existing release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          bash scripts/myswy-release-guard.sh \
+            --tag "${{ needs.verify.outputs.tag_name }}" \
+            --repository "${{ github.repository }}" \
+            --scope release
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          # --config is the fork's own file: it omits the upstream Homebrew tap
+          # and would otherwise try to push to a tap this account cannot write.
+          args: release --clean --config .goreleaser.myswy.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # The build jobs push by digest only: a content-addressed blob that carries no
+  # tag. Publishing a digest twice is idempotent and cannot point a deployment
+  # at different bytes, so these jobs are allowed to run even though the tag
+  # check happens later — that is what makes "build the digest first, decide
+  # about the tag afterwards" possible.
+  docker-backend-build:
+    needs: [verify, guard]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute backend image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-backend
+          labels: |
+            org.opencontainers.image.title=Multica Backend (self-host distribution)
+            org.opencontainers.image.description=Multica self-hosted backend with direct-to-object-storage attachment uploads
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.tag_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          pull: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=release-myswy-backend-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=release-myswy-backend-${{ env.PLATFORM_PAIR }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.tag_name }}
+            COMMIT=${{ github.sha }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/multica-backend,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-backend-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-backend-merge:
+    needs: [verify, guard, docker-backend-build]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-myswy-docker-backend-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-backend-*
+          merge-multiple: true
+
+      # The guard script is read from the tagged commit, not from a floating
+      # branch, so the check a release runs is the check that release shipped.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute backend image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-backend
+          # `latest` is deliberately NOT published, and neither is a `sha-*`
+          # tag: every deployment pins the version tag and, at deploy time, its
+          # digest. A second tag derived from the commit would be a second name
+          # for the same content that a later build of the same commit could
+          # repoint, which is the overwrite this workflow exists to prevent.
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.tag_name }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The check is in the same step as the write on purpose. A separate step
+      # could be reordered, skipped, or split off in an edit; here the write is
+      # unreachable without passing the check first, and a rerun of this job
+      # replays both.
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/multica-backend
+          TAG: ${{ needs.verify.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/myswy-release-guard.sh" \
+            --tag "$TAG" --repository "$GITHUB_REPOSITORY" \
+            --scope image --image multica-backend
+          # Build the argument list into an array. Upstream's version inlines
+          # two unquoted command substitutions here, which shellcheck flags
+          # (SC2046) and which would break on an image reference containing a
+          # space; assembling the arguments explicitly avoids both.
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=("-t" "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest_file in *; do
+            args+=("$IMAGE@sha256:$digest_file")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ github.repository_owner }}/multica-backend:${{ needs.verify.outputs.tag_name }}
+
+  docker-web-build:
+    needs: [verify, guard]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute web image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-web
+          labels: |
+            org.opencontainers.image.title=Multica Web (self-host distribution)
+            org.opencontainers.image.description=Multica self-hosted web frontend with direct-to-object-storage attachment uploads
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.tag_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          pull: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=release-myswy-web-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=release-myswy-web-${{ env.PLATFORM_PAIR }}
+          build-args: |
+            REMOTE_API_URL=http://backend:8080
+            NEXT_PUBLIC_APP_VERSION=${{ needs.verify.outputs.tag_name }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/multica-web,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-web-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-web-merge:
+    needs: [verify, guard, docker-web-build]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-myswy-docker-web-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-web-*
+          merge-multiple: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute web image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/multica-web
+          # See docker-backend-merge: no `latest`, no `sha-*`.
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.tag_name }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/multica-web
+          TAG: ${{ needs.verify.outputs.tag_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/myswy-release-guard.sh" \
+            --tag "$TAG" --repository "$GITHUB_REPOSITORY" \
+            --scope image --image multica-web
+          # Build the argument list into an array. Upstream's version inlines
+          # two unquoted command substitutions here, which shellcheck flags
+          # (SC2046) and which would break on an image reference containing a
+          # space; assembling the arguments explicitly avoids both.
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=("-t" "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest_file in *; do
+            args+=("$IMAGE@sha256:$digest_file")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            ghcr.io/${{ github.repository_owner }}/multica-web:${{ needs.verify.outputs.tag_name }}
+
+  summary:
+    needs: [verify, cli, docker-backend-merge, docker-web-merge]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write release summary
+        run: |
+          tag='${{ needs.verify.outputs.tag_name }}'
+          {
+            echo "## Self-host distribution release \`$tag\`"
+            echo
+            echo "| Artifact | Reference |"
+            echo "| --- | --- |"
+            echo "| Backend image | \`ghcr.io/${{ github.repository_owner }}/multica-backend:$tag\` |"
+            echo "| Web image | \`ghcr.io/${{ github.repository_owner }}/multica-web:$tag\` |"
+            echo "| CLI archives + checksums | release \`$tag\` of \`${{ github.repository }}\` |"
+            echo
+            echo "Pin deployments to the image digest, not the tag:"
+            echo
+            echo '```'
+            echo "docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/multica-backend:$tag --format '{{json .Manifest}}' | jq -r .digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

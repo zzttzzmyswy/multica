@@ -3,14 +3,17 @@
 # -----------------------------------------------------------------------------
 images:
   backend:
-    repository: ghcr.io/multica-ai/multica-backend
-    # Empty defaults to Chart.appVersion. Released OCI charts set appVersion to
-    # the Git tag (for example v0.3.5), so installs use matching app images.
+    repository: ghcr.io/zzttzzmyswy/multica-backend
+    # Empty falls back to Chart.appVersion, which this chart pins to a real
+    # distribution release (vX.Y.Z-myswy.N). This distribution publishes no
+    # `latest` tag, so an empty tag used to render
+    # `ghcr.io/zzttzzmyswy/multica-backend:latest`, which never pulls.
+    # Set explicitly to deploy a different published build.
     tag: ""
     pullPolicy: IfNotPresent
   frontend:
-    repository: ghcr.io/multica-ai/multica-web
-    # Empty defaults to Chart.appVersion. Set explicitly to override.
+    repository: ghcr.io/zzttzzmyswy/multica-web
+    # Empty falls back to Chart.appVersion; see the backend note above.
     tag: ""
     pullPolicy: IfNotPresent
   postgres:
@@ -160,11 +163,10 @@ backend:
     # MULTICA_VCS_SECRET_KEY through existingSecret before connections work.
     # Set false to hide and reject the integration for this deployment.
     vcsIntegrationEnabled: true
-    # Community theme store (Settings → Appearance → Browse, beta). "off"
-    # hides it and stops every registry request; registryUrl points it at
-    # another registry's index.json. Empty keeps the official registry.
+    # Community theme store (Settings → Appearance → Manage, beta). Always on;
+    # registryUrl points it at another registry's index.json. Empty keeps the
+    # official registry.
     themeStore:
-      mode: ""
       registryUrl: ""
     # Managed multica-cloud connection. Empty keeps self-hosting independent.
     # Fleet, Billing, entitlement policy and strict seat capacity share it.

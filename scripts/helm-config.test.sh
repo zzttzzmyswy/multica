@@ -95,4 +95,51 @@ capacity_config="$(
 )"
 require_rendered_value "$capacity_config" 'MULTICA_CLOUD_URL: "https://multica-cloud.internal"'
 
+# ---------------------------------------------------------------------------
+# Image tags must render to a build this distribution actually publishes.
+#
+# The chart's appVersion used to be `latest`, and both image tags default to it,
+# so a plain `helm template` produced `ghcr.io/zzttzzmyswy/multica-backend:latest`
+# — a tag this distribution never publishes, which fails at pull time rather than
+# at install time.
+# ---------------------------------------------------------------------------
+image_lines="$(
+  helm template multica "$CHART_DIR" --show-only templates/backend.yaml --show-only templates/frontend.yaml \
+    | grep -E '^\s+image: "' || true
+)"
+
+if grep -q ':latest"' <<<"$image_lines"; then
+  echo "Default chart rendering uses a :latest tag, which this distribution does not publish:"
+  echo "$image_lines"
+  exit 1
+fi
+
+# Every rendered image must carry a distribution version, so the default install
+# is reproducible rather than "whatever is newest when you pull".
+for component in multica-backend multica-web; do
+  if ! grep -Eq "ghcr\.io/zzttzzmyswy/${component}:v[0-9]+\.[0-9]+\.[0-9]+-myswy\.[0-9]+\"" <<<"$image_lines"; then
+    echo "Default rendering of ${component} is not a distribution version tag:"
+    echo "$image_lines"
+    exit 1
+  fi
+done
+
+# An explicit override must still win, so an operator can deploy any published
+# build without editing the chart.
+override_lines="$(
+  helm template multica "$CHART_DIR" \
+    --set images.backend.tag=v0.10.0-myswy.7 \
+    --set images.frontend.tag=v0.10.0-myswy.7 \
+    --show-only templates/backend.yaml --show-only templates/frontend.yaml \
+    | grep -E '^\s+image: "'
+)"
+if ! grep -q 'multica-backend:v0.10.0-myswy.7"' <<<"$override_lines" ||
+  ! grep -q 'multica-web:v0.10.0-myswy.7"' <<<"$override_lines"; then
+  echo "Explicit image tag override did not take effect:"
+  echo "$override_lines"
+  exit 1
+fi
+
+echo "helm image tags ok"
+
 echo "helm config rendering ok"

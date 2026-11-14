@@ -29,6 +29,14 @@
 # any more: `make selfhost` (via scripts/selfhost-wait.sh) and both installers
 # read it back with `docker compose port`, so the health check and the printed
 # URL always match what was actually published.
+#
+# Image references: MULTICA_IMAGE_TAG selects a tag, and
+# docker-compose.selfhost.digest.yml exists for a digest-pinned deployment.
+# Digest pinning cannot be expressed here by substitution: Compose has no way to
+# ask "does this value already contain @" or ":", so appending `:${...TAG}`
+# unconditionally produced `...@sha256:<digest>:v0.9.0-myswy.1`, which Docker
+# rejects as an invalid reference format. The override file sets complete
+# references instead, and `make selfhost-digest` below points at it.
 
 name: multica
 
@@ -53,7 +61,7 @@ services:
       retries: 5
 
   backend:
-    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:${MULTICA_IMAGE_TAG:-latest}
+    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/zzttzzmyswy/multica-backend}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -195,10 +203,8 @@ services:
       MULTICA_VCS_INTEGRATION_ENABLED: ${MULTICA_VCS_INTEGRATION_ENABLED:-true}
       # VCS integration at-rest encryption key for token-based providers
       MULTICA_VCS_SECRET_KEY: ${MULTICA_VCS_SECRET_KEY:-}
-      # Community theme store (Settings → Appearance → Browse). On by default;
-      # "off" hides it and stops every registry request. The registry URL
-      # points it at another registry's index.json.
-      MULTICA_THEME_STORE: ${MULTICA_THEME_STORE:-}
+      # Community theme store (Settings → Appearance → Manage). Always on; the
+      # registry URL points it at another registry's index.json.
       MULTICA_THEME_REGISTRY_URL: ${MULTICA_THEME_REGISTRY_URL:-}
       # WeCom smart-bot integration. MULTICA_WECOM_SECRET_KEY is the
       # opt-in: unset = integration disabled. It encrypts each installation's
@@ -240,7 +246,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}
+    image: ${MULTICA_WEB_IMAGE:-ghcr.io/zzttzzmyswy/multica-web}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.1}
     depends_on:
       - backend
     ports:

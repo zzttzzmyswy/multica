@@ -20,6 +20,17 @@ concurrency:
 
 jobs:
   verify:
+    # Upstream-only, like every other job in this workflow. Release tags pushed
+    # to a fork also match this trigger, and this workflow publishes nothing
+    # there (every publishing job below is owner-guarded), so its verification
+    # job would only re-run the full race suite and vulnerability scan a second
+    # time in parallel with the fork's own release workflow
+    # (.github/workflows/release-myswy.yml) — hours of duplicated runner time
+    # that could only fail the one workflow that does not publish.
+    #
+    # This is the gate that HAS to pass before upstream publishes, so it stays
+    # unskippable where it matters.
+    if: github.repository_owner == 'multica-ai'
     runs-on: ubuntu-latest
     outputs:
       tag_name: ${{ steps.release_meta.outputs.tag_name }}
@@ -120,8 +131,16 @@ jobs:
   # (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) and merged into a
   # manifest list. This avoids QEMU emulation, which was making the Next.js
   # arm64 build run for 30+ minutes per release.
+  #
+  # Upstream-only, like the `release` and `helm-chart` jobs above. In a fork
+  # these images resolve to ghcr.io/<fork-owner>/multica-{backend,web}; letting
+  # them run there would publish a `latest` tag from the fork in addition to
+  # the fork's own release workflow (.github/workflows/release-myswy.yml),
+  # which deliberately publishes no `latest`. Two publishers of one image
+  # namespace is how a pinned deployment ends up running an unverified build.
   docker-backend-build:
     needs: verify
+    if: github.repository_owner == 'multica-ai'
     strategy:
       fail-fast: false
       matrix:
@@ -191,6 +210,7 @@ jobs:
 
   docker-backend-merge:
     needs: [verify, docker-backend-build]
+    if: github.repository_owner == 'multica-ai'
     runs-on: ubuntu-latest
     concurrency:
       group: release-docker-backend-${{ github.ref }}
@@ -239,6 +259,7 @@ jobs:
 
   docker-web-build:
     needs: verify
+    if: github.repository_owner == 'multica-ai'
     strategy:
       fail-fast: false
       matrix:
@@ -308,6 +329,7 @@ jobs:
 
   docker-web-merge:
     needs: [verify, docker-web-build]
+    if: github.repository_owner == 'multica-ai'
     runs-on: ubuntu-latest
     concurrency:
       group: release-docker-web-${{ github.ref }}

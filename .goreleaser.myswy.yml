@@ -1,0 +1,114 @@
+# GoReleaser configuration for the self-host distribution of this fork.
+#
+# Differences from the upstream .goreleaser.yml, and why:
+#
+#   * No `brews:` section. The upstream config pushes a formula to
+#     multica-ai/homebrew-tap with a secret this fork does not have. Running it
+#     here would either fail the release (missing token) or, worse, publish a
+#     fork build into the upstream tap. This fork publishes no tap at all, so
+#     server/internal/cli's BrewFormulaName is empty and both update paths
+#     refuse the brew route instead of falling back to upstream's formula.
+#   * `project_name` stays `multica` so archive names remain exactly what
+#     internal/cli/update.go looks for. Changing it would make `multica update`
+#     search for an asset no release publishes.
+#
+# Everything else mirrors upstream so the two configs stay comparable: same
+# build ids, same ldflags (so `multica version` reports the tag and commit),
+# same dual archive naming (legacy `multica_<os>_<arch>` kept for CLIs released
+# before the versioned scheme), and the same checksums.txt that
+# internal/cli/update.go verifies before replacing a binary.
+version: 2
+
+project_name: multica
+
+release:
+  # Every distribution tag is a prerelease, and that is stated explicitly rather
+  # than inherited. GoReleaser's defaults are prerelease=false and
+  # make_latest=true: a tag carrying a `-myswy.N` suffix does NOT make the
+  # release a prerelease unless `prerelease: "auto"` is set, and an earlier
+  # version of this file assumed `auto` was the default. With the real defaults
+  # the release would have been published as a normal GitHub release and marked
+  # "latest", which is exactly the state this distribution must not be in: the
+  # updater's `/releases/latest` lookups and any `latest`-following tooling would
+  # pick a build whose artifacts are never replaced.
+  #
+  # `prerelease: true` is unconditional rather than "auto" on purpose: a tag
+  # that somehow lacked the suffix would otherwise silently publish as a normal
+  # release. The workflow rejects such tags before this runs.
+  prerelease: true
+  # A prerelease must never claim GitHub's "latest release" pointer.
+  make_latest: "false"
+  #
+  # replace_existing_artifacts is FALSE, unlike upstream's config. A published
+  # version's bytes are what an installed CLI verified against its checksum, so
+  # a same-tag rerun must fail rather than swap the artifact underneath it. The
+  # documented recovery for a partial publish is a new build number (myswy.N+1),
+  # which costs one tag and keeps every version immutable and auditable.
+  #
+  # This protects the release's archives only, and only from GoReleaser. It is
+  # not the publish guard: scripts/myswy-release-guard.sh runs first and refuses
+  # the run before GoReleaser is invoked, so this setting is a second line, not
+  # the first one.
+  replace_existing_artifacts: false
+
+builds:
+  - id: multica
+    main: ./cmd/multica
+    dir: server
+    binary: multica
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.buildCommit={{.FullCommit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  # The legacy name is still published because a CLI released before the
+  # versioned scheme looks for `multica_{os}_{arch}.{ext}` when it self-updates.
+  - id: legacy
+    files:
+      - LICENSE*
+      - README*
+      - NOTICE
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+  # The name internal/cli.ReleaseAssetName builds, and the one the pinned
+  # install/update flow documents.
+  - id: versioned
+    files:
+      - LICENSE*
+      - README*
+      - NOTICE
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}-cli-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

@@ -563,6 +563,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			Storage: store,
 			Logger:  slog.Default(),
 		}
+		// Presigned-upload sessions own object-storage bytes the same way the
+		// channel-media ledger does, so they get the same independent worker.
+		// Built only when a presign-capable backend is configured; on local
+		// storage the endpoints answer 501 and no session rows are ever
+		// written.
+		if handler.StorageSupportsDirectUpload(store) {
+			h.AttachmentUploadReconciler = &service.AttachmentUploadReconciler{
+				Queries: queries,
+				Storage: store,
+				Logger:  slog.Default(),
+			}
+		}
 	}
 	installationStore := lark.NewChannelInstallationStore(queries)
 	h.ChannelSupervisor = buildChannelSupervisor(
@@ -2373,6 +2385,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			})
 
 			// Attachments
+			//
+			// Presigned direct upload. The two-step shape (issue a PUT
+			// credential, then complete) keeps file bytes off this API and
+			// therefore off any reverse proxy in front of it. Both routes are
+			// workspace-scoped, like the rest of the attachment metadata API:
+			// the target binding must be visible to this member. The handlers
+			// still self-validate the target, because the workspace header only
+			// proves membership, not access to the specific issue/comment/chat.
+			r.Post("/api/attachments/presign-upload", h.PresignAttachmentUpload)
+			r.Post("/api/attachments/{id}/complete-upload", h.CompleteAttachmentUpload)
 			r.Get("/api/attachments/{id}", h.GetAttachmentByID)
 			// /api/attachments/{id}/download is registered in the
 			// outer Auth-only group above so it can be loaded as a
@@ -2855,16 +2877,10 @@ func optionalUUID(s string) pgtype.UUID {
 	return util.MustParseUUID(s)
 }
 
-// themeStoreFromEnv builds the community theme store. MULTICA_THEME_STORE=off
-// (or false / 0) turns it off; MULTICA_THEME_REGISTRY_URL points it at
-// another registry's index.json. A URL that does not parse turns the store
-// off rather than failing the boot.
+// themeStoreFromEnv builds the community theme store, which is always on.
+// MULTICA_THEME_REGISTRY_URL points it at another registry's index.json. A
+// URL that does not parse turns the store off rather than failing the boot.
 func themeStoreFromEnv() *themestore.Store {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("MULTICA_THEME_STORE"))) {
-	case "off", "false", "0", "disabled":
-		slog.Info("theme store: turned off by MULTICA_THEME_STORE")
-		return nil
-	}
 	store, err := themestore.New(themestore.Config{
 		IndexURL: strings.TrimSpace(os.Getenv("MULTICA_THEME_REGISTRY_URL")),
 	})

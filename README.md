@@ -1,3 +1,11 @@
+> **This is a self-host distribution fork of Multica.**
+> It tracks [multica-ai/multica](https://github.com/multica-ai/multica) and adds
+> direct-to-object-storage attachment upload.
+> Install and update from **this** repository's releases —
+> [docs/self-host-distribution.md](docs/self-host-distribution.md).
+> The upstream install commands below (`multica-ai/multica`, the
+> `multica-ai/tap` Homebrew formula) install a build **without** these changes.
+
 <div align="center">
 
 <picture>
@@ -175,7 +183,7 @@ Full walkthrough: [Quickstart](https://multica.ai/docs/cloud-quickstart) · [Tut
 ## Runtimes
 
 Multica does not ship a model. It drives the agent CLIs you already have installed and
-authenticated — 29 of them today — so switching providers is a dropdown, not a migration.
+authenticated — the current source supports 31 — so switching providers is a dropdown, not a migration.
 
 | Provider | CLI | Provider | CLI |
 | --- | --- | --- | --- |
@@ -193,6 +201,7 @@ authenticated — 29 of them today — so switching providers is a dropdown, not
 | MiniMax Code | `mcode` | Dim | `dim` |
 | Huawei Cloud CodeArts | `codearts` | ZeroClaw | `zeroclaw` |
 | Muse Code | `muse` | Devin CLI | `devin` |
+| Amp | `amp` | Factory Droid | `droid` |
 | ZCode | `zcode` / ZCode Desktop | | |
 
 Installing and authenticating them: [Install an agent runtime](https://multica.ai/docs/install-agent-runtime) ·
