@@ -41,6 +41,17 @@ The executor holds these as constants. `prepare` refuses to continue when the
 running containers, the ledger or the schema shape do not match the baseline,
 because the rollback evidence was gathered on exactly that state.
 
+**Identity is the image, not the reference text.** The real deployment's compose
+file names `ghcr.io/multica-ai/multica-backend:latest` while the container runs
+the validated build. `prepare` therefore identifies the running build by the
+image ID `.Image` reports plus the repo digests that image carries, and accepts a
+tag only when it resolves to the validated digest. The rollback reference
+recorded for R1 is the full `repo@sha256:...` string the image itself reports —
+never the compose reference with its repository rewritten, because a rewritten
+prefix would name a reference nobody has proven resolvable. `prepare` re-resolves
+that reference locally and requires it to be the same image that is running, so a
+bad reference fails before the writers stop rather than at pull time.
+
 The upgrade script is installed **verbatim** from the reviewed input with the
 recorded hash; its internals are not reimplemented or "improved" here.
 
@@ -67,7 +78,8 @@ path is refused too.
 
 `prepare` also refuses while a timer job is in flight (`multica-upgrade.service`
 or `multica-attachment-gc.service` still running): freezing a half-applied
-update would leave a state the snapshot cannot describe.
+update would leave a state the snapshot cannot describe. That refusal happens
+before anything is written, so clearing the obstruction and re-running is enough.
 
 Re-running `prepare` re-verifies the assets against the hashes the journal
 recorded and **keeps** the original snapshot: it does not rebuild it. That is a
@@ -77,10 +89,21 @@ updater, CLI or compose file has changed since the first run the command exits
 matches its recorded hash is reported the same way rather than silently
 repaired. Once the journal has moved past `prepared`, `prepare` refuses outright.
 
-The publish itself is transactional: every file is written under
-`assets.new/` and renamed into place only after the whole snapshot and every
-journal key is complete, so a failure midway leaves the previous snapshot intact
-rather than half-replaced.
+The publish is a single transaction over **both** the assets and the journal.
+Every file and every journal key is written under `assets.new/` and
+`journal.new` first; only then are they renamed into place, assets first and the
+journal last. A failure at any earlier point — a required input missing, an asset
+that does not verify, a baseline mismatch, a timer job in flight — removes the
+staging copies and publishes nothing, so the state on disk is either the complete
+previous snapshot or no snapshot at all. A failure while publishing rolls the
+assets back to the previous copy, so a published journal never describes files
+that are not there, and vice versa: the journal's hashes and the files on disk
+always belong to the same snapshot.
+
+A first `prepare` that fails is therefore **retryable with no manual cleanup**.
+That matters because the alternative the previous revision shipped — half a
+journal with no `config_sha256` — refused every later run and left the operator
+deleting files by hand.
 
 Config keys (`KEY=VALUE`, one per line, `#` comments):
 
@@ -109,6 +132,28 @@ BACKUP_DIR=/Volume1/@backup
 CLI_ARCHIVE_SHA256=6b1414ba07b9b5e4b6e01f2411917e35957812b52449801522c3d3d0a6195e54
 APPROVED_UPGRADE_SHA256=a777090243e1bcf237856486d9759ff596dbf95c1751c928a41ef19388ed58d7
 ```
+
+### Compose resolution
+
+Every `docker compose` invocation pins the deployment directory:
+
+```
+docker compose -f <file> --project-directory "$COMPOSE_DIR" -p "$PROJECT" <args>
+```
+
+This is required, not cosmetic. The real compose file uses `env_file: .env`,
+`${POSTGRES_PASSWORD}` interpolation and a relative bind mount, and Compose
+resolves all three against the **project directory**, not against the directory
+holding the `-f` file. The rollback file lives under the state directory, which
+has no `.env`; without the flag it fails to load with `env file .env not found`
+and interpolates the password to an empty string — after the writers are already
+stopped.
+
+`scripts/nas-maintenance-compose.test.sh` proves this against the real Compose
+CLI (no daemon, no network, placeholder values only): it loads a synthetic
+deployment, shows that the snapshot fails from its own directory, shows that it
+loads and resolves to the same model with the directory pinned, and fails if the
+flag is removed from the wrapper.
 
 Timeouts (`STOP_TIMEOUT`, `BACKUP_TIMEOUT`, `TOC_TIMEOUT`, `MIGRATE_TIMEOUT`,
 `UP_TIMEOUT`, `HEALTH_TIMEOUT`, `QUERY_TIMEOUT`, `PROBE_TIMEOUT`,
@@ -257,6 +302,19 @@ switch the connection. Creating that database, restoring into it, and switching
 `DATABASE_URL` need their own reviewed operation card with their own stop
 conditions — they are not automated here.
 
+## Scope status: this is not a releasable executor yet
+
+Two work items were separated out of one oversized card after two acceptance
+rounds. This revision covers only the first:
+
+- **A (this change)**: real image identity and rollback references, Compose
+  resolution, and the `prepare` transaction.
+- **B (not done)**: the resume/migration state machine — late-stage resume
+  revalidation, a migration latch that covers shape failures and interruption,
+  and per-stage journal field requirements. Tracked separately; until it lands,
+  the executor must not be installed or run against production, and an
+  acceptance of A means only that this code range is complete.
+
 ## What must still be tested on the NAS
 
 This executor was developed and verified offline only. The following are
@@ -284,6 +342,10 @@ explicitly **not** covered and belong to the NAS window:
    `ghcr.io/multica-ai/multica-{backend,web}:latest`. The rule is implemented and
    tested against stubs, but confirming that the NAS's live containers carry the
    validated repo digests is a read-only check that must run on the box.
+8. The real deployment's own compose file through `compose_run`. The real-Compose
+   suite proves the mechanism on a synthetic file; the production file's actual
+   `env_file`/interpolation/mounts must be confirmed on the box before the
+   window.
 
 ## Limits that are known and deliberate
 

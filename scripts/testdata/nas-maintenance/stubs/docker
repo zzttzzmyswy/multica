@@ -90,18 +90,55 @@ image_id_of_ref() {
     printf 'image-id-%s\n' "$(printf '%s' "$1" | cksum | awk '{print $1}')"
 }
 
-# repo_digests_of <ref>: consult $S/images/<id>.digests, which the case fixture
-# writes. A tag resolves to whatever digests the fixture recorded for it. A ref
-# that is already an image ID (as `docker inspect .Image` returns) is looked up
-# directly, the way a real daemon accepts either form.
-repo_digests_of() {
-    local ref=$1 id
-    if [ -f "$S/images/$ref.digests" ]; then
-        cat "$S/images/$ref.digests"
+# key_of_ref <ref>: a filesystem-safe table key for an image reference.
+key_of_ref() {
+    printf '%s' "$1" | tr '/:@' '___'
+}
+
+# image_key_for_ref <ref>: the table key an image reference identifies.
+#
+# A tag maps to its own row. A `repo@sha256:...` reference maps to the image that
+# carries that digest — the same way a real daemon resolves a digest reference to
+# content, not to the spelling of the string.
+image_key_for_ref() {
+    local ref=$1 id key
+    key=$(key_of_ref "$ref")
+    if [ -f "$S/images/$key.digests" ]; then
+        printf '%s\n' "$key"
         return 0
     fi
+    if [ -f "$S/images/$ref.digests" ]; then
+        printf '%s\n' "$ref"
+        return 0
+    fi
+    case $ref in
+        *@sha256:*)
+            local want=${ref##*@}
+            for f in "$S"/images/*.digests; do
+                [ -f "$f" ] || continue
+                if grep -q "@$want\$" "$f"; then
+                    # The canonical image ID for this content, when the fixture
+                    # recorded one; otherwise the row key stands in for it.
+                    if [ -f "${f%.digests}.imageid" ]; then
+                        cat "${f%.digests}.imageid"
+                    else
+                        basename "$f" .digests
+                    fi
+                    return 0
+                fi
+            done
+            ;;
+    esac
     id=$(image_id_of_ref "$ref")
-    [ -f "$S/images/$id.digests" ] && cat "$S/images/$id.digests"
+    [ -f "$S/images/$id.digests" ] && { printf '%s\n' "$id"; return 0; }
+    printf '%s\n' "$id"
+}
+
+# repo_digests_of <ref>: the repo digests that reference's image reports.
+repo_digests_of() {
+    local key
+    key=$(image_key_for_ref "$1")
+    [ -f "$S/images/$key.digests" ] && cat "$S/images/$key.digests"
     return 0
 }
 
@@ -133,7 +170,16 @@ case ${1:-} in
                         *"$miss"*) printf 'Error: No such image: %s\n' "$ref" >&2; exit 1 ;;
                     esac
                 done
-                image_id_of_ref "$ref"
+                key=$(image_key_for_ref "$ref")
+                [ -f "$S/images/$key.digests" ] || {
+                    printf 'Error: No such image: %s\n' "$ref" >&2; exit 1; }
+                # `.Id` is the canonical image ID, even when the reference that
+                # found the row was a tag or a repo@digest string.
+                if [ -f "$S/images/$key.imageid" ]; then
+                    cat "$S/images/$key.imageid"
+                else
+                    printf '%s\n' "$key"
+                fi
                 ;;
             *)
                 for miss in $(opt missing-images || true); do
@@ -218,16 +264,24 @@ case ${1:-} in
     compose)
         shift
         file=""
+        project_dir=""
+        project=""
         while [ $# -gt 0 ]; do
             case $1 in
                 -f) file=$2; shift 2 ;;
-                -p) shift 2 ;;
+                -p) project=$2; shift 2 ;;
+                --project-directory) project_dir=$2; shift 2 ;;
+                --project-directory=*) project_dir=${1#*=}; shift ;;
                 *) break ;;
             esac
         done
         action=${1:-}
         shift || true
-        printf 'compose %s %s %s\n' "$file" "$action" "$*" >>"$S/compose.log"
+        # Record the resolution context, not just the file: a snapshot compose
+        # file only loads correctly when the project directory is the
+        # deployment's. The suite asserts on this.
+        printf 'compose file=%s project=%s project_dir=%s action=%s args=%s\n' \
+            "$file" "$project" "$project_dir" "$action" "$*" >>"$S/compose.log"
         case $action in
             stop)
                 for svc in "$@"; do

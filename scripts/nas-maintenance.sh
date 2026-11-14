@@ -639,6 +639,39 @@ image_is_digest() {
     image_repo_digests "$id" | grep -q "@sha256:$want\$"
 }
 
+# image_ref_for_digest <image-id> <digest>: the full `repo@sha256:...` string the
+# local image itself reports for that digest.
+#
+# This is the only safe rollback reference. The digest alone says nothing about
+# which repository can resolve it: the running build may have been pulled from
+# upstream, and rewriting the prefix to this fork's repository would invent a
+# reference that nobody has verified exists. What the image reports in
+# RepoDigests is exactly the reference the daemon can start it from.
+image_ref_for_digest() {
+    local id=$1 want=${2#sha256:}
+    image_repo_digests "$id" | grep "@sha256:$want\$" | head -1
+}
+
+# compose_run <timeout> <file> <compose args...> — the single way this tool
+# invokes Docker Compose.
+#
+# `--project-directory` is not decoration. A real deployment's compose file uses
+# `env_file: .env`, `${POSTGRES_PASSWORD}` interpolation and relative bind mounts,
+# all of which Compose resolves against the *project* directory, not against the
+# directory holding the -f file. Running a snapshot copy from
+# `$STATE_DIR/assets/compose` therefore fails with "env file .env not found" and
+# silently interpolates secrets to blank. Every call pins the project directory to
+# the deployment directory, so a snapshot loads exactly like the original, from
+# any snapshot location and any caller cwd.
+#
+# Passing the arguments directly (no string building) keeps paths with spaces and
+# hashes containing shell metacharacters intact.
+compose_run() {
+    local secs=$1 file=$2
+    shift 2
+    bounded "$secs" docker compose -f "$file" --project-directory "$COMPOSE_DIR" -p "$PROJECT" "$@"
+}
+
 psql_value() {
     bounded "$QUERY_TIMEOUT" docker exec "$PG_CONTAINER" \
         psql -U "$PG_USER" -d "$PG_DATABASE" -tAc "$1" 2>/dev/null | tr -d '[:space:]'
@@ -829,6 +862,7 @@ stage_assets() {
 # would otherwise be captured by the caller's command substitution.
 RESOLVED_REF=""
 RESOLVED_IMAGE_ID=""
+RESOLVED_VERIFIED_REF=""
 resolve_running_identity() {
     local container=$1 want=$2 label=$3 ref id
     ref=$(container_image_ref "$container")
@@ -848,13 +882,25 @@ resolve_running_identity() {
         log "       the rollback baseline was gathered on that exact digest; re-verify it on the NAS"
         return 1
     fi
+    # The rollback reference comes from the image's own RepoDigests, never from
+    # rewriting the compose reference's repository prefix.
+    local verified
+    verified=$(image_ref_for_digest "$id" "$want")
+    if [ -z "$verified" ]; then
+        log "ERROR: image $id carries $want but reports no full repo digest for it,"
+        log "       so there is no reference proven startable on this host"
+        return 1
+    fi
+
     if [ "$(digest_of_ref "$ref")" = "$want" ]; then
         log "$label identity ok: $ref pinned by digest, image $id"
     else
         log "$label identity ok by image ID: compose names $ref, which resolves to image $id carrying $want"
     fi
+    log "$label rollback reference (from the image's RepoDigests): $verified"
     RESOLVED_REF=$ref
     RESOLVED_IMAGE_ID=$id
+    RESOLVED_VERIFIED_REF=$verified
     return 0
 }
 
@@ -904,15 +950,18 @@ write_rollback_compose() {
 
 snapshot_state() {
     local backend_ref web_ref backend_id web_id backend_digest web_digest compose_sha
+    local rollback_backend_ref rollback_web_ref
     local cli_sha cli_ver script_sha script_mode script_uid script_gid
     log "== snapshot of the pre-change state =="
 
     resolve_running_identity "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_OLD" backend || return $EXIT_PREPARE
     backend_ref=$RESOLVED_REF
     backend_id=$RESOLVED_IMAGE_ID
+    rollback_backend_ref=$RESOLVED_VERIFIED_REF
     resolve_running_identity "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_OLD" web || return $EXIT_PREPARE
     web_ref=$RESOLVED_REF
     web_id=$RESOLVED_IMAGE_ID
+    rollback_web_ref=$RESOLVED_VERIFIED_REF
     backend_digest=$PIN_BACKEND_DIGEST_OLD
     web_digest=$PIN_WEB_DIGEST_OLD
 
@@ -922,23 +971,37 @@ snapshot_state() {
         log "ERROR: compose snapshot does not match the live file"; return $EXIT_PREPARE; }
 
     # The live file may name a moving tag. R1 restores *this* file (so the box
-    # returns to exactly what it ran before) but starts it from a digest-pinned
-    # copy, because `latest` must never decide which build comes back.
-    local rollback_frontend_ref
-    case $web_ref in
-        *@sha256:*) rollback_frontend_ref=$web_ref ;;
-        *) rollback_frontend_ref="ghcr.io/zzttzzmyswy/multica-web@$PIN_WEB_DIGEST_OLD" ;;
-    esac
-    local rollback_backend_ref
-    case $backend_ref in
-        *@sha256:*) rollback_backend_ref=$backend_ref ;;
-        *) rollback_backend_ref="ghcr.io/zzttzzmyswy/multica-backend@$PIN_BACKEND_DIGEST_OLD" ;;
-    esac
+    # returns to exactly what it ran before) but starts the containers from a
+    # digest-pinned copy built from the references the running images reported.
+    # Each of those references is re-resolved here: if it does not exist locally
+    # as the same image, prepare fails now instead of after the writers are
+    # stopped.
+    local rb_id
+    rb_id=$(image_id "$rollback_backend_ref")
+    if [ -z "$rb_id" ]; then
+        log "ERROR: rollback reference $rollback_backend_ref does not resolve locally"
+        return $EXIT_PREPARE
+    fi
+    if [ "$rb_id" != "$backend_id" ]; then
+        log "ERROR: $rollback_backend_ref resolves to image $rb_id, but the running backend is $backend_id"
+        return $EXIT_PREPARE
+    fi
+    local rw_id
+    rw_id=$(image_id "$rollback_web_ref")
+    if [ -z "$rw_id" ]; then
+        log "ERROR: rollback reference $rollback_web_ref does not resolve locally"
+        return $EXIT_PREPARE
+    fi
+    if [ "$rw_id" != "$web_id" ]; then
+        log "ERROR: $rollback_web_ref resolves to image $rw_id, but the running web container is $web_id"
+        return $EXIT_PREPARE
+    fi
+
     write_rollback_compose "$ASSETS/compose/docker-compose.rollback.yml" \
-        "$rollback_backend_ref" "$rollback_frontend_ref" || {
+        "$rollback_backend_ref" "$rollback_web_ref" || {
         log "ERROR: cannot derive a digest-pinned rollback compose file from $COMPOSE_FILE"
         return $EXIT_PREPARE; }
-    log "rollback compose pins backend=$rollback_backend_ref web=$rollback_frontend_ref"
+    log "rollback compose pins backend=$rollback_backend_ref web=$rollback_web_ref (both verified locally)"
 
     if [ -f "$CLI_BIN" ]; then
         cp -p "$CLI_BIN" "$ASSETS/previous/multica" || return $EXIT_PREPARE
@@ -1018,6 +1081,7 @@ snapshot_state() {
              "compose_path=$COMPOSE_FILE" "compose_sha256=$compose_sha" \
              "compose_new_sha256=$(sha256_of "$ASSETS/compose/docker-compose.new.yml")" \
              "compose_rollback_sha256=$(sha256_of "$ASSETS/compose/docker-compose.rollback.yml")" \
+             "rollback_backend_ref=$rollback_backend_ref" "rollback_web_ref=$rollback_web_ref" \
              "cli_sha256=$cli_sha" "cli_version=$cli_ver" \
              "upgrade_script_sha256=$script_sha" "upgrade_script_mode=$script_mode" \
              "upgrade_script_uid=$script_uid" "upgrade_script_gid=$script_gid" \
@@ -1037,19 +1101,34 @@ snapshot_state() {
     return 0
 }
 
-# commit_snapshot: publish a fully staged snapshot in one rename.
+# commit_snapshot <staging-assets> <final-assets> <staging-journal> <final-journal>
 #
-# `assets.new` is built beside `assets` and renamed over it only after every
-# file and every journal key is in place, so a failure mid-prepare leaves the
-# previous snapshot untouched instead of half-replacing it.
+# The snapshot and the journal that describes it are one commit unit. Publishing
+# them separately is what left a first `prepare` failure with a half-written
+# journal (initial_* keys, no config_sha256) that no later run would accept: the
+# operator's only way out was to delete files by hand.
+#
+# Order matters and is recoverable at every step:
+#   1. move the previous assets aside (still intact on disk),
+#   2. publish the new assets,
+#   3. publish the journal.
+# If step 3 fails the assets are rolled back to the previous copy, so the pair on
+# disk is always either the old snapshot with the old journal, or the new
+# snapshot with the new journal — never one of each.
 commit_snapshot() {
-    local staging=$1 final=$2
+    local staging=$1 final=$2 stage_journal=$3 final_journal=$4
     rm -rf "$final.old"
     if [ -d "$final" ]; then
         mv -f "$final" "$final.old" || { log "ERROR: cannot move the previous snapshot aside"; return 1; }
     fi
     if ! mv -f "$staging" "$final"; then
         log "ERROR: cannot publish the staged snapshot; restoring the previous one"
+        [ -d "$final.old" ] && mv -f "$final.old" "$final"
+        return 1
+    fi
+    if ! mv -f "$stage_journal" "$final_journal"; then
+        log "ERROR: cannot publish the staged journal; rolling the snapshot back"
+        rm -rf "$final"
         [ -d "$final.old" ] && mv -f "$final.old" "$final"
         return 1
     fi
@@ -1166,13 +1245,17 @@ cmd_prepare() {
     log "== prepare (intent: verify assets and snapshot; no service is stopped) =="
     WORK=$(mktemp -d "$STATE_DIR/tmp.XXXXXX") || { log "ERROR: cannot create a work directory under $STATE_DIR"; return $EXIT_PREPARE; }
 
-    local rc=0 ref staging="$ASSETS.new"
+    local rc=0 ref staging="$ASSETS.new" stage_journal="$STATE_DIR/journal.new"
+    local final_assets=$ASSETS final_journal=$JOURNAL
     rm -rf "$staging"
+    rm -f "$stage_journal"
     mkdir -p "$staging" || { rm -rf "$WORK"; return $EXIT_PREPARE; }
-    # Everything from here writes into $staging, and ASSETS points at it so the
-    # staging helpers need no second parameter.
-    local final_assets=$ASSETS
+    # Everything below writes into the staging copies. The real journal is not
+    # touched until the snapshot is complete, so a failure here leaves no
+    # half-written state behind: a journal with initial_* keys and no
+    # config_sha256 is not resumable and must never reach disk.
     ASSETS=$staging
+    JOURNAL=$stage_journal
 
     for ref in "$COMPOSE_FILE" "$COMPOSE_FILE_NEW" "$CLI_ARCHIVE" "$APPROVED_UPGRADE_SCRIPT"; do
         [ -f "$ref" ] || { log "ERROR: required input missing: $ref"; rc=$EXIT_PREPARE; break; }
@@ -1197,22 +1280,21 @@ cmd_prepare() {
     if [ "$rc" -eq 0 ]; then stage_assets || rc=$?; fi
     if [ "$rc" -eq 0 ]; then snapshot_state || rc=$?; fi
     if [ "$rc" -eq 0 ]; then
-        # The publish is the commit point: before it, nothing outside the
-        # staging directory and the journal exists.
-        commit_snapshot "$staging" "$final_assets" || rc=$EXIT_PREPARE
-        ASSETS=$final_assets
+        # Every journal key the snapshot implies is written into the staged
+        # journal, before the publish, so the pair is complete when it lands.
+        jset config_sha256 "$(config_sha256)" || rc=$EXIT_PREPARE
+        [ "$rc" -eq 0 ] && { jset intent switch || rc=$EXIT_PREPARE; }
+        [ "$rc" -eq 0 ] && { stage_set prepared || rc=$EXIT_PREPARE; }
     fi
     if [ "$rc" -eq 0 ]; then
-        jset config_sha256 "$(config_sha256)" --once || rc=$EXIT_PREPARE
+        commit_snapshot "$staging" "$final_assets" "$stage_journal" "$final_journal" || rc=$EXIT_PREPARE
     fi
-    if [ "$rc" -eq 0 ]; then
-        jset intent switch --once || rc=$EXIT_PREPARE
-    fi
-    if [ "$rc" -eq 0 ]; then stage_set prepared || rc=$EXIT_PREPARE; fi
     if [ "$rc" -ne 0 ]; then
-        ASSETS=$final_assets
         rm -rf "$staging"
+        rm -f "$stage_journal"
     fi
+    ASSETS=$final_assets
+    JOURNAL=$final_journal
     rm -rf "$WORK"
     WORK=""
     [ "$rc" -eq 0 ] || return "$rc"
@@ -1257,7 +1339,7 @@ stop_writers() {
     unit_state_stopped "$s" || { log "ERROR: $DAEMON_UNIT is still '$s' after stop"; return $EXIT_FREEZE; }
 
     log "stopping backend and frontend containers (project $PROJECT)"
-    if ! bounded "$STOP_TIMEOUT" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" stop backend frontend; then
+    if ! compose_run "$STOP_TIMEOUT" "$COMPOSE_FILE" stop backend frontend; then
         log "ERROR: 'docker compose stop backend frontend' failed; backend=$(container_status "$BACKEND_CONTAINER") frontend=$(container_status "$FRONTEND_CONTAINER")"
         return $EXIT_FREEZE
     fi
@@ -1512,7 +1594,7 @@ step_switch() {
     [ "$(sha256_of "$COMPOSE_FILE")" = "$(jget initial_compose_new_sha256)" ] || {
         log "ERROR: $COMPOSE_FILE does not match the approved input after the write"; return $EXIT_CANDIDATE; }
 
-    bounded "$UP_TIMEOUT" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d backend frontend
+    compose_run "$UP_TIMEOUT" "$COMPOSE_FILE" up -d backend frontend
     rc=$?
     log "compose up exit=$rc"
     if [ "$rc" -ne 0 ]; then
@@ -1914,7 +1996,10 @@ cmd_rollback_r1() {
         report_state; return $EXIT_ROLLBACK
     fi
     local rc body commit
-    bounded "$UP_TIMEOUT" docker compose -f "$rollback_compose" -p "$PROJECT" up -d backend frontend
+    # The rollback file lives under the state directory; the project directory
+    # still has to be the deployment's, or its .env and env_file resolve against
+    # the snapshot instead of the real configuration.
+    compose_run "$UP_TIMEOUT" "$rollback_compose" up -d backend frontend
     rc=$?
     if [ "$rc" -ne 0 ]; then
         log "ERROR: compose up with the rollback file exited $rc; backend=$(container_status "$BACKEND_CONTAINER")"

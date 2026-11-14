@@ -141,6 +141,7 @@
     "scripts/myswy-release-workflow.test.mjs",
     "scripts/nas-maintenance.sh",
     "scripts/nas-maintenance.test.sh",
+    "scripts/nas-maintenance-compose.test.sh",
     "scripts/testdata/nas-maintenance/**",
     "docs/nas-myswy-maintenance.md"
   ],

@@ -134,10 +134,10 @@ new_case() {
     # The old builds are present locally and carry their release digests, and
     # the two containers run them. That is the shape prepare verifies identity
     # against — not how the compose file happens to spell the reference.
-    image_carries "$BACKEND_IMAGE_OLD" "$BACKEND_DIGEST_OLD"
-    image_carries "$WEB_IMAGE_OLD" "$WEB_DIGEST_OLD"
-    image_carries "$BACKEND_IMAGE_NEW" "$BACKEND_DIGEST_NEW"
-    image_carries "$WEB_IMAGE_NEW" "$WEB_DIGEST_NEW"
+    image_carries "$BACKEND_IMAGE_OLD" "ghcr.io/zzttzzmyswy/multica-backend" "$BACKEND_DIGEST_OLD"
+    image_carries "$WEB_IMAGE_OLD" "ghcr.io/zzttzzmyswy/multica-web" "$WEB_DIGEST_OLD"
+    image_carries "$BACKEND_IMAGE_NEW" "ghcr.io/zzttzzmyswy/multica-backend" "$BACKEND_DIGEST_NEW"
+    image_carries "$WEB_IMAGE_NEW" "ghcr.io/zzttzzmyswy/multica-web" "$WEB_DIGEST_NEW"
     set_container multica-backend-1 "$BACKEND_IMAGE_OLD"
     set_container multica-frontend-1 "$WEB_IMAGE_OLD"
 
@@ -171,27 +171,79 @@ image_id_of_ref() {
     printf 'image-id-%s\n' "$(printf '%s' "$1" | cksum | awk '{print $1}')"
 }
 
-# image_carries <ref> <digest...>: record the repo digests this reference's
-# image reports. A tag resolves to the digests recorded here, so a case can
-# express "latest currently points at the validated build" and then move it.
+# key_of_ref mirrors the stub's filesystem-safe table key.
+key_of_ref() {
+    printf '%s' "$1" | tr '/:@' '___'
+}
+
+# image_carries <ref> <repo> <digest...>
+#
+# Record the repo digests this image reports, the way `docker image inspect
+# .RepoDigests` does. A real RepoDigests list never contains a tag: pulling
+# `repo:latest` records `repo@sha256:...`, and that is the full reference the
+# daemon can start the image from.
+#
+# A real daemon accepts three spellings for one image and this models all of
+# them: the reference a container was started from, the `repo@sha256:...` form,
+# and the image ID `.Image` reports.
 image_carries() {
-    local ref=$1
-    shift
-    local id
-    id=$(image_id_of_ref "$ref")
+    local ref=$1 repo=$2
+    shift 2
     mkdir -p "$CUR/state/images"
+    local id key dkey d
+    id=$(image_id_of_ref "$ref")
+    key=$(key_of_ref "$ref")
     : >"$CUR/state/images/$id.digests"
-    local d
+    : >"$CUR/state/images/$key.digests"
+    printf '%s\n' "$id" >"$CUR/state/images/$id.imageid"
+    printf '%s\n' "$id" >"$CUR/state/images/$key.imageid"
     for d in "$@"; do
-        printf '%s@%s\n' "${ref%%@*}" "$d" >>"$CUR/state/images/$id.digests"
+        printf '%s@%s\n' "$repo" "$d" >>"$CUR/state/images/$id.digests"
+        printf '%s@%s\n' "$repo" "$d" >>"$CUR/state/images/$key.digests"
+        # A `repo@sha256:...` reference is content, not spelling: it resolves to
+        # this same image.
+        dkey=$(key_of_ref "$repo@$d")
+        cp "$CUR/state/images/$id.digests" "$CUR/state/images/$dkey.digests"
+        printf '%s\n' "$id" >"$CUR/state/images/$dkey.imageid"
     done
 }
 
+# image_carries_tag <tag-ref> <repo> <digest...>: a tag that resolves to the
+# content of an image already registered. Used to model "`latest` currently
+# points at the validated build", and to move it somewhere else.
+image_carries_tag() {
+    local ref=$1 repo=$2 digest=$3
+    local key source id
+    key=$(key_of_ref "$ref")
+    source=$(key_of_ref "$repo@$digest")
+    [ -f "$CUR/state/images/$source.digests" ] || {
+        bad "fixture error: no image registered for $repo@$digest"
+        return 1
+    }
+    # A tag and its digest are the same image: `.Image` reports one ID for both,
+    # exactly like a real daemon.
+    id=$(cat "$CUR/state/images/$source.imageid" 2>/dev/null || printf '%s' "$(image_id_of_ref "$repo@$digest")")
+    cp "$CUR/state/images/$source.digests" "$CUR/state/images/$key.digests"
+    printf '%s\n' "$id" >"$CUR/state/images/$key.imageid"
+}
+
+# set_container <name> <image-ref>: a running container on that reference.
+#
+# Its `.Image` is whatever image the reference resolves to, so a container
+# started from `repo:latest` reports the same ID as the digest that tag points
+# at — as a real daemon does. Falling back to a name-derived ID would let a test
+# pass that a real host would reject.
 set_container() {
-    printf '%s\n' "$2" >"$CUR/state/containers/$1.image"
+    local ref=$2 key
+    printf '%s\n' "$ref" >"$CUR/state/containers/$1.image"
     printf 'running\n' >"$CUR/state/containers/$1.status"
     printf 'true\n' >"$CUR/state/containers/$1.running"
-    image_id_of_ref "$2" >"$CUR/state/containers/$1.image_id"
+    key=$(key_of_ref "$ref")
+    if [ -f "$CUR/state/images/$key.imageid" ]; then
+        cp "$CUR/state/images/$key.imageid" "$CUR/state/containers/$1.image_id"
+    else
+        image_id_of_ref "$ref" >"$CUR/state/containers/$1.image_id"
+    fi
 }
 
 # stub_opt <name> [value] — sets (or with no value, clears) one stub behaviour.
@@ -427,6 +479,13 @@ mark_calls() { printf 'MARK %s\n' "${1:-mark}" >>"$CUR/state/calls.log"; }
 
 calls_since_mark() {
     awk 'f { print } /^MARK / { f = 1 }' "$CUR/state/calls.log"
+}
+
+# compose_calls_since_mark — the compose log has its own record, because a
+# compose invocation is more than a command line: the suite needs the resolved
+# project directory and project name to prove where it would have run.
+compose_calls_since_mark() {
+    awk 'f { print } /^MARK / { f = 1 }' "$CUR/state/compose.log"
 }
 
 expect_no_call_since_mark() {
@@ -1253,8 +1312,16 @@ step "review 1: a real production tag reference prepares without rebuilding"
 # the containers actually run the validated build. Identity comes from the image
 # the container runs and the digests that image carries, not from the spelling.
 new_case tag-reference
-image_carries "ghcr.io/multica-ai/multica-backend:latest" "$BACKEND_DIGEST_OLD"
-image_carries "ghcr.io/multica-ai/multica-web:latest" "$WEB_DIGEST_OLD"
+# The real baseline: the container was pulled from upstream as `:latest`, so its
+# RepoDigests record upstream `repo@sha256:...`, not a fork reference.
+image_carries "ghcr.io/multica-ai/multica-backend@$BACKEND_DIGEST_OLD" \
+    "ghcr.io/multica-ai/multica-backend" "$BACKEND_DIGEST_OLD"
+image_carries "ghcr.io/multica-ai/multica-web@$WEB_DIGEST_OLD" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
+image_carries_tag "ghcr.io/multica-ai/multica-backend:latest" \
+    "ghcr.io/multica-ai/multica-backend" "$BACKEND_DIGEST_OLD"
+image_carries_tag "ghcr.io/multica-ai/multica-web:latest" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
 set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
 set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
 prepare_ok
@@ -1268,10 +1335,20 @@ if [ -f "$rollback_compose" ]; then
 else
     bad "no rollback compose file was recorded"
 fi
-if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr.io/zzttzzmyswy/multica-backend@$BACKEND_DIGEST_OLD\$" "$rollback_compose" 2>/dev/null; then
-    ok "the rollback file pins the backend digest"
+# The pinned reference must be the one the running image reported — upstream,
+# not a fork prefix invented by rewriting the repository. Asserting a fork
+# prefix here is what let the previous revision ship a reference nobody had
+# verified.
+expected_rb="ghcr.io/multica-ai/multica-backend@$BACKEND_DIGEST_OLD"
+if grep -qE "^[[:space:]]*image:[[:space:]]*$expected_rb\$" "$rollback_compose" 2>/dev/null; then
+    ok "the rollback file pins the digest against the verified upstream repo"
 else
-    bad "the rollback file does not pin the backend digest: $(grep -E 'image:' "$rollback_compose" 2>/dev/null | tr '\n' '|')"
+    bad "the rollback file does not pin $expected_rb: $(grep -E 'image:' "$rollback_compose" 2>/dev/null | tr '\n' '|')"
+fi
+if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr.io/zzttzzmyswy/multica-backend@$BACKEND_DIGEST_OLD\$" "$rollback_compose" 2>/dev/null; then
+    bad "the rollback file rewrote the repository prefix to this fork"
+else
+    ok "the rollback file keeps the repository the image was pulled from"
 fi
 if grep -q 'latest' "$rollback_compose" 2>/dev/null; then
     bad "the rollback file still contains a floating tag"
@@ -1282,8 +1359,14 @@ expect_sha "$CUR/compose/docker-compose.yml" "$(sha256sum "$FIXTURES/compose-liv
 
 step "review 1: a tag that has drifted to another build is refused"
 new_case tag-drift
-image_carries "ghcr.io/multica-ai/multica-backend:latest" "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-image_carries "ghcr.io/multica-ai/multica-web:latest" "$WEB_DIGEST_OLD"
+image_carries "ghcr.io/multica-ai/multica-backend-drifted:latest" \
+    "ghcr.io/multica-ai/multica-backend" "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+image_carries_tag "ghcr.io/multica-ai/multica-backend:latest" \
+    "ghcr.io/multica-ai/multica-backend" "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+image_carries "ghcr.io/multica-ai/multica-web@$WEB_DIGEST_OLD" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
+image_carries_tag "ghcr.io/multica-ai/multica-web:latest" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
 set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
 set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
 run_script prepare --config "$CUR_CONFIG"
@@ -1633,6 +1716,177 @@ else
         bad "owner is $(stat -c '%u:%g' "$CUR/scripts/upgrade-multica.sh"), expected 1234:5678"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# A: real image references, compose resolution, and the prepare transaction.
+#
+# These three are the scope of this card. Each case below reproduces the state
+# the reviewer reached with real Docker / real Compose, using stubs only where a
+# daemon would otherwise be required.
+# ---------------------------------------------------------------------------
+
+step "A1: every compose call resolves against the deployment directory"
+new_case compose-project-dir
+prepare_ok
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+# Both compose actions must name the deployment directory, not the directory the
+# file happens to live in. A snapshot under STATE_DIR has no .env of its own.
+if grep -q "project_dir=$CUR/compose " "$CUR/state/compose.log"; then
+    ok "stop/up carry --project-directory=$CUR/compose"
+else
+    bad "compose calls did not pin the project directory: $(head -3 "$CUR/state/compose.log" | tr '\n' '|')"
+fi
+if grep -q "project=multica " "$CUR/state/compose.log"; then
+    ok "the project name is explicit on every call"
+else
+    bad "compose calls did not pin the project name"
+fi
+
+step "A1: the rollback compose file is started from the deployment directory"
+new_case compose-project-dir-rollback
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+stub_opt compose-rc
+printf 'MARK rollback\n' >>"$CUR/state/compose.log"
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 0
+# The rollback file lives under STATE_DIR/assets/compose; without the project
+# directory its `env_file: .env` and ${...} interpolation would resolve there.
+if compose_calls_since_mark | grep -q "project_dir=$CUR/compose .*action=up"; then
+    ok "the rollback up pins the deployment directory"
+else
+    bad "the rollback up did not pin the project directory: $(compose_calls_since_mark | tr '\n' '|')"
+fi
+if compose_calls_since_mark | grep -q "file=$CUR/state-dir/assets/compose/docker-compose.rollback.yml"; then
+    ok "the rollback up uses the digest-pinned snapshot file"
+else
+    bad "the rollback up did not use the verified rollback file: $(compose_calls_since_mark | tr '\n' '|')"
+fi
+
+step "A2: the rollback reference is the image's own repository"
+new_case rollback-ref-upstream
+# The real baseline: containers pulled from upstream as :latest. The rollback
+# reference must be upstream's repo@digest, because that is the reference the
+# image reports and the only one proven resolvable here.
+image_carries "ghcr.io/multica-ai/multica-backend@$BACKEND_DIGEST_OLD" \
+    "ghcr.io/multica-ai/multica-backend" "$BACKEND_DIGEST_OLD"
+image_carries "ghcr.io/multica-ai/multica-web@$WEB_DIGEST_OLD" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
+image_carries_tag "ghcr.io/multica-ai/multica-backend:latest" \
+    "ghcr.io/multica-ai/multica-backend" "$BACKEND_DIGEST_OLD"
+image_carries_tag "ghcr.io/multica-ai/multica-web:latest" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
+set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
+set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
+prepare_ok
+expect_journal initial_rollback_backend_ref \
+    "ghcr.io/multica-ai/multica-backend@$BACKEND_DIGEST_OLD"
+expect_journal initial_rollback_web_ref \
+    "ghcr.io/multica-ai/multica-web@$WEB_DIGEST_OLD"
+if journal_get initial_rollback_backend_ref 2>/dev/null | grep -q zzttzzmyswy; then
+    bad "the recorded rollback reference was rewritten to this fork"
+else
+    ok "the recorded rollback reference keeps the original repository"
+fi
+
+# Note: a rollback reference that resolves to no local image at all cannot be
+# constructed here without also failing the earlier digest-identity gate, which
+# already refuses an image the host does not carry. The check that matters — the
+# derived reference must be the *same* image that is running — is the case below.
+
+step "A2: a rollback reference resolving to a different image fails prepare"
+new_case rollback-ref-wrong-image
+image_carries "ghcr.io/multica-ai/multica-backend:latest" \
+    "ghcr.io/multica-ai/multica-backend" "$BACKEND_DIGEST_OLD"
+image_carries "ghcr.io/multica-ai/multica-web:latest" \
+    "ghcr.io/multica-ai/multica-web" "$WEB_DIGEST_OLD"
+set_container multica-backend-1 "ghcr.io/multica-ai/multica-backend:latest"
+set_container multica-frontend-1 "ghcr.io/multica-ai/multica-web:latest"
+# The digest-form row resolves, but to an image that is not what is running.
+printf 'image-id-something-else\n' \
+    >"$CUR/state/images/$(key_of_ref "ghcr.io/multica-ai/multica-backend@$BACKEND_DIGEST_OLD").imageid"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'but the running backend is' 'refuses a reference that resolves elsewhere'
+expect_no_journal initial_compose_sha256
+
+step "A3: a first prepare that fails leaves nothing behind and can be retried"
+new_case prepare-first-failure
+# The reviewer's counter-example: the very first prepare fails (a oneshot GC job
+# is in flight). The old executor had already written half a journal by then, so
+# the retry hit "unbound journal" and the operator had to delete files by hand.
+set_unit multica-attachment-gc.service active
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 20
+expect_log 'is running; a timer job is in flight' 'refuses while a timer job runs'
+if [ -f "$CUR/state-dir/journal" ]; then
+    bad "a failed first prepare left a journal behind: $(cat "$CUR/state-dir/journal" | tr '\n' '|' | cut -c1-200)"
+else
+    ok "no journal was published by the failed prepare"
+fi
+if [ -d "$CUR/state-dir/assets" ]; then bad "a failed first prepare published assets"; else ok "no assets were published"; fi
+if [ -d "$CUR/state-dir/assets.new" ]; then bad "a staging directory was left behind"; else ok "no staging directory was left behind"; fi
+if [ -f "$CUR/state-dir/journal.new" ]; then bad "a staged journal was left behind"; else ok "no staged journal was left behind"; fi
+# The obstruction clears; a retry must now succeed with no manual cleanup.
+set_unit multica-attachment-gc.service inactive
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage prepared
+expect_journal config_sha256 "$(sha256sum "$CUR_CONFIG" | awk '{ print $1 }')"
+
+step "A3: a prepare failing after staging can be retried"
+new_case prepare-late-failure
+# Fail after the assets are staged and the snapshot is written but before the
+# publish: the rollback compose cannot be derived when the live file has no
+# backend image line.
+grep -v 'multica-backend@' "$CUR/compose/docker-compose.yml" >"$CUR/compose/tmp.yml"
+mv "$CUR/compose/tmp.yml" "$CUR/compose/docker-compose.yml"
+run_script prepare --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the prepare failed as arranged (exit $RC)"; else bad "prepare succeeded on a broken compose file"; fi
+if [ -f "$CUR/state-dir/journal" ]; then
+    bad "a late prepare failure left a journal behind"
+else
+    ok "no journal was published"
+fi
+if [ -d "$CUR/state-dir/assets.new" ]; then bad "staging left behind"; else ok "staging cleaned up"; fi
+# Fix the input and retry.
+cp "$FIXTURES/compose-live.yml" "$CUR/compose/docker-compose.yml"
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage prepared
+
+step "A3: a successful snapshot is never overwritten or half-replaced"
+new_case prepare-publish-atomic
+prepare_ok
+snapshot_journal="$(sha256sum "$CUR/state-dir/journal" | awk '{ print $1 }')"
+snapshot_assets="$(find "$CUR/state-dir/assets" -type f | sort | xargs sha256sum | sha256sum | awk '{ print $1 }')"
+# Any later attempt, successful or not, must leave both untouched.
+run_script prepare --config "$CUR_CONFIG"
+expect_rc 0
+expect_sha "$CUR/state-dir/journal" "$snapshot_journal"
+if [ "$(find "$CUR/state-dir/assets" -type f | sort | xargs sha256sum | sha256sum | awk '{ print $1 }')" = "$snapshot_assets" ]; then
+    ok "the published assets are byte-identical"
+else
+    bad "the published assets changed on a re-run"
+fi
+# Journal and assets must always agree: every initial_* hash is present on disk.
+for pair in "initial_compose_sha256:$CUR/state-dir/assets/compose/docker-compose.initial.yml" \
+            "initial_compose_new_sha256:$CUR/state-dir/assets/compose/docker-compose.new.yml" \
+            "initial_compose_rollback_sha256:$CUR/state-dir/assets/compose/docker-compose.rollback.yml" \
+            "initial_cli_sha256:$CUR/state-dir/assets/previous/multica" \
+            "initial_upgrade_script_sha256:$CUR/state-dir/assets/previous/upgrade-multica.sh"; do
+    k=${pair%%:*}; path=${pair#*:}
+    want=$(journal_get "$k")
+    got=$(sha256sum "$path" 2>/dev/null | awk '{ print $1 }')
+    if [ "$want" = "$got" ]; then
+        ok "journal $k matches the published file"
+    else
+        bad "journal $k=$want but $path is $got"
+    fi
+done
 
 step "the release pins match the reviewed release"
 pin_of() { grep -E "^readonly $1=" "$EXECUTOR" | head -1 | sed 's/.*=//'; }
