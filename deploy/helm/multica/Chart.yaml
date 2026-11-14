@@ -8,7 +8,7 @@ version: 0.1.0
 # Pinned to a real distribution release. `latest` is not published by this
 # distribution, so an empty image tag resolving to it produced a reference that
 # never pulls (ghcr.io/zzttzzmyswy/multica-backend:latest).
-appVersion: "v0.9.0-myswy.1"
+appVersion: "v0.9.0-myswy.2"
 home: https://multica.ai
 sources:
   - https://github.com/multica-ai/multica

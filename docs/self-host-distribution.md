@@ -63,13 +63,13 @@ the code depends on.
 1. Merge to `main` through a pull request. Never tag an unmerged branch.
 2. Choose the version and create the tag:
    ```bash
-   git tag v0.9.0-myswy.1
-   git push origin v0.9.0-myswy.1
+   git tag v0.9.0-myswy.2
+   git push origin v0.9.0-myswy.2
    ```
 3. `.github/workflows/release-myswy.yml` runs on the tag push and publishes:
-   - `ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.1`
-   - `ghcr.io/zzttzzmyswy/multica-web:v0.9.0-myswy.1`
-   - GitHub release `v0.9.0-myswy.1` with CLI archives
+   - `ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.2`
+   - `ghcr.io/zzttzzmyswy/multica-web:v0.9.0-myswy.2`
+   - GitHub release `v0.9.0-myswy.2` with CLI archives
      (`multica-cli-<version>-<os>-<arch>.tar.gz` plus the legacy
      `multica_<os>_<arch>.tar.gz`) and `checksums.txt`
 4. Record the image **digests** from the image-merge job output. Deployment
@@ -174,12 +174,17 @@ token request and the push (it is the same credential `docker/login-action`
 already logs in with). A classic PAT with `read:packages` also works for the
 check and needs no `packages:write`. Both are read-only uses of the credential.
 
-**Not yet exercised on a real tag push.** The registry behaviour above was
+**Not yet exercised end to end.** The registry behaviour above was
 measured against `ghcr.io` with a real credential, and the workflow is tested
 against a local stub that reproduces those exact answers. What has *not* run is
-this workflow publishing `v0.9.0-myswy.1`: no tag has been pushed, so the
-`GITHUB_TOKEN` token grant inside Actions is by contract, not by observation.
-The first real release is where that gap closes.
+a release of this workflow that got past `verify`: the `v0.9.0-myswy.1` tag was
+pushed, its run failed in the test gate, and every publishing job after that gate
+was skipped — that build published no image and no release. The `GITHUB_TOKEN`
+grant that writes images and the GitHub release inside Actions is therefore still
+by contract, not by observation, and the next build number is a candidate rather
+than a published version. Treat a green release run's own Release page and image
+digests as the only statement that something was published; nothing in this
+document implies it.
 
 Upstream's `.github/workflows/release.yml` still exists here, but every job in it
 (including its gate) is guarded by `github.repository_owner == 'multica-ai'` and
@@ -198,7 +203,7 @@ curl -fsSL https://raw.githubusercontent.com/zzttzzmyswy/multica/main/scripts/in
 
 # One exact version (also the rollback path)
 curl -fsSL https://raw.githubusercontent.com/zzttzzmyswy/multica/main/scripts/install-myswy.sh \
-  | bash -s -- --version v0.9.0-myswy.1
+  | bash -s -- --version v0.9.0-myswy.2
 
 # Report installed vs available without changing anything
 bash scripts/install-myswy.sh --check
@@ -239,13 +244,18 @@ mirrored install still verifies against the manifest for the same release.
 
 ## Deploying the server
 
-`.env` selects the images by tag:
+`.env` selects the images by tag. The checked-in default is the build this
+branch is prepared for:
 
 ```bash
-MULTICA_IMAGE_TAG=v0.9.0-myswy.1
+MULTICA_IMAGE_TAG=v0.9.0-myswy.2
 MULTICA_BACKEND_IMAGE=ghcr.io/zzttzzmyswy/multica-backend
 MULTICA_WEB_IMAGE=ghcr.io/zzttzzmyswy/multica-web
 ```
+
+Set this to whatever version a successful release run actually published: a
+default that names a build with no image fails at pull time, and this value is
+not evidence that the build exists.
 
 A digest is the only immutable pin. This workflow publishes each version tag
 once and refuses to re-publish it, so a tag here should never move — but a pin
@@ -266,7 +276,7 @@ make selfhost-digest
 The separate override file exists because Compose interpolation cannot test
 whether a value already carries a `@digest` or a `:tag`, so the base file's
 `${..._IMAGE}:${..._TAG}` appended a tag to a digest
-(`...@sha256:<digest>:v0.9.0-myswy.1`) — an invalid reference format that made
+(`...@sha256:<digest>:v0.9.0-myswy.2`) — an invalid reference format that made
 digest pinning impossible to express. The override sets the whole reference
 instead, and fails the render if either digest is unset rather than falling back
 to a tag silently. `scripts/selfhost-config.test.sh` renders both paths and
@@ -276,7 +286,7 @@ Obtain a digest from the release run's image-merge job, or:
 
 ```bash
 docker buildx imagetools inspect \
-  ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.1 --format '{{json .Manifest}}'
+  ghcr.io/zzttzzmyswy/multica-backend:v0.9.0-myswy.2 --format '{{json .Manifest}}'
 ```
 
 Database migrations apply automatically: the backend image's entrypoint runs

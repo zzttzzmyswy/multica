@@ -11,7 +11,7 @@
 #     curl -fsSL https://raw.githubusercontent.com/zzttzzmyswy/multica/main/scripts/install-myswy.sh | bash
 #
 #   Install or roll back to one exact version:
-#     curl -fsSL .../scripts/install-myswy.sh | bash -s -- --version v0.9.0-myswy.1
+#     curl -fsSL .../scripts/install-myswy.sh | bash -s -- --version v0.9.0-myswy.2
 #
 #   Show what is installed and what is available, without changing anything:
 #     bash scripts/install-myswy.sh --check
@@ -73,7 +73,7 @@ Usage: install-myswy.sh [--version <tag>] [--check]
 
   (default)          Install, or upgrade to, the newest published build
   --version <tag>    Install or roll back to one exact release tag
-                     (for example v0.9.0-myswy.1)
+                     (for example v0.9.0-myswy.2)
   --check            Report the installed and available versions; change nothing
 
 Environment variables:
