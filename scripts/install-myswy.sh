@@ -178,9 +178,10 @@ if mode == "highest":
         version = tag_version(tag, pattern)
         if version is None:
             continue
-        # The archive must carry this release's own version, exactly as the CLI
-        # requires (hasVersionedReleaseAssetFor). A versionless legacy name
-        # cannot be tied to the tag it hangs off, so it does not count.
+        # The archive must carry the version of the release it is attached to,
+        # exactly as the CLI requires (hasVersionedReleaseAssetFor). A
+        # versionless legacy name cannot be tied to the tag it hangs off, so it
+        # does not count.
         wanted = "multica-cli-%s-%s.tar.gz" % (tag[1:], platform)
         if not any((asset.get("name") or "") == wanted for asset in release.get("assets") or []):
             continue
