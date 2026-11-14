@@ -439,8 +439,9 @@ world_post_switch() {
     printf '148\n' >"$CUR/state/tables"
     printf '799/0/0\n' >"$CUR/state/indexes"
     # A journal that legitimately reached 'cli' also records every earlier
-    # stage; the fixture has to look like one, or the completeness gate (rightly)
-    # refuses it.
+    # stage, including the verified migration attempt and the two artifacts
+    # `cli` installed. The fixture has to look like one, or the completeness
+    # gate (rightly) refuses it — which is the point of the gate.
     jset stage cli
     jset freeze_at '2026-01-01 00:00:00'
     jset backup_path "$CUR/backup/world.dump"
@@ -448,9 +449,19 @@ world_post_switch() {
     jset backup_sha256 "$(sha256sum "$CUR/backup/world.dump" | awk '{ print $1 }')"
     jset backup_bytes 10
     jset backup_toc_lines 500
+    jset migration_attempt "done"
+    jset migration_outcome verified
     jset migrate_rc 0
     jset ledger_after 660_attachment_upload_session_workspace
+    jset migration_ledger_rows 684
+    jset migration_tables 148
+    jset migration_indexes 799/0/0
     jset switched_commit "$REV_NEW"
+    # A world at 'cli' has already installed both artifacts, so the fixture
+    # installs them instead of only writing the journal keys.
+    cp -p "$FIXTURES/approved-upgrade.sh" "$CUR/scripts/upgrade-multica.sh"
+    jset cli_installed_sha256 "$(sha256sum "$CUR/cli-bin/multica" | awk '{ print $1 }')"
+    jset upgrade_script_installed_sha256 "$APPROVED_SHA"
     # Reaching 'cli' means switch already started the new application: the units
     # are still stopped, but the containers are up and serving.
     set_unit multica-daemon inactive
@@ -540,6 +551,12 @@ sed -e '/^COMPOSE_FILE_NEW=/d' "$CUR_CONFIG" >"$CUR/partial.conf"
 run_script prepare --config "$CUR/partial.conf"
 expect_rc 2
 expect_log 'missing: COMPOSE_FILE_NEW' 'names the missing setting'
+# FRONTEND_URL decides whether the web container is serving, so a write config
+# that leaves it out must not silently fall back to a built-in address.
+sed -e '/^FRONTEND_URL=/d' "$CUR_CONFIG" >"$CUR/no-frontend-url.conf"
+run_script prepare --config "$CUR/no-frontend-url.conf"
+expect_rc 2
+expect_log 'missing: FRONTEND_URL' 'refuses to guess the frontend address'
 write_config 'NONSENSE_KEY=1'
 run_script prepare --config "$CUR_CONFIG"
 expect_rc 2
@@ -1934,6 +1951,526 @@ if grep -nE 'declare -A|mapfile|readarray|\$\{[a-zA-Z_]+,,|\$\{[a-zA-Z_]+\^\^' "
     bad "the executor uses a bash 4+ construct: $(grep -nE 'declare -A|mapfile|readarray' "$EXECUTOR" | head -2)"
 else
     ok "no bash-4-only construct"
+fi
+
+# ---------------------------------------------------------------------------
+# B: the resume and migration state machine.
+#
+# Three defects from the second acceptance round, each reproduced on its own:
+#
+#   3. a late resume (from `verified`) returned 0 without re-measuring anything,
+#      so an old CLI, a stopped frontend and a deleted backup all "succeeded";
+#   4. only a non-zero `docker run` was latched, so a migration that exited 0
+#      into the wrong schema — or that was interrupted — was simply re-run;
+#   5. `frozen` demanded the backup fields, so a failed dump could never be
+#      retried: the only way out was editing the journal by hand.
+#
+# Every case below is driven through the executor's own CLI. Nothing edits the
+# journal to clear a latch: a latch that can be cleared by hand is not a latch.
+# ---------------------------------------------------------------------------
+
+# thaw_then_break — reach `verified` legitimately (a real run whose thaw fails),
+# then damage the world in a named way. Each case separates one fault from the
+# others, so a single early mismatch cannot hide the rest.
+thaw_then_break() {
+    prepare_ok || return 1
+    stub_opt start-fail-unit multica-daemon
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    if [ "$RC" -ne 70 ]; then
+        bad "the arranged thaw failure did not happen (exit $RC)"
+        return 1
+    fi
+    if [ "$(journal_get stage)" != verified ]; then
+        bad "the arranged thaw left stage '$(journal_get stage)', expected verified"
+        return 1
+    fi
+    stub_opt start-fail-unit
+    return 0
+}
+
+step "B1: a late resume re-measures the installed CLI"
+new_case late-resume-old-cli
+thaw_then_break || true
+write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_OLD"
+mark_calls late-cli
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success over an old CLI"; fi
+expect_log "cli version '$CLI_VERSION_OLD'" 'names the CLI it actually found'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl start' 'starts no unit on a stale candidate'
+if [ "$(journal_get stage)" = "done" ]; then bad "the journal reached done"; else ok "the journal did not reach done"; fi
+
+step "B1: a late resume notices a frontend that is no longer serving"
+new_case late-resume-frontend-down
+thaw_then_break || true
+printf 'false\n' >"$CUR/state/containers/multica-frontend-1.running"
+printf 'exited\n' >"$CUR/state/containers/multica-frontend-1.status"
+mark_calls late-frontend
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success over a stopped frontend"; fi
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl start' 'starts no unit'
+
+step "B1: a late resume notices the backup is gone"
+new_case late-resume-backup-gone
+thaw_then_break || true
+rm -f "$(journal_get backup_path)"
+mark_calls late-backup
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success without a recovery point"; fi
+expect_log 'the recorded backup .* is missing' 'names the missing recovery point'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl start' 'starts no unit'
+
+step "B1: a late resume notices a staged asset that no longer matches"
+new_case late-resume-staged-script
+thaw_then_break || true
+printf '# tampered after prepare\n' >>"$CUR/state-dir/assets/approved-upgrade-multica.sh"
+mark_calls late-staged
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success over a tampered staged asset"; fi
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl start' 'starts no unit'
+
+step "B1: a late resume notices the migration outcome no longer matches the database"
+new_case late-resume-schema-drift
+thaw_then_break || true
+printf '616_member_pinned\n' >"$CUR/state/ledger"
+mark_calls late-schema
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success over an unmigrated schema"; fi
+expect_log 'MISMATCH: ledger' 'names the schema it actually read'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl start' 'starts no unit'
+
+step "B1: a healthy late resume still completes"
+new_case late-resume-healthy
+thaw_then_break || true
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+expect_log 'maintenance complete' 'accepts a genuinely complete resume'
+expect_unit multica-daemon active
+
+step "B1: a thaw that is resumed after a partial unit restore does not start twice"
+# The units were restored in a previous attempt except the daemon. Resuming must
+# start only what is missing, and must not treat the already-active timers as an
+# unauthorised success or start them again.
+new_case thaw-partial-units
+prepare_ok
+stub_opt start-fail-unit multica-daemon
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 70
+stub_opt start-fail-unit
+# The two timers were restored before the daemon failed; they are active now.
+expect_unit multica-upgrade.timer active
+expect_unit multica-attachment-gc.timer active
+expect_unit multica-daemon inactive
+mark_calls thaw-partial
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+expect_unit multica-daemon active
+expect_no_call_since_mark 'systemctl start multica-upgrade.timer' 'does not restart a unit already restored'
+expect_no_call_since_mark 'systemctl start multica-attachment-gc.timer' 'does not restart a unit already restored'
+if calls_since_mark | grep -q 'systemctl start multica-daemon'; then
+    ok "starts only the unit that was still down"
+else
+    bad "never started the daemon that was still down: $(calls_since_mark | tr '\n' '|')"
+fi
+
+step "B2: a migration that exits 0 into the wrong schema is latched"
+new_case migrate-shape-latch
+prepare_ok
+# The command reports success; the schema is not the .2 schema.
+stub_opt ledger-after 650_partial
+stub_opt rows-after 670
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 40
+expect_log 'the command reported success but the schema gate rejected it' 'says the exit status was not the gate'
+expect_log 'MISMATCH: ledger' 'names what it actually read'
+expect_log 'MIGRATION NOT VERIFIED' 'records the attempt as unverified'
+if [ "$(journal_get migration_outcome)" != verified ]; then
+    ok "no verified outcome was recorded"
+else
+    bad "a non-.2 schema was recorded as verified"
+fi
+expect_no_call 'compose .* up' 'never starts the application'
+if [ "$(dump_count)" = 1 ]; then ok "exactly one backup exists"; else bad "$(dump_count) dumps exist"; fi
+
+new_case migrate-shape-latch-retry
+prepare_ok
+stub_opt tables-after 131
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 40
+stub_opt tables-after
+mark_calls shape-retry
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the re-run refused (exit $RC)"; else bad "the re-run performed the migration again"; fi
+expect_no_call_since_mark 'docker run' 'the migration was not called a second time'
+expect_no_call_since_mark 'compose .* up' 'the application was not started'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_journal stage backup
+
+step "B2: a migration interrupted while running is latched"
+new_case migrate-interrupted
+prepare_ok
+# The command changes the schema and then dies. Nothing after it runs, so the
+# journal holds an attempt with no outcome — exactly the state a re-run must not
+# treat as "the migration never happened".
+stub_opt migrate-killed 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 40
+expect_log 'MIGRATION NOT VERIFIED' 'records the attempt as unverified'
+stub_opt migrate-killed
+mark_calls interrupted-retry
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the re-run refused (exit $RC)"; else bad "the re-run continued after an interrupted migration"; fi
+expect_no_call_since_mark 'docker run' 'the migration was not called again'
+expect_no_call_since_mark 'compose .* up' 'the application was not started'
+
+step "B2: a migration whose outcome cannot be recorded is latched"
+new_case migrate-ledger-write-fails
+prepare_ok
+# The journal breaks while the migration is running: the command succeeded, but
+# the verified outcome cannot be written. The attempt is on disk and the outcome
+# is not, which is the latch.
+stub_opt break-migration-journal 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the run failed (exit $RC)"; else bad "the run reported success without a recorded outcome"; fi
+expect_no_log 'maintenance complete' 'never claims completion'
+
+step "B2: the attempt is on disk before the command runs"
+new_case migrate-attempt-order
+prepare_ok
+# The latch has to reach disk *before* the process starts. A journal written
+# afterwards leaves the window this card exists to close, so the case makes the
+# command itself read the journal from inside the stub: what it sees is what was
+# on disk at the instant the migration ran.
+stub_opt migrate-observe-journal "$CUR/state-dir/journal"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+observed="$(cat "$CUR/state/migrate-journal-at-start" 2>/dev/null)"
+case $observed in
+    *migration_attempt=pending*) ok "the attempt was recorded before the command ran" ;;
+    *) bad "the journal did not hold the attempt when the command ran: $(printf '%s' "$observed" | tr '\n' '|' | cut -c1-200)" ;;
+esac
+expect_journal migration_attempt "done"
+expect_journal migration_outcome verified
+expect_log 'migrate exit=0' 'the command actually ran'
+if [ "$(journal_get stage)" = "done" ]; then ok "the journal reached done"; else bad "stage is $(journal_get stage)"; fi
+
+step "B2: an intact success path records every migration fact"
+new_case migrate-facts
+prepare_ok
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal migration_attempt "done"
+expect_journal migration_outcome verified
+expect_journal migrate_rc 0
+expect_journal ledger_after 660_attachment_upload_session_workspace
+expect_journal migration_ledger_rows 684
+expect_journal migration_tables 148
+expect_journal migration_indexes 799/0/0
+expect_no_journal migration_failed
+
+step "B3: a failed dump keeps exactly the frozen stage and can be retried"
+new_case dump-retry
+prepare_ok
+stub_opt dump-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 30
+# The old requirement set made this stage unresumable: it demanded a backup the
+# step had just failed to take, so the operator's only way forward was editing
+# the journal.
+expect_journal stage frozen
+expect_no_journal backup_path
+if [ "$(dump_count)" = 0 ]; then ok "no partial dump was recorded"; else bad "a partial dump was left"; fi
+echo
+stub_opt dump-rc
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+if [ "$(dump_count)" = 1 ]; then ok "exactly one successful dump exists"; else bad "$(dump_count) dumps exist"; fi
+expect_log 'backup ok' 'took the backup after the cause was corrected'
+
+step "B3: retrying the dump never overwrites an earlier recorded backup"
+new_case dump-retry-keeps-first
+prepare_ok
+stub_opt dump-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 30
+stub_opt dump-rc
+# A stray file with the second attempt's name must not be overwritten: an
+# earlier attempt's bytes are evidence, not scratch space.
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+recorded="$(journal_get backup_path)"
+expect_sha "$recorded" "$(journal_get backup_sha256)"
+if [ "$(dump_count)" = 1 ]; then ok "one dump exists"; else bad "$(dump_count) dumps exist"; fi
+
+step "B3: a recorded backup is never replaced by a second one"
+new_case backup-not-replaced
+prepare_ok
+stub_opt compose-rc 1
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 50
+first_path="$(journal_get backup_path)"
+first_sha="$(journal_get backup_sha256)"
+stub_opt compose-rc
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal backup_path "$first_path"
+expect_journal backup_sha256 "$first_sha"
+if [ "$(dump_count)" = 1 ]; then ok "the first backup is still the only one"; else bad "$(dump_count) dumps exist"; fi
+
+step "B: no case has to edit the journal to clear a latch"
+# A latch an operator can clear by hand is not a latch, and a resume that needs a
+# hand-edited journal is the defect these cases exist to prevent. Every latch in
+# the suite must be cleared by its own cause, through the executor's CLI. The
+# pattern matches a key *assignment* so this check does not match itself.
+latch_edits=$(grep -nE 'sed -i .*(migrate_failed|migration_attempt|migration_outcome)=' "$0" || true)
+if [ -n "$latch_edits" ]; then
+    bad "a case clears a migration latch by editing the journal: $latch_edits"
+else
+    ok "no case clears a migration latch by hand"
+fi
+
+step "the documented config example is usable as written"
+# The runbook hands the operator a KEY=VALUE block to copy. If it omits a key the
+# executor requires, following the document produces exit 2 — the document would
+# be the defect, not the operator. Extract the block and feed it to the executor
+# after pointing its paths at the sandbox.
+new_case documented-config
+DOC="$SCRIPT_DIR/../docs/nas-myswy-maintenance.md"
+if [ ! -f "$DOC" ]; then
+    bad "the runbook is missing at $DOC"
+else
+    awk '/^COMPOSE_DIR=/{inside=1} inside && /^[A-Z0-9_]+=/{print} inside && /^```/{exit}' "$DOC" >"$CUR/doc.conf"
+    if [ ! -s "$CUR/doc.conf" ]; then
+        bad "no config example could be extracted from $DOC"
+    else
+        # Point every path and hash at the fixture; the example's *keys* are what
+        # is under test, not its production values.
+        sed -i \
+            -e "s|^COMPOSE_DIR=.*|COMPOSE_DIR=$CUR/compose|" \
+            -e "s|^COMPOSE_FILE=.*|COMPOSE_FILE=$CUR/compose/docker-compose.yml|" \
+            -e "s|^COMPOSE_FILE_NEW=.*|COMPOSE_FILE_NEW=$CUR/compose/docker-compose.approved.yml|" \
+            -e "s|^CLI_BIN=.*|CLI_BIN=$CUR/cli-bin/multica|" \
+            -e "s|^UPGRADE_SCRIPT=.*|UPGRADE_SCRIPT=$CUR/scripts/upgrade-multica.sh|" \
+            -e "s|^CLI_ARCHIVE=.*|CLI_ARCHIVE=$CUR/multica-cli.tar.gz|" \
+            -e "s|^APPROVED_UPGRADE_SCRIPT=.*|APPROVED_UPGRADE_SCRIPT=$CUR/approved-upgrade-multica.sh|" \
+            -e "s|^STATE_DIR=.*|STATE_DIR=$CUR/state-dir|" \
+            -e "s|^LOG=.*|LOG=$CUR/maintenance.log|" \
+            -e "s|^BACKUP_DIR=.*|BACKUP_DIR=$CUR/backup|" \
+            -e "s|^CLI_ARCHIVE_SHA256=.*|CLI_ARCHIVE_SHA256=$CLI_ARCHIVE_SHA|" \
+            -e "s|^APPROVED_UPGRADE_SHA256=.*|APPROVED_UPGRADE_SHA256=$APPROVED_SHA|" \
+            "$CUR/doc.conf"
+        run_script prepare --config "$CUR/doc.conf"
+        expect_rc 0
+        expect_log 'prepare ok' 'the documented example drives a real prepare'
+        for k in FRONTEND_URL BACKEND_URL DOCKER_NETWORK STATE_DIR; do
+            if grep -qE "^$k=" "$CUR/doc.conf"; then
+                ok "the example names $k"
+            else
+                bad "the documented example omits $k"
+            fi
+        done
+    fi
+fi
+
+step "the documented recovery table names every resumable stage"
+DOC="$SCRIPT_DIR/../docs/nas-myswy-maintenance.md"
+if [ ! -f "$DOC" ]; then
+    bad "the runbook is missing"
+else
+    for stage in prepared frozen backup migrated switched cli verified "done"; do
+        if grep -qE "^\| \`$stage\`" "$DOC"; then
+            ok "the runbook says what \`$stage\` allows"
+        else
+            bad "the runbook's recovery table does not cover \`$stage\`"
+        fi
+    done
+fi
+
+step "B4: drift injected at every stage boundary cannot produce a false success"
+# The general form of the three findings: for each stage a re-run can start from,
+# break one thing the remaining steps depend on and assert the run does not
+# report success. The damage is applied to the *live* system and to the staged
+# assets — exactly what an operator, a timer, a crash or another process can do
+# between two runs — never to the journal.
+#
+# Each entry is "<stage>|<damage key>|<human label>". The key selects the
+# mutation in break_thing; the label only appears in the case header.
+#
+# Only drift the remaining steps cannot legitimately repair belongs here. A live
+# CLI broken before `cli` runs is *repaired* by the install, and a watcher that
+# came back before `freeze` is *stopped* by the freeze — both are the tool doing
+# its job, not a false success. Those are asserted separately below.
+drift_matrix() {
+    cat <<'ENTRIES'
+prepared|staged-cli|the staged CLI
+prepared|staged-script|the approved upgrade script
+frozen|writer|a writer that came back
+frozen|staged-script|the approved upgrade script
+backup|backup|the recorded backup
+backup|staged-cli|the staged CLI
+migrated|schema|the database schema
+migrated|writer|a writer that came back
+switched|frontend|the frontend process
+switched|backend-image|the backend container image
+switched|staged-script|the staged upgrade script
+cli|cli|the installed CLI
+cli|script|the installed upgrade script
+cli|frontend|the frontend process
+cli|schema|the database schema
+verified|cli|the installed CLI
+verified|backup|the recorded backup
+verified|staged-cli|the staged CLI
+verified|frontend|the frontend process
+ENTRIES
+}
+
+# reach_stage <stage> — drive a real run to the named stage and leave it there.
+reach_stage() {
+    case $1 in
+        prepared) prepare_ok || return 1; return 0 ;;
+        frozen)
+            prepare_ok || return 1
+            stub_opt dump-rc 1
+            run_script run --intent=switch --config "$CUR_CONFIG"
+            stub_opt dump-rc
+            ;;
+        backup)
+            prepare_ok || return 1
+            stub_opt migrate-rc 1
+            run_script run --intent=switch --config "$CUR_CONFIG"
+            stub_opt migrate-rc
+            ;;
+        migrated)
+            prepare_ok || return 1
+            stub_opt compose-rc 1
+            run_script run --intent=switch --config "$CUR_CONFIG"
+            stub_opt compose-rc
+            ;;
+        switched)
+            # Reach `migrated`, then let only the cli step fail: an unexecutable
+            # staged CLI makes `cli` fail without changing the world.
+            prepare_ok || return 1
+            if [ -f "$CUR/state-dir/assets/cli/unpack/multica" ]; then
+                chmod 644 "$CUR/state-dir/assets/cli/unpack/multica"
+            fi
+            run_script run --intent=switch --config "$CUR_CONFIG"
+            chmod 755 "$CUR/state-dir/assets/cli/unpack/multica" 2>/dev/null
+            ;;
+        cli)
+            prepare_ok || return 1
+            world_post_switch
+            stub_opt frontend-never 1
+            run_script run --intent=switch --config "$CUR_CONFIG"
+            stub_opt frontend-never
+            ;;
+        verified) thaw_then_break ;;
+    esac
+    if [ "$(journal_get stage)" != "$1" ]; then
+        bad "could not reach stage '$1' (it is '$(journal_get stage)')"
+        return 1
+    fi
+    return 0
+}
+
+# break_thing <what> — the drift, applied after the stage was reached.
+break_thing() {
+    case $1 in
+        cli) write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_OLD" ;;
+        staged-cli) printf '#!/bin/sh\nprintf "multica 0.9.0-myswy.2\\n"\n' >"$CUR/state-dir/assets/cli/unpack/multica"; chmod 755 "$CUR/state-dir/assets/cli/unpack/multica" ;;
+        staged-script) printf '# changed\n' >>"$CUR/state-dir/assets/approved-upgrade-multica.sh" ;;
+        script) printf '# changed\n' >>"$CUR/scripts/upgrade-multica.sh" ;;
+        backup) rm -f "$(journal_get backup_path)" ;;
+        schema) printf '616_member_pinned\n' >"$CUR/state/ledger" ;;
+        writer) set_unit multica-attachment-gc.service active ;;
+        frontend) printf 'false\n' >"$CUR/state/containers/multica-frontend-1.running"
+                  printf 'exited\n' >"$CUR/state/containers/multica-frontend-1.status" ;;
+        backend-image) set_container multica-backend-1 "$BACKEND_IMAGE_OLD" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+while IFS='|' read -r stage damage what; do
+    [ -n "$stage" ] || continue
+    case $stage in \#*) continue ;; esac
+    step "B4: $stage + drift in $what must not report success"
+    new_case "drift-$stage-$damage"
+    if reach_stage "$stage"; then
+        break_thing "$damage" || { bad "unknown drift key '$damage'"; continue; }
+        mark_calls "drift-$stage-$damage"
+        run_script run --intent=switch --config "$CUR_CONFIG"
+        case "$stage" in
+            prepared|frozen|backup|migrated)
+                # Up to the application start the drift must either re-freeze the
+                # world or refuse; what it must never do is continue past it.
+                if [ "$RC" -eq 0 ]; then
+                    bad "[$stage/$what] the run reported success after the drift"
+                else
+                    ok "the run refused or stopped (exit $RC)"
+                fi
+                expect_no_log 'maintenance complete' '[no completion claimed]'
+                ;;
+            *)
+                if [ "$RC" -eq 0 ]; then
+                    # A successful continue is only acceptable if the drift was
+                    # actually repaired by the step, which none of these can be.
+                    bad "[$stage/$what] the run reported success over a drifted $what"
+                else
+                    ok "the run refused (exit $RC)"
+                fi
+                expect_no_log 'maintenance complete' '[no completion claimed]'
+                if [ "$(journal_get stage)" = "done" ]; then
+                    bad "[$stage/$what] the journal reached done"
+                else
+                    ok "the journal did not reach done"
+                fi
+                ;;
+        esac
+        # Whatever it decided, it must not have written a success over the drift.
+        if [ "$(journal_get stage)" = "done" ] && [ "$RC" -ne 0 ]; then
+            bad "[$stage/$what] the journal reached done but the run failed"
+        fi
+    fi
+done < <(drift_matrix)
+
+step "B4: drift the remaining steps can legitimately repair is repaired, not faked"
+# The counterpart of the matrix, in the other direction: a broken live CLI before
+# `cli` and a watcher that came back before `freeze` are exactly what those steps
+# exist to fix. Each case asserts the step really did the work — a new installed
+# binary with the recorded hash, a re-stopped unit — rather than that the run
+# merely returned zero.
+new_case drift-repaired-by-steps
+prepare_ok
+write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_OLD"
+set_unit multica-attachment-gc.service active
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_log 'maintenance complete' 'the run completes'
+expect_sha "$CUR/cli-bin/multica" "$(journal_get cli_binary_sha256)"
+expect_unit multica-attachment-gc.service inactive
+expect_unit multica-daemon active
+
+step "B4: a repaired drift resumes to a real success"
+# The counterpart of the matrix: after the operator fixes the cause, the run must
+# complete. Otherwise every drift case above could pass by refusing forever.
+new_case drift-repaired
+if reach_stage verified; then
+    write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_OLD"
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    if [ "$RC" -eq 0 ]; then bad "the drifted run succeeded"; else ok "the drifted run refused (exit $RC)"; fi
+    # Put the installed CLI back the way `cli` left it and resume.
+    write_cli "$CUR/cli-bin/multica" "$CLI_VERSION_NEW"
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 0
+    expect_journal stage "done"
+    expect_log 'maintenance complete' 'completes once the drift is repaired'
 fi
 
 # ---------------------------------------------------------------------------

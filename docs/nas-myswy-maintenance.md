@@ -122,6 +122,7 @@ DAEMON_UNIT=multica-daemon
 UPGRADE_TIMER=multica-upgrade.timer
 GC_TIMER=multica-attachment-gc.timer
 BACKEND_URL=http://127.0.0.1:8080/health
+FRONTEND_URL=http://127.0.0.1:3000/
 CLI_BIN=/usr/local/bin/multica
 UPGRADE_SCRIPT=/home/myswy/scripts/upgrade-multica.sh
 CLI_ARCHIVE=/home/myswy/incoming/multica-cli-0.9.0-myswy.2-linux-amd64.tar.gz
@@ -213,19 +214,72 @@ steps in one process:
 
 A failure records the step in the journal and prints the real state. Re-running
 `run --intent=switch` resumes at that step; it does not repeat completed steps,
-and it never re-takes the backup or replaces the initial snapshot.
+and it never re-takes the backup the journal already recorded or replaces the
+initial snapshot.
 
-The stage is a position, not evidence, so every resume re-proves the facts the
-remaining steps depend on:
+### Stages, and what each one is allowed to do
 
-- past the freeze and before the application is started, all five writers must
-  still be down — the API or a oneshot timer service can come back between runs;
-- past the backup, the recorded dump must exist and still match its SHA-256;
-- a **failed migration is a latch**: `migrate_failed` is recorded, and a re-run
-  refuses with exit `80` instead of treating the same command as permission to
-  continue over a possibly half-migrated database. Inspecting the real schema and
-  choosing the next step is the operator's decision, not the tool's;
-- the staged CLI and approved upgrade script must still hash as recorded.
+A stage is a position, not evidence. Each stage carries only the facts it has
+actually finished, and a resume re-measures the world before it acts:
+
+| stage | a re-run may | journal must already hold |
+| --- | --- | --- |
+| `prepared` | `freeze` | the snapshot and the staged release inputs |
+| `frozen` | retry `backup` | + `freeze_at`; writers are down, no dump yet |
+| `backup` | `migrate` | + the recorded, verified dump |
+| `migrated` | `switch` | + `migration_attempt` with `migration_outcome=verified` and the schema counters that gate saw |
+| `switched` | `cli` | + the revision the candidate reported |
+| `cli` | `verify` | + the hashes of both installed artifacts |
+| `verified` | `thaw` | same as `cli` — `verify` adds no fact of its own |
+| `done` | nothing | terminal |
+
+`frozen` is deliberately **not** required to carry a backup. A failed or
+interrupted `pg_dump` leaves exactly that stage, and the operator's remedy is to
+fix the cause and take the backup — not to abandon the window or edit the journal.
+A retried dump never overwrites the bytes an earlier attempt left behind, and a
+backup the journal already recorded is reused rather than replaced.
+
+### The migration latch
+
+`migration_attempt=pending` is written **before** `docker run` starts, and
+`migration_outcome=verified` only after the command returned 0 **and** the
+schema gate (ledger, ledger rows, table count, index validity) matched **and**
+the outcome reached disk. Anything else is a latch:
+
+- the command exits non-zero;
+- the command exits 0 into a schema the gate rejects;
+- the process is interrupted while running, or after it returns but before the
+  outcome is recorded;
+- the outcome cannot be written (the journal is unwritable or replaced).
+
+In every one of those states a re-run refuses (exit `80`) before it reaches the
+step again. Nothing in the tool retries the migration automatically, and nothing
+clears the latch except an operator deciding what the real schema is. Inspecting
+it and choosing the next step is not a command.
+
+### Resuming at or after `switched`
+
+From `cli` onward the new application is up on purpose, so "the writers are
+down" is no longer an invariant. Instead every resume re-measures:
+
+- both containers run the exact `.2` digests and the frontend answers HTTP;
+- the database is the complete 660 schema;
+- the installed CLI is the staged binary byte for byte and reports
+  `0.9.0-myswy.2`;
+- the upgrade script is the approved input, and its unit still executes it;
+- the staged CLI and approved script still hash as recorded;
+- the recorded backup still exists and matches its SHA-256.
+
+`thaw` runs that whole acceptance **again before starting any unit**, and once
+more after the units are back, before it writes `done`. The `verified` stage is
+`thaw`'s input, never its authorisation: a CLI swapped back, a frontend stopped
+or a backup deleted between `verify` and `thaw` is caught before anything is
+released. A thaw that was interrupted mid-restore is safe to resume — units
+already in their recorded state are left alone, so nothing is started twice, and
+a partly restored set is not mistaken for an unauthorised success.
+
+`thaw` is also the step that records `thaw_started`, so a half-finished restore
+is visible as its own state rather than as unexplained drift.
 
 The journal is validated per stage before anything runs: required keys, legal
 unit-state values, a `config_sha256` binding, and no duplicate keys. A truncated
@@ -302,18 +356,43 @@ switch the connection. Creating that database, restoring into it, and switching
 `DATABASE_URL` need their own reviewed operation card with their own stop
 conditions — they are not automated here.
 
+## When a run stops: what to do at each stage
+
+`status` prints the stage, the journal and the live state, and takes no lock.
+Read it before doing anything else. The table below is the whole recovery
+surface — nothing here requires editing the journal.
+
+| where it stopped | what the tool will do on a re-run | what the operator does |
+| --- | --- | --- |
+| `prepared`, freeze failed | retries the freeze | fix the unit or container that would not stop, re-run |
+| `frozen`, dump failed | retries only the backup | fix `pg_dump`/disk space/`BACKUP_DIR`, re-run. The writers stay down; nothing was migrated |
+| `backup`, migrate failed or was interrupted | **refuses** (exit `80`) | read the schema the gate recorded, decide with the operator. `rollback-r1` restores the old images only |
+| `migrated`, switch failed | retries from `switch` | fix compose/health/registry, re-run |
+| `switched`, cli failed | retries from `cli` | fix the unit entry point or file permissions, re-run |
+| `cli`, verify failed | retries `verify`, then `thaw` | fix what the mismatch names; the acceptance is re-measured, so a stale `verified` cannot carry it |
+| `verified`, thaw failed | re-accepts, then restores only the units still out of place | make the unit startable, re-run. Units already back are left alone |
+| `done` | refuses | nothing; the window is closed |
+
+Two rules hold throughout: no step ever re-runs the migration after an
+unverified attempt, and no step writes `done` without a fresh acceptance read
+from the live system. If the answer is not written in the table, the tool does
+not have one — stop and escalate to the operator rather than editing
+`$STATE_DIR`.
+
 ## Scope status: this is not a releasable executor yet
 
 Two work items were separated out of one oversized card after two acceptance
-rounds. This revision covers only the first:
+rounds. Both have now landed as code:
 
-- **A (this change)**: real image identity and rollback references, Compose
+- **A (merged)**: real image identity and rollback references, Compose
   resolution, and the `prepare` transaction.
-- **B (not done)**: the resume/migration state machine — late-stage resume
+- **B (this change)**: the resume/migration state machine — late-stage resume
   revalidation, a migration latch that covers shape failures and interruption,
-  and per-stage journal field requirements. Tracked separately; until it lands,
-  the executor must not be installed or run against production, and an
-  acceptance of A means only that this code range is complete.
+  and per-stage journal field requirements.
+
+Neither acceptance makes this executor installable. Both suites are offline
+fixtures; the NAS checks in the next section are still outstanding, and the
+production operation has its own card.
 
 ## What must still be tested on the NAS
 
