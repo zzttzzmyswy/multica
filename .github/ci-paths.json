@@ -138,7 +138,11 @@
     "docker-compose.selfhost.digest.yml",
     "deploy/helm/multica/Chart.yaml",
     "scripts/myswy-release-guard-stub.py",
-    "scripts/myswy-release-workflow.test.mjs"
+    "scripts/myswy-release-workflow.test.mjs",
+    "scripts/nas-maintenance.sh",
+    "scripts/nas-maintenance.test.sh",
+    "scripts/testdata/nas-maintenance/**",
+    "docs/nas-myswy-maintenance.md"
   ],
   "installer": [
     "scripts/install.sh",

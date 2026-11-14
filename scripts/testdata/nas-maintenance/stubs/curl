@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Stub `curl` for scripts/nas-maintenance.test.sh.
+#
+# Only the backend `/health` probe is answered, and the answer is derived from
+# the image the fake backend container is running — the same way a real backend
+# reports the revision it was built from. A wrong digest therefore cannot also
+# report the expected commit, and a container that is not running has no health
+# answer at all. $TB/state/opt can force either behaviour off.
+set -u
+
+S=${TB:?TB must point at the case directory}/state
+mkdir -p "$S/opt"
+printf 'curl %s\n' "$*" >>"$S/calls.log"
+
+# opt <name>: prints the recorded value, or nothing. Fails when unset.
+opt() {
+    [ -f "$S/opt/$1" ] || return 1
+    cat "$S/opt/$1"
+}
+
+case $* in
+    *"/health"*) ;;
+    *) exit 22 ;;
+esac
+
+[ -f "$S/opt/health-never" ] && exit 22
+
+running=$(cat "$S/containers/multica-backend-1.running" 2>/dev/null || printf 'false')
+[ "$running" = "true" ] || exit 22
+
+if [ -f "$S/opt/health-commit" ]; then
+    commit=$(opt health-commit)
+else
+    image=$(cat "$S/containers/multica-backend-1.image" 2>/dev/null)
+    case $image in
+        *@sha256:01e09bc9d800260b89834c6a0a00433a456daa5f8ec06211a1515da103817702)
+            commit=8098fd32808c57d8e3b6bd8f7408e6e47b81e7ab
+            ;;
+        *@sha256:864a97102959895b174f4fb1e2798bc38c896ea9ff33497564ec11eac5728374)
+            commit=b1ea927def6490c43bedff537b6f4ed9a47fa828
+            ;;
+        *)
+            # An unknown build cannot report a revision.
+            commit=""
+            ;;
+    esac
+fi
+
+if [ -z "$commit" ]; then
+    printf '{"status":"ok","pid":4242}\n'
+    exit 0
+fi
+printf '{"status":"ok","pid":4242,"commit":"%s","started_at":"2026-01-01T00:00:00Z"}\n' "$commit"
