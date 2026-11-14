@@ -526,6 +526,9 @@ higher = [
     ("v97.0.0-myswy.", "multica-cli-97.0.0-myswy.-linux-amd64.tar.gz", False),
     ("v96.0.0-myswy.x", "multica-cli-96.0.0-myswy.x-linux-amd64.tar.gz", False),
     ("v95.0.0-myswy.-1", "multica-cli-95.0.0-myswy.-1-linux-amd64.tar.gz", False),
+    # Matching assets cannot make overflowing or non-ASCII components valid.
+    ("v9223372036854775808.0.0-myswy.1", "multica-cli-9223372036854775808.0.0-myswy.1-linux-amd64.tar.gz", False),
+    ("v９９.0.0-myswy.1", "multica-cli-９９.0.0-myswy.1-linux-amd64.tar.gz", False),
     # A draft with a perfectly good archive.
     ("v94.0.0-myswy.1", "multica-cli-94.0.0-myswy.1-linux-amd64.tar.gz", True),
 ]
@@ -553,7 +556,7 @@ if "$TMP/install-bin/multica" version 2>/dev/null | grep -q "0.9.0-myswy.2"; the
 else
   bad "selected an entry it should have skipped: $("$TMP/install-bin/multica" version 2>/dev/null || echo missing)"
 fi
-malformed_downloads="$(grep -E 'myswy\.1-extra|myswy\.1\.2|myswy\.-|myswy\.x|9[3-9]\.0\.0' "$TMP/curl.log" || true)"
+malformed_downloads="$(grep -E 'myswy\.1-extra|myswy\.1\.2|myswy\.-|myswy\.x|9[3-9]\.0\.0|9223372036854775808|９９' "$TMP/curl.log" || true)"
 if [ -z "$malformed_downloads" ]; then
   ok "never downloaded an archive from a skipped release"
 else

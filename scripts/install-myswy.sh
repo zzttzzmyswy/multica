@@ -144,22 +144,23 @@ releases = data if isinstance(data, list) else [data]
 # comparison below and then be installed, which is how v99.0.0-myswy.1-extra
 # used to beat every real release.
 def tag_pattern(suffix):
-    return re.compile(r"^v(\d+)\.(\d+)\.(\d+)%s(\d+)$" % re.escape(suffix))
+    return re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)%s([0-9]+)" % re.escape(suffix))
 
 def tag_version(tag, pattern):
     """(major, minor, patch, build) as ints, or None for a tag that is not a
-    release of this distribution.
-
-    Python integers do not overflow, so a build number too large for the CLI
-    still parses and orders correctly here; it is the asset lookup and the
-    download that reject it, not the shape check.
-    """
+    release of this distribution within the integer range accepted by the CLI."""
     if not isinstance(tag, str):
         return None
-    match = pattern.match(tag)
+    match = pattern.fullmatch(tag)
     if not match:
         return None
-    return tuple(int(group) for group in match.groups())
+    try:
+        parts = tuple(int(group) for group in match.groups())
+    except ValueError:
+        return None
+    if any(part > sys.maxsize for part in parts):
+        return None
+    return parts
 
 if mode == "highest":
     suffix = sys.argv[2]        # e.g. -myswy.
