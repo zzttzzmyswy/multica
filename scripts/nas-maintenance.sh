@@ -43,9 +43,32 @@
 #     deployment names `:latest` while running the validated build.
 #   * A stage in the journal is a position, not evidence. Every resume re-proves
 #     the writers are stopped, the backup is intact and the assets still hash as
-#     recorded, and a failed migration is a latch that needs an operator.
+#     recorded, and a migration attempt is a latch that needs an operator.
 #   * Write commands refuse to run without an explicit config file, so a
 #     forgotten parameter can never fall back to a built-in production path.
+#
+# Stage table. "allowed" is what a re-run may do from that stage; "evidence" is
+# what the journal must already hold before anything runs. A stage requires only
+# what it has actually finished — never a later stage's facts.
+#
+#   stage                     allowed        evidence required
+#   ------------------------- -------------- --------------------------------
+#   (none)                    prepare        -
+#   prepared                  freeze         snapshot + staged release inputs
+#   frozen                    backup (retry) + freeze_at; writers down, no dump
+#   backup                    migrate        + verified dump
+#   migrated                  switch         + migration_attempt with
+#                                            outcome=verified, plus the
+#                                            post-migration schema counters
+#   switched                  cli            + the candidate's reported revision
+#   cli                       verify         + hashes of both installed files
+#   verified                  thaw           same as cli (`verify` adds no new
+#                                            fact, it re-proves existing ones)
+#   done                      -              terminal
+#
+# `thaw` is the only step that starts units again, so it repeats the whole final
+# acceptance rather than trusting `verified`, and it records that it began so a
+# half-restored unit set is recognisable as its own work.
 #
 # Production writes stay behind explicit intent: `run` requires --intent=switch
 # and refuses every other value; bare invocation prints usage and exits 2.
@@ -271,13 +294,92 @@ jset() {
         return 0
     fi
     local tmp="$JOURNAL.tmp.$$"
-    {
+    (
         if [ -f "$JOURNAL" ]; then
-            awk -v k="$k=" 'index($0, k) != 1' "$JOURNAL"
+            awk -v k="$k=" 'index($0, k) != 1' "$JOURNAL" || exit 1
         fi
         printf '%s=%s\n' "$k" "$v"
-    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
+    ) >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
     mv -f "$tmp" "$JOURNAL" 2>/dev/null || { rm -f "$tmp"; log "ERROR: cannot replace journal $JOURNAL"; return 1; }
+    return 0
+}
+
+# jcommit <stage> [KEY=VALUE ...]
+#
+# One journal transition: every fact and the stage itself are written into one
+# temp file and renamed once, so a reader sees either the whole transition or
+# none of it.
+#
+# The alternative — a sequence of `jset` calls followed by `stage_set` — leaves
+# persisted states the tool has no rule for. A run that wrote
+# `migration_outcome=verified` and then failed to commit `stage=migrated` leaves
+# `stage=backup / attempt=done / outcome=verified`, which is indistinguishable
+# from "never migrated" to a reader that keys off the stage, so the next run
+# executed `up` a second time. The same shape applies to a backup whose path and
+# hash landed while its byte and TOC counts did not: the stage said the recovery
+# point existed.
+#
+# A transition that carries evidence uses this; nothing may advance a stage and
+# then describe it in a later write.
+jcommit() {
+    local stage=$1
+    shift
+    case $stage in
+        ''|*[!A-Za-z0-9_.-]*) log "ERROR: invalid journal stage '$stage'"; return 1 ;;
+    esac
+    if [ -e "$JOURNAL" ] && [ ! -f "$JOURNAL" ]; then
+        log "ERROR: $JOURNAL exists but is not a regular file"
+        return 1
+    fi
+    local pair k v drop
+    # Reject a malformed fact before anything is written: a half-validated
+    # transition must not reach the journal at all.
+    for pair in "$@"; do
+        case $pair in
+            *=*) ;;
+            *) log "ERROR: jcommit fact '$pair' is not KEY=VALUE"; return 1 ;;
+        esac
+        k=${pair%%=*}
+        v=${pair#*=}
+        case $k in
+            stage|stage_at)
+                log "ERROR: jcommit sets '$k' itself; do not pass it"
+                return 1
+                ;;
+            ''|*[!A-Za-z0-9_.-]*) log "ERROR: invalid journal key '$k'"; return 1 ;;
+        esac
+        case $v in
+            *$'\n'*) log "ERROR: journal value for '$k' contains a newline"; return 1 ;;
+        esac
+    done
+
+    # Every key this transition owns is dropped from the old content, so the new
+    # value is the only one present.
+    drop=" stage stage_at "
+    for pair in "$@"; do
+        drop="$drop${pair%%=*} "
+    done
+
+    local tmp="$JOURNAL.tmp.$$"
+    (
+        if [ -f "$JOURNAL" ]; then
+            awk -v drop="$drop" '
+                { key = $0; sub(/=.*/, "", key) }
+                index(drop, " " key " ") == 0 { print }
+            ' "$JOURNAL" || exit 1
+        fi
+        for pair in "$@"; do
+            printf '%s\n' "$pair" || exit 1
+        done
+        printf 'stage=%s\n' "$stage" || exit 1
+        printf 'stage_at=%s\n' "$(date '+%F %T')"
+    ) >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
+    if ! mv -f "$tmp" "$JOURNAL" 2>/dev/null; then
+        rm -f "$tmp"
+        log "ERROR: cannot commit stage '$stage' to $JOURNAL; nothing was recorded"
+        return 1
+    fi
+    log "stage -> $stage"
     return 0
 }
 
@@ -321,43 +423,62 @@ journal_guard() {
 
 # Required journal keys per stage. A stage is only meaningful when every fact the
 # later steps rely on is present: without them a truncated or hand-edited journal
-# would let `run` resume with an empty snapshot and declare success. The list is
-# cumulative — each stage includes what all earlier stages wrote.
+# would let `run` resume with an empty snapshot and declare success.
+#
+# The list is cumulative, and it grows only with what the stage has actually
+# finished — never with what a later stage will produce:
+#
+#   prepared         the snapshot and the staged inputs; nothing has been stopped
+#   frozen           + freeze_at; the writers are down, but the dump may not
+#                    exist yet (a failed or interrupted pg_dump leaves exactly
+#                    this stage, and an operator must be able to retry the dump
+#                    from here)
+#   backup           + the recorded, verified dump: the recovery point
+#   migrated         + migration_attempt with outcome=verified, and the
+#                    post-migration schema counters the gate accepted
+#   switched         + the revision the candidate reported
+#   cli/verified/done + the hashes of the two installed artifacts (`verify` adds
+#                    no fact of its own, it re-proves the existing ones)
 journal_required_keys() {
     local stage=$1
+    # Every stage keeps the prepare snapshot and the staged release inputs.
+    printf '%s\n' stage config_sha256 intent stage_at initial_prepared_at
+    printf '%s\n' initial_compose_sha256 initial_cli_sha256 initial_upgrade_script_sha256
+    printf '%s\n' initial_backend_digest initial_web_digest
+    printf '%s\n' initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state
+    printf '%s\n' initial_upgrade_service_state initial_gc_service_state
+    printf '%s\n' initial_ledger_max initial_ledger_rows initial_tables initial_indexes
+    printf '%s\n' initial_backend_image_id initial_web_image_id
+    printf '%s\n' cli_binary_sha256 cli_archive_sha256 cli_version_new approved_upgrade_sha256
     case $stage in
-        prepared)
-            printf '%s\n' stage config_sha256 intent stage_at initial_prepared_at
-            printf '%s\n' initial_compose_sha256 initial_cli_sha256 initial_upgrade_script_sha256
-            printf '%s\n' initial_backend_digest initial_web_digest
-            printf '%s\n' initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state
-            printf '%s\n' initial_upgrade_service_state initial_gc_service_state
-            printf '%s\n' initial_ledger_max initial_ledger_rows initial_tables initial_indexes
-            printf '%s\n' initial_backend_image_id initial_web_image_id
-            printf '%s\n' cli_binary_sha256 cli_archive_sha256 cli_version_new approved_upgrade_sha256
-            ;;
-        frozen|backup|migrated|switched|cli|verified|done|*)
-            printf '%s\n' stage config_sha256 intent stage_at initial_prepared_at
-            printf '%s\n' initial_compose_sha256 initial_cli_sha256 initial_upgrade_script_sha256
-            printf '%s\n' initial_backend_digest initial_web_digest
-            printf '%s\n' initial_daemon_state initial_upgrade_timer_state initial_gc_timer_state
-            printf '%s\n' initial_upgrade_service_state initial_gc_service_state
-            printf '%s\n' initial_ledger_max initial_ledger_rows initial_tables initial_indexes
-            printf '%s\n' initial_backend_image_id initial_web_image_id
-            printf '%s\n' cli_binary_sha256 cli_archive_sha256 cli_version_new approved_upgrade_sha256
-            printf '%s\n' freeze_at backup_path backup_sha256 backup_bytes backup_toc_lines
-            ;;
+        prepared) return 0 ;;
     esac
-    # Anything past `backup` also has a finished migration to describe.
+    # Every stage past `prepared` stopped the writers and says when.
+    printf '%s\n' freeze_at
     case $stage in
-        migrated|switched|cli|verified|done)
-            printf '%s\n' migrate_rc ledger_after
-            ;;
+        frozen) return 0 ;;
     esac
+    # From `backup` on there is a recovery point, and it must be described.
+    printf '%s\n' backup_path backup_sha256 backup_bytes backup_toc_lines
     case $stage in
-        switched|cli|verified|done)
-            printf '%s\n' switched_commit
-            ;;
+        backup) return 0 ;;
+    esac
+    # From `migrated` on the migration ran and its outcome is a verified schema,
+    # not a command's exit status. The attempt key is required too: without it
+    # there is no proof the command was ever started under this journal.
+    printf '%s\n' migration_attempt migration_outcome migrate_rc ledger_after
+    printf '%s\n' migration_ledger_rows migration_tables migration_indexes
+    case $stage in
+        migrated) return 0 ;;
+    esac
+    printf '%s\n' switched_commit
+    case $stage in
+        switched) return 0 ;;
+    esac
+    # From `cli` on, what was installed is part of the record.
+    printf '%s\n' cli_installed_sha256 upgrade_script_installed_sha256
+    case $stage in
+        done) printf '%s\n' completed_at ;;
     esac
     return 0
 }
@@ -543,8 +664,9 @@ require_config() {
     fi
     for k in COMPOSE_DIR COMPOSE_FILE COMPOSE_FILE_NEW PROJECT DOCKER_NETWORK \
              PG_CONTAINER PG_USER PG_DATABASE BACKEND_CONTAINER FRONTEND_CONTAINER \
-             DAEMON_UNIT UPGRADE_TIMER GC_TIMER BACKEND_URL CLI_BIN UPGRADE_SCRIPT \
-             CLI_ARCHIVE APPROVED_UPGRADE_SCRIPT STATE_DIR LOG BACKUP_DIR; do
+             DAEMON_UNIT UPGRADE_TIMER GC_TIMER BACKEND_URL FRONTEND_URL CLI_BIN \
+             UPGRADE_SCRIPT CLI_ARCHIVE APPROVED_UPGRADE_SCRIPT STATE_DIR LOG \
+             BACKUP_DIR; do
         eval "v=\${$k:-}"
         [ -n "$v" ] || missing="$missing $k"
     done
@@ -762,16 +884,13 @@ record_failure() {
 # believing it is further along than the journal says, so it is fatal: the
 # caller must treat a non-zero return as its own failure code.
 stage_set() {
-    local stage=$1
-    if ! jset stage "$stage"; then
-        log "ERROR: cannot record stage '$stage' in $JOURNAL; aborting rather than continuing unrecorded"
+    # Stage and its timestamp are one write: two renames could leave a stage with
+    # the previous stage's timestamp, and every reader treats stage_at as when the
+    # stage was reached. A transition that also carries evidence uses `jcommit`.
+    jcommit "$1" || {
+        log "ERROR: cannot record stage '$1' in $JOURNAL; aborting rather than continuing unrecorded"
         return 1
-    fi
-    if ! jset stage_at "$(date '+%F %T')"; then
-        log "ERROR: cannot record stage_at in $JOURNAL; aborting rather than continuing unrecorded"
-        return 1
-    fi
-    log "stage -> $stage"
+    }
     return 0
 }
 
@@ -1136,16 +1255,10 @@ commit_snapshot() {
     return 0
 }
 
-# verify_existing_snapshot: read-only re-check of a completed snapshot.
-#
-# A second `prepare` must never rewrite the pre-change files: the journal keeps
-# the first hashes, so overwriting them would leave R1 restoring nothing. This
-# re-verifies the assets against those recorded hashes and reports whether the
-# live host has since drifted, without touching a byte.
-verify_existing_snapshot() {
+# Immutable recovery files must survive every stage, even after the live files
+# have been upgraded. Keep this separate from the prepared host comparison.
+snapshot_files_ok() {
     local drift=0 k want path got
-    log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
-
     for k in compose_sha256 cli_sha256 upgrade_script_sha256 compose_new_sha256 compose_rollback_sha256; do
         want=$(jget "initial_$k" 2>/dev/null || true)
         case $k in
@@ -1155,7 +1268,7 @@ verify_existing_snapshot() {
             cli_sha256) path=$ASSETS/previous/multica ;;
             upgrade_script_sha256) path=$ASSETS/previous/upgrade-multica.sh ;;
         esac
-        [ -n "$want" ] || continue          # recorded as absent at prepare
+        [ -n "$want" ] || { log "ERROR: snapshot hash initial_$k is missing"; drift=1; continue; }
         if [ ! -f "$path" ]; then
             log "ERROR: snapshot file missing: $path"
             drift=1
@@ -1168,13 +1281,19 @@ verify_existing_snapshot() {
             drift=1
         fi
     done
+    [ "$drift" -eq 0 ] || return $EXIT_PREPARE
+}
+
+snapshot_assets_ok() {
+    local drift=0 k want path
+    snapshot_files_ok || return $?
     for k in cli_binary_sha256 approved_upgrade_sha256; do
         want=$(jget "$k" 2>/dev/null || true)
         case $k in
             cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
             approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
         esac
-        [ -n "$want" ] || continue
+        [ -n "$want" ] || { log "ERROR: staged asset hash $k is missing"; drift=1; continue; }
         if [ ! -f "$path" ]; then
             log "ERROR: staged asset missing: $path"
             drift=1
@@ -1183,6 +1302,14 @@ verify_existing_snapshot() {
         [ "$(sha256_of "$path")" = "$want" ] || { log "ERROR: staged asset $path no longer matches $want"; drift=1; }
     done
     [ "$drift" -eq 0 ] || return $EXIT_PREPARE
+}
+
+# A repeated prepare also requires the live host to match its original snapshot.
+verify_existing_snapshot() {
+    local drift=0
+    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
+        log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
+    snapshot_assets_ok || return $?
 
     # The live host is allowed to keep running, but a change to the things the
     # snapshot describes breaks the equivalence R1 relies on.
@@ -1209,7 +1336,8 @@ verify_existing_snapshot() {
         log "        Restore the live files to the recorded versions, or archive $STATE_DIR and start again."
         return $EXIT_PREPARE
     }
-    log "verify ok: snapshot and live files still match the recorded hashes"
+    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
+        log "verify ok: snapshot and live files still match the recorded hashes"
     return 0
 }
 
@@ -1394,15 +1522,52 @@ step_freeze() {
     return 0
 }
 
+# step_backup: the recovery point.
+#
+# Resumable from `frozen`, because a failed or interrupted pg_dump leaves exactly
+# that stage — the writers are down, no dump exists, and the operator's remedy is
+# to fix the cause and take the backup, not to start the whole switch again. Two
+# rules keep the retry safe:
+#
+#   * a backup that is already recorded and still matches its hash is *the*
+#     recovery point: the step re-confirms the freeze and advances the stage
+#     instead of writing a second dump over a good one;
+#   * a new dump never overwrites an existing file. The name carries the second
+#     it started in, and a collision means a previous attempt's evidence, so the
+#     name is made unique rather than reused.
 step_backup() {
-    local dump stamp rc toc_out toc_rc toc_lines sha size
+    local dump stamp rc toc_out toc_rc toc_lines sha size attempt
     log "== final backup (writes are frozen) =="
-    # Re-confirm the writers are still stopped right before the dump.
+    # Re-confirm the writers are still stopped right before the dump. A resume
+    # from `frozen` must not inherit the earlier run's freeze claim.
     writers_stopped || { log "ERROR: refusing to dump a live database"; return $EXIT_FREEZE; }
+
+    if backup_recorded; then
+        # A previous attempt committed this dump in full; re-commit the same facts
+        # with the stage, so a journal whose stage did not land is repaired
+        # without touching the bytes on disk.
+        log "an earlier attempt already recorded this backup; keeping it and continuing"
+        jcommit backup \
+            "backup_path=$(jget backup_path)" \
+            "backup_sha256=$(jget backup_sha256)" \
+            "backup_bytes=$(jget backup_bytes)" \
+            "backup_toc_lines=$(jget backup_toc_lines)" \
+            "backup_at=$(jget backup_at)" || return $EXIT_FREEZE
+        return 0
+    fi
 
     stamp=$(date '+%Y%m%d-%H%M%S')
     mkdir -p "$BACKUP_DIR" || { log "ERROR: cannot create $BACKUP_DIR"; return $EXIT_FREEZE; }
     dump="$BACKUP_DIR/multica-pre-myswy2-$stamp.dump"
+    attempt=0
+    while [ -e "$dump" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt 99 ]; then
+            log "ERROR: cannot find an unused dump name under $BACKUP_DIR; nothing was written"
+            return $EXIT_FREEZE
+        fi
+        dump="$BACKUP_DIR/multica-pre-myswy2-$stamp-$attempt.dump"
+    done
     bounded "$BACKUP_TIMEOUT" docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DATABASE" -Fc >"$dump"
     rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -1430,14 +1595,23 @@ step_backup() {
         log "ERROR: pg_restore -l returned only ${toc_lines:-0} TOC entries; the dump is not usable"
         return $EXIT_FREEZE
     fi
-    jset backup_path "$dump" --once || return $EXIT_FREEZE
-    jset backup_sha256 "$sha" --once || return $EXIT_FREEZE
-    jset backup_bytes "$size" --once || return $EXIT_FREEZE
-    jset backup_toc_lines "$toc_lines" --once || return $EXIT_FREEZE
-    jset backup_at "$(date '+%F %T')" --once || return $EXIT_FREEZE
+    # Every fact about this one dump, and the stage that says the recovery point
+    # exists, are a single transition. Written separately, a process that died
+    # after `backup_sha256` left `stage=frozen` with a half-described backup, and
+    # the retry then either reused it (a recovery point with no byte or TOC
+    # counts) or generated a second dump and mixed the two.
+    if ! jcommit backup \
+            "backup_path=$dump" \
+            "backup_sha256=$sha" \
+            "backup_bytes=$size" \
+            "backup_toc_lines=$toc_lines" \
+            "backup_at=$(date '+%F %T')"; then
+        log "ERROR: the dump is complete but its description could not be committed;"
+        log "       stage stays frozen and a re-run will take a fresh backup"
+        return $EXIT_FREEZE
+    fi
     log "backup ok: $dump sha256=$sha bytes=$size toc=$toc_lines"
     log "the data-loss window for any future recovery starts now (writes frozen)"
-    stage_set backup || return $EXIT_FREEZE
     return 0
 }
 
@@ -1472,14 +1646,42 @@ schema_shape() {
     return 0
 }
 
+# backup_recorded: a backup is recorded *and* still matches its hash. Silent —
+# for steps that ask the question as part of their own logic rather than as a
+# precondition failure. `backup_usable` is the logging form.
+backup_recorded() {
+    local path want got k
+    path=$(jget backup_path 2>/dev/null || true)
+    want=$(jget backup_sha256 2>/dev/null || true)
+    [ -n "$path" ] && [ -n "$want" ] || return 1
+    # A recovery point is only recorded when it is fully described. Checking the
+    # path and hash alone accepted a half-committed record and then wrote `done`
+    # over a backup with no byte count and no TOC.
+    for k in backup_bytes backup_toc_lines backup_at; do
+        jget "$k" >/dev/null 2>&1 || return 1
+    done
+    [ -f "$path" ] || return 1
+    got=$(sha256_of "$path")
+    [ "$got" = "$want" ]
+}
+
 backup_usable() {
-    local path want got
+    local path want got k
     path=$(jget backup_path 2>/dev/null || true)
     want=$(jget backup_sha256 2>/dev/null || true)
     if [ -z "$path" ] || [ -z "$want" ]; then
         log "ERROR: the journal records no backup; there is no recovery point for this switch"
         return 1
     fi
+    # A backup the journal only half-describes is not a recovery point. Saying so
+    # here keeps a partial record from passing the resume gates that read it.
+    for k in backup_bytes backup_toc_lines backup_at; do
+        if ! jget "$k" >/dev/null 2>&1; then
+            log "ERROR: the recorded backup is incomplete: $k is missing"
+            log "        a partially committed backup record cannot stand as the recovery point"
+            return 1
+        fi
+    done
     if [ ! -f "$path" ]; then
         log "ERROR: the recorded backup $path is missing"
         return 1
@@ -1493,6 +1695,65 @@ backup_usable() {
     return 0
 }
 
+# Migration attempt latch.
+#
+# `migration_attempt` says a migration command **may** have touched this
+# database. It is written before the process starts, because the alternative —
+# record the attempt after the command returns — leaves a window in which the
+# database has been migrated and the journal says nothing, so the next run would
+# treat the same command as a first attempt and run `up` again over an unknown
+# schema. Four ways to arrive at that window are all covered by writing first:
+#
+#   * the process is interrupted (SIGTERM, power loss, a killed supervisor);
+#   * the command exits 0 into a schema the gate rejects;
+#   * the command exits non-zero;
+#   * the outcome cannot be recorded (disk full, journal replaced).
+#
+# Only `migration_outcome=verified` — written after the command returned 0 AND
+# every schema counter matched — lets a later run treat the migration as done.
+# Anything else is a latch: `run` refuses before reaching the step again.
+MIGRATION_ATTEMPT_NONE=none
+MIGRATION_ATTEMPT_PENDING=pending
+MIGRATION_ATTEMPT_DONE="done"
+
+migration_attempt_state() { jget migration_attempt 2>/dev/null || printf '%s' "$MIGRATION_ATTEMPT_NONE"; }
+
+migration_outcome_verified() { [ "$(jget migration_outcome 2>/dev/null || true)" = verified ]; }
+
+# migration_settled: no migration command has been started, or the one that was
+# started committed a complete verified result together with `stage=migrated`.
+#
+# This is the only test a resume may use to decide "may the first migration run
+# now". `stage=backup` alone is not it: an interrupted commit, a journal from an
+# older revision, or a `--once` write that landed without its companions all
+# leave the attempt keys behind while the stage still reads `backup`, and running
+# `up` over that is exactly the double migration this revision forbids.
+# migration_missing_facts: the result keys a settled migration must carry but the
+# journal does not hold. Used only for the operator-facing message.
+migration_missing_facts() {
+    local k
+    for k in migration_attempt migration_outcome migrate_rc ledger_after \
+             migration_ledger_rows migration_tables migration_indexes migration_verified_at; do
+        jget "$k" >/dev/null 2>&1 || printf '%s ' "$k"
+    done
+    printf '\n'
+}
+
+migration_settled() {
+    case $(migration_attempt_state) in
+        "$MIGRATION_ATTEMPT_NONE") return 0 ;;
+    esac
+    migration_outcome_verified || return 1
+    # A verified outcome is only half the proof: every fact the result consists
+    # of must be there, or the commit was partial.
+    local k
+    for k in migration_attempt migration_outcome migrate_rc ledger_after \
+             migration_ledger_rows migration_tables migration_indexes migration_verified_at; do
+        jget "$k" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
 step_migrate() {
     local dburl rc lm lr tc ix
     log "== migrate: /app/migrate up from the exact .2 backend image (no server, no worker) =="
@@ -1503,6 +1764,30 @@ step_migrate() {
     backup_usable || { log "ERROR: migrate was not attempted"; return $EXIT_FREEZE; }
     writers_stopped || { log "ERROR: migrate was not attempted; stop the writers first"; return $EXIT_FREEZE; }
 
+    # A migration command that was started and did not commit a complete result
+    # has no automatic path forward. This is checked against the journal's real
+    # contents, never against the stage alone: an interrupted commit can leave
+    # `stage=backup` while `migration_attempt` is already set, and that state must
+    # not read as "never migrated".
+    if ! migration_settled; then
+        log "REFUSE: an earlier migration attempt here never committed a complete, verified result."
+        migration_latch_report
+        return $EXIT_REFUSED
+    fi
+    if migration_outcome_verified; then
+        log "REFUSE: migration_attempt=$(migration_attempt_state) but stage is '$stage'."
+        log "        A verified migration must be recorded with stage=migrated in one write;"
+        log "        this journal has the facts without the stage, so it was written by an"
+        log "        older or interrupted run. Migrating again over it is not authorised."
+        migration_latch_report
+        return $EXIT_REFUSED
+    fi
+
+    if [ "$(schema_shape)" != pre ]; then
+        log "REFUSE: schema is no longer the verified pre-migration shape; migrate was not attempted."
+        return $EXIT_MIGRATE
+    fi
+
     dburl=$(database_url)
     if [ -z "$dburl" ]; then
         log "ERROR: cannot read DATABASE_URL from $BACKEND_CONTAINER; migrate was not attempted"
@@ -1510,49 +1795,112 @@ step_migrate() {
     fi
     log "using DATABASE_URL from $BACKEND_CONTAINER (host=$(printf '%s' "$dburl" | sed 's#.*@##; s#/.*##'))"
 
+    # The latch reaches disk before the command does. If it cannot be written,
+    # the command is not started: an unrecorded attempt is exactly the state a
+    # later run would mistake for a clean one.
+    if ! jset migration_attempt "$MIGRATION_ATTEMPT_PENDING"; then
+        log "ERROR: cannot record the migration attempt in $JOURNAL; migrate was not started"
+        return $EXIT_MIGRATE
+    fi
+    if ! jset migration_attempt_at "$(date '+%F %T')"; then
+        log "ERROR: cannot record migration_attempt_at; migrate was not started"
+        return $EXIT_MIGRATE
+    fi
+
     bounded "$MIGRATE_TIMEOUT" docker run --rm --network "$DOCKER_NETWORK" \
         --entrypoint /app/migrate -e DATABASE_URL="$dburl" \
         "ghcr.io/zzttzzmyswy/multica-backend@$PIN_BACKEND_DIGEST_NEW" up
     rc=$?
     log "migrate exit=$rc"
+
+    # From here the attempt is on disk whatever happens next. Every path that is
+    # not a fully verified schema leaves it without `outcome=verified`.
+    lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
+    log "post-migrate: ledger=$lm rows=$lr tables=$tc indexes(ok/invalid/notready)=$ix"
+
     if [ "$rc" -ne 0 ]; then
-        jset migrate_rc "$rc" || log "WARNING: cannot record migrate_rc in the journal"
-        log "MIGRATION FAILED. Real state: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
+        jset migrate_rc "$rc" >/dev/null 2>&1
+        jset migrate_failed "$rc" >/dev/null 2>&1
+        migration_latch_failed "$rc" "$lm" "$lr" "$tc" "$ix"
+        log "MIGRATION FAILED. Real state: ledger=$lm rows=$lr tables=$tc indexes=$ix"
         log "No automatic continuation and no claim that an intermediate schema is recoverable:"
         log "the site is preserved. Decide with the operator; rollback-r1 restores the old images only."
-        record_failure migrate "$EXIT_MIGRATE"
-        # A latch, not just a stage: a re-run of the same command is not an
-        # automatic licence to continue over a database that may be half
-        # migrated. Naming the latch explicitly is the operator's decision.
-        jset migrate_failed "$rc" || log "WARNING: cannot record the migration failure latch"
         return $EXIT_MIGRATE
     fi
 
-    lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
-    log "post-migrate: ledger=$lm rows=$lr tables=$tc indexes(ok/invalid/notready)=$ix"
-    jset migrate_rc 0 || { log "ERROR: cannot record migrate_rc"; return $EXIT_MIGRATE; }
-    jset ledger_after "$lm" --once || { log "ERROR: cannot record ledger_after"; return $EXIT_MIGRATE; }
-    if [ "$lm" != "$PIN_LEDGER_AFTER" ]; then
-        log "ERROR: ledger is '$lm', expected $PIN_LEDGER_AFTER; not continuing on a partial schema"
+    # The command returned 0. That authorises nothing on its own: a `/app/migrate
+    # up` that exits 0 after a partially applied batch leaves a schema neither
+    # build can read. The gate is the schema, not the exit status.
+    if ! schema_ok; then
+        jset migrate_rc 0 >/dev/null 2>&1
+        migration_latch_failed "exit 0 but the schema is not the .2 schema" "$lm" "$lr" "$tc" "$ix"
+        log "       the command reported success but the schema gate rejected it:"
+        log "       an exit status is not evidence; this database is not a verified .2 schema"
         return $EXIT_MIGRATE
     fi
-    if [ "$lr" != "$PIN_LEDGER_ROWS_AFTER" ]; then
-        log "ERROR: ledger row count is '$lr', expected $PIN_LEDGER_ROWS_AFTER"
+
+    # Command 0 and every counter verified. The complete result and the stage are
+    # one transition: writing the facts first and the stage afterwards is what
+    # let a failed last rename leave `stage=backup` with a finished migration
+    # recorded, and the next run migrated a second time.
+    if ! jcommit migrated \
+            "migration_attempt=$MIGRATION_ATTEMPT_DONE" \
+            "migration_outcome=verified" \
+            "migrate_rc=0" \
+            "ledger_after=$lm" \
+            "migration_ledger_rows=$lr" \
+            "migration_tables=$tc" \
+            "migration_indexes=$ix" \
+            "migration_verified_at=$(date '+%F %T')"; then
+        migration_latch_failed "cannot commit the verified migration result" "$lm" "$lr" "$tc" "$ix"
+        log "ERROR: the migration is verified but its result could not be committed with"
+        log "       stage=migrated; the attempt stays latched and a re-run will refuse"
         return $EXIT_MIGRATE
     fi
-    if [ "$tc" != "$PIN_TABLES_AFTER" ]; then
-        log "ERROR: table count is '$tc', expected $PIN_TABLES_AFTER"
-        return $EXIT_MIGRATE
-    fi
-    case $ix in
-        "$PIN_INDEXES_AFTER/0/0") ;;
-        *)
-            log "ERROR: index state is '$ix', expected $PIN_INDEXES_AFTER/0/0 (all valid and ready)"
-            return $EXIT_MIGRATE
-            ;;
-    esac
-    stage_set migrated || return $EXIT_MIGRATE
     return 0
+}
+
+# migration_latch_failed <reason> <ledger> <rows> <tables> <indexes>
+#
+# Turns an attempted migration into the state only an operator may leave. The
+# attempt key is never cleared and no `outcome=verified` is written, so every
+# later `run` refuses before it reaches the step again.
+migration_latch_failed() {
+    local reason=$1 lm=$2 lr=$3 tc=$4 ix=$5 failed
+    # The latch is the attempt key, already on disk before the command ran. These
+    # facts describe the failure for the operator; none of them is what makes the
+    # next run refuse, so a failure to write them cannot open the door. They are
+    # written in one transition anyway, so a reader never sees half a diagnosis.
+    failed=$(jget migrate_failed 2>/dev/null || true)
+    if ! jcommit "$(jget stage 2>/dev/null || printf 'backup')" \
+            "migration_outcome=failed: $reason" \
+            "migration_observed=ledger=$lm rows=$lr tables=$tc indexes=$ix" \
+            "migrate_failed=${failed:-$reason}"; then
+        log "WARNING: cannot record the failure detail; the attempt key is still the latch"
+    fi
+    # The stage deliberately stays where it was: the position did not advance, and
+    # the latch — an attempt without a verified outcome — is what makes a re-run
+    # refuse. Moving the stage would suggest a step completed.
+    log "MIGRATION NOT VERIFIED ($reason)."
+    log "  the attempt is recorded and no verified schema authorises continuing."
+    record_failure migrate "$EXIT_MIGRATE"
+    return 0
+}
+
+# migration_latch_report: what a refused re-run tells the operator. Read-only.
+migration_latch_report() {
+    local outcome observed
+    outcome=$(jget migration_outcome 2>/dev/null || printf 'none')
+    observed=$(jget migration_observed 2>/dev/null || true)
+    log "        the recorded outcome is '$outcome' (only 'verified' would continue)"
+    if [ -n "$observed" ]; then
+        log "        schema when the attempt stopped: $observed"
+    fi
+    log "        schema now: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
+    log "        Re-running is not an automatic licence to continue over a possibly half-migrated"
+    log "        database. Inspect the real schema, then hand the decision to the operator:"
+    log "        rollback-r1 restores the old images only and refuses an unknown schema shape."
+    log "        The pre-change dump is evidence for a separate recovery, not an automatic restore."
 }
 
 wait_candidate() {
@@ -1584,6 +1932,10 @@ assert_container_digest() {
 step_switch() {
     local rc body commit
     log "== switch: apply the approved compose input with the exact .2 digests =="
+    schema_ok || {
+        log "REFUSE: schema changed before candidate startup; Compose was not replaced."
+        return $EXIT_MIGRATE
+    }
     [ -f "$ASSETS/compose/docker-compose.new.yml" ] || { log "ERROR: staged compose input missing"; return $EXIT_CANDIDATE; }
     [ "$(sha256_of "$ASSETS/compose/docker-compose.new.yml")" = "$(jget initial_compose_new_sha256)" ] || {
         log "ERROR: staged compose input no longer matches the hash recorded at prepare"; return $EXIT_CANDIDATE; }
@@ -1612,15 +1964,8 @@ step_switch() {
         log "ERROR: candidate reports commit '$commit', expected $PIN_BACKEND_REV_NEW"
         return $EXIT_CANDIDATE
     fi
-    assert_container_digest "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_NEW" || return $EXIT_CANDIDATE
-    assert_container_digest "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_NEW" || return $EXIT_CANDIDATE
-    if [ "$(container_running "$FRONTEND_CONTAINER")" != "true" ]; then
-        log "ERROR: frontend container is not running (status=$(container_status "$FRONTEND_CONTAINER"))"
-        return $EXIT_CANDIDATE
-    fi
-    # Running is not serving: a web container can be up and still return 500 or
-    # refuse connections. Ask it, the same way the backend is asked.
-    frontend_ready || return $EXIT_CANDIDATE
+    # Identity and service, from the same definition `verify` and `thaw` use.
+    candidates_ok || return $EXIT_CANDIDATE
     jset switched_commit "$commit" --once || { log "ERROR: cannot record switched_commit"; return $EXIT_CANDIDATE; }
     log "candidate ok: commit=$commit backend=$PIN_BACKEND_DIGEST_NEW web=$PIN_WEB_DIGEST_NEW"
     stage_set switched || return $EXIT_CANDIDATE
@@ -1628,12 +1973,32 @@ step_switch() {
 }
 
 step_cli() {
-    local staged installed_sha installed_ver old_mode old_uid old_gid exec_start
+    local staged installed_sha installed_ver old_mode old_uid old_gid rc=0 code
     log "== cli: install the frozen CLI, then the approved upgrade script (backend is already .2) =="
+
+    # Nothing is replaced until the world this install assumes has been read
+    # again. `switch` proved the candidate when it started it; a resume from
+    # `switched` runs later, possibly after the backend was rolled back or the
+    # frontend died, and replacing the CLI and updater first would mean mutating
+    # the deployment on the strength of a stale claim.
+    health_ok || rc=$?
+    candidates_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    schema_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    if [ "$rc" -ne 0 ]; then
+        log "REFUSE: the candidate is not the verified .2 deployment right now, so nothing was installed."
+        log "        A resume re-proves the candidate before it touches the CLI or the updater."
+        return "$rc"
+    fi
+
+    # The staged sources, verified again immediately before the copy: the state
+    # directory is writable between runs, and a script that no longer matches its
+    # recorded hash must fail here rather than be installed and detected after.
+    staged_assets_ok || {
+        log "REFUSE: a staged asset no longer matches the journal, so nothing was installed."
+        return $EXIT_CLI
+    }
     staged="$ASSETS/cli/unpack/multica"
     [ -x "$staged" ] || { log "ERROR: staged CLI missing at $staged"; return $EXIT_CLI; }
-    [ "$(sha256_of "$staged")" = "$(jget cli_binary_sha256)" ] || {
-        log "ERROR: staged CLI hash changed since prepare"; return $EXIT_CLI; }
 
     # The environment assertion comes first: a unit that no longer executes the
     # maintained script must fail this step before any file is replaced.
@@ -1687,36 +2052,19 @@ step_cli() {
 }
 
 step_verify() {
-    local commit lm lr tc ix cli_ver cli_sha body
+    local rc=0 body
     log "== verify: version, schema, cli, and that writes are still frozen =="
     body=$(health_body)
-    commit=$(health_field "$body" commit)
-    lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
-    cli_ver=$([ -x "$CLI_BIN" ] && cli_version_of "$CLI_BIN")
-    cli_sha=$([ -f "$CLI_BIN" ] && sha256_of "$CLI_BIN")
-    log "  commit=$commit ledger=$lm rows=$lr tables=$tc indexes=$ix cli=${cli_ver:-none}"
-
-    local rc=0
-    [ "$commit" = "$PIN_BACKEND_REV_NEW" ] || { log "  MISMATCH: commit"; rc=$EXIT_CANDIDATE; }
-    [ "$lm" = "$PIN_LEDGER_AFTER" ] || { log "  MISMATCH: ledger"; rc=$EXIT_MIGRATE; }
-    [ "$lr" = "$PIN_LEDGER_ROWS_AFTER" ] || { log "  MISMATCH: ledger rows"; rc=$EXIT_MIGRATE; }
-    [ "$tc" = "$PIN_TABLES_AFTER" ] || { log "  MISMATCH: tables"; rc=$EXIT_MIGRATE; }
-    case $ix in
-        "$PIN_INDEXES_AFTER/0/0") ;;
-        *) log "  MISMATCH: indexes $ix"; rc=$EXIT_MIGRATE ;;
-    esac
-    [ "$cli_ver" = "$PIN_CLI_VERSION_NEW" ] || { log "  MISMATCH: cli version '${cli_ver:-none}'"; rc=$EXIT_CLI; }
-    [ "$cli_sha" = "$(jget cli_binary_sha256)" ] || { log "  MISMATCH: cli sha256"; rc=$EXIT_CLI; }
-    assert_container_digest "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_NEW" || rc=$EXIT_CANDIDATE
-    assert_container_digest "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_NEW" || rc=$EXIT_CANDIDATE
-    # Re-asked here rather than remembered from `switch`: the frontend can exit
-    # or start failing between the two steps, and this is the last gate before
-    # the operator is told the switch is good.
-    if ! frontend_ready; then
-        log "  MISMATCH: frontend is not serving"
-        rc=$EXIT_CANDIDATE
+    log "  commit=$(health_field "$body" commit) ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state) cli=$([ -x "$CLI_BIN" ] && cli_version_of "$CLI_BIN")"
+    # One definition of acceptance, shared with thaw. Re-listing the checks here
+    # is exactly how the previous revision's copies drifted apart.
+    final_acceptance || rc=$?
+    # verify still runs before thaw, so no writer may have started yet: a daemon
+    # that is already up was not frozen for this window.
+    if [ "$(unit_state "$DAEMON_UNIT")" = "active" ]; then
+        log "  MISMATCH: daemon is active before thaw"
+        [ "$rc" -eq 0 ] && rc=$EXIT_FREEZE
     fi
-    [ "$(unit_state "$DAEMON_UNIT")" != "active" ] || { log "  MISMATCH: daemon is active before thaw"; rc=$EXIT_FREEZE; }
     [ "$rc" -eq 0 ] || return "$rc"
     stage_set verified || return $EXIT_CANDIDATE
     return 0
@@ -1762,9 +2110,69 @@ restore_units() {
     return 0
 }
 
+# step_thaw: the only step that starts units, so it is the step where a wrong
+# answer stops being cheap. Three things make it safe to resume:
+#
+#   1. it re-runs the complete final acceptance *before* any unit starts — a
+#      previous run's `verified` says nothing about the CLI, the frontend or the
+#      backup now;
+#   2. it records `thaw_started`, so a run interrupted half-way is recognisable
+#      as thaw's own partial work rather than as unexplained drift;
+#   3. `restore_units` skips a unit already in its recorded state, so a resumed
+#      thaw neither starts a restored unit twice nor mistakes a normal part-way
+#      restore for a failure.
 step_thaw() {
-    restore_units || return $?
-    stage_set "done" || return $EXIT_ROLLBACK
+    local rc=0
+    log "== thaw: re-accept the live system, then restore the recorded unit states =="
+    final_acceptance
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "REFUSE: the final acceptance does not hold now, so no unit was started."
+        log "        A previous 'verified' stage is not permission to release the writers: the"
+        log "        CLI, the containers, the schema or the recorded backup changed since then."
+        record_failure thaw "$rc"
+        report_state
+        return "$rc"
+    fi
+    if jget thaw_started >/dev/null 2>&1; then
+        log "note: an earlier thaw began at $(jget thaw_started); units already in their recorded state are left alone"
+    fi
+    if ! jset thaw_started "$(date '+%F %T')" --once; then
+        log "ERROR: cannot record thaw_started; refusing to start units unrecorded"
+        return $EXIT_ROLLBACK
+    fi
+    restore_units
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        record_failure thaw "$rc"
+        report_state
+        return "$rc"
+    fi
+    # The units are back, but the acceptance must still hold with them running:
+    # a daemon that comes up against a wrong schema would answer health and look
+    # restored. This is the last read before `done` is written.
+    final_acceptance
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "REFUSE: the units are restored but the acceptance no longer holds; not recording 'done'."
+        record_failure thaw "$rc"
+        report_state
+        return "$rc"
+    fi
+    # `done` is the only stage that tells the operator the window is closed, so it
+    # is written last and read back. A journal missing one of its facts — the
+    # half-written record a failed `--once` write leaves — must not be reported as
+    # a completed maintenance just because every live check passed.
+    if ! jcommit "done" "completed_at=$(date '+%F %T')"; then
+        log "ERROR: the maintenance succeeded but the terminal stage could not be recorded"
+        return $EXIT_ROLLBACK
+    fi
+    if ! journal_complete "done"; then
+        log "REFUSE: the terminal journal is incomplete after the final write; not reporting"
+        log "        a completed maintenance. The live system is in its final state, but the"
+        log "        record of it is not, so the next reader cannot trust the stage."
+        return $EXIT_ROLLBACK
+    fi
     log "maintenance complete: backend/web/CLI on .2, schema 660, services restored"
     return 0
 }
@@ -1773,22 +2181,257 @@ step_thaw() {
 # run
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared acceptance checks.
+#
+# Every gate that decides "this deployment is on .2 and healthy" is expressed
+# once, here, and called from `switch`, `verify` and `thaw`. The previous
+# revision wrote the same intent three times and the copies disagreed: the late
+# resume path returned 0 without running any of them, so a resumed run could
+# report success over an old CLI, a stopped frontend and a deleted backup. A
+# resume must re-run the *same* checks as the first pass, not a summary of what
+# the first pass concluded.
+#
+# The functions here never read the journal's `stage`: a stage is a position, and
+# these are the measurements that decide whether a position may be left.
+# ---------------------------------------------------------------------------
+
+# health_ok: the backend answers /health with the exact .2 revision.
+health_ok() {
+    local body commit
+    body=$(health_body)
+    commit=$(health_field "$body" commit)
+    if [ -z "$body" ] || [ -z "$commit" ]; then
+        log "  MISMATCH: no backend commit at $BACKEND_URL"
+        return $EXIT_CANDIDATE
+    fi
+    if [ "$commit" != "$PIN_BACKEND_REV_NEW" ]; then
+        log "  MISMATCH: commit '${commit}' (expected $PIN_BACKEND_REV_NEW)"
+        return $EXIT_CANDIDATE
+    fi
+    return 0
+}
+
+# schema_ok: the live database is exactly the post-migration schema. One
+# definition, so `migrate`, `verify` and `thaw` cannot disagree about what the
+# .2 schema is.
+schema_ok() {
+    local lm lr tc ix rc=0
+    lm=$(ledger_max); lr=$(ledger_rows); tc=$(table_count); ix=$(index_state)
+    if [ "$lm" != "$PIN_LEDGER_AFTER" ]; then
+        log "  MISMATCH: ledger: ledger is '$lm', expected $PIN_LEDGER_AFTER"
+        rc=$EXIT_MIGRATE
+    fi
+    if [ "$lr" != "$PIN_LEDGER_ROWS_AFTER" ]; then
+        log "  MISMATCH: ledger rows: ledger row count is '$lr', expected $PIN_LEDGER_ROWS_AFTER"
+        rc=$EXIT_MIGRATE
+    fi
+    if [ "$tc" != "$PIN_TABLES_AFTER" ]; then
+        log "  MISMATCH: tables: table count is '$tc', expected $PIN_TABLES_AFTER"
+        rc=$EXIT_MIGRATE
+    fi
+    case $ix in
+        "$PIN_INDEXES_AFTER/0/0") ;;
+        *) log "  MISMATCH: indexes: index state is '$ix', expected $PIN_INDEXES_AFTER/0/0 (all valid and ready)"
+           rc=$EXIT_MIGRATE ;;
+    esac
+    return "$rc"
+}
+
+# candidates_ok: both containers run the exact .2 digests, the frontend process
+# is up, and it answers HTTP. Running is not serving, so all three are asked.
+candidates_ok() {
+    local rc=0
+    assert_container_digest "$BACKEND_CONTAINER" "$PIN_BACKEND_DIGEST_NEW" || rc=$EXIT_CANDIDATE
+    assert_container_digest "$FRONTEND_CONTAINER" "$PIN_WEB_DIGEST_NEW" || rc=$EXIT_CANDIDATE
+    if [ "$(container_running "$FRONTEND_CONTAINER")" != "true" ]; then
+        log "  MISMATCH: $FRONTEND_CONTAINER is not running (status=$(container_status "$FRONTEND_CONTAINER"))"
+        rc=$EXIT_CANDIDATE
+    fi
+    frontend_ready || { log "  MISMATCH: frontend is not serving"; rc=$EXIT_CANDIDATE; }
+    return "$rc"
+}
+
+# cli_ok: the installed CLI is byte-identical to the staged binary and reports
+# the pinned version. Both are reported: the hash proves what was installed, and
+# `--version` proves the binary that claims to carry it.
+cli_ok() {
+    local want sha ver rc=0
+    want=$(jget cli_binary_sha256 2>/dev/null || true)
+    if [ -z "$want" ]; then
+        log "  MISMATCH: the journal records no cli_binary_sha256"
+        return $EXIT_CLI
+    fi
+    if [ ! -x "$CLI_BIN" ]; then
+        log "  MISMATCH: $CLI_BIN is missing or not executable"
+        return $EXIT_CLI
+    fi
+    sha=$(sha256_of "$CLI_BIN")
+    ver=$(cli_version_of "$CLI_BIN")
+    if [ "$ver" != "$PIN_CLI_VERSION_NEW" ]; then
+        log "  MISMATCH: cli version '${ver:-none}' (expected $PIN_CLI_VERSION_NEW)"
+        rc=$EXIT_CLI
+    fi
+    if [ "$sha" != "$want" ]; then
+        log "  MISMATCH: cli sha256 is ${sha:-none}, expected $want"
+        rc=$EXIT_CLI
+    fi
+    return "$rc"
+}
+
+# upgrade_script_ok: the installed script is the approved input, and the oneshot
+# unit still executes that path. A verified script no unit runs is a dead
+# callback: the next real upgrade would silently use the old entry point.
+upgrade_script_ok() {
+    local want sha exec_start
+    want=$(jget approved_upgrade_sha256 2>/dev/null || true)
+    if [ -z "$want" ]; then
+        log "  MISMATCH: the journal records no approved_upgrade_sha256"
+        return $EXIT_CLI
+    fi
+    if [ ! -f "$UPGRADE_SCRIPT" ]; then
+        log "  MISMATCH: $UPGRADE_SCRIPT is missing"
+        return $EXIT_CLI
+    fi
+    sha=$(sha256_of "$UPGRADE_SCRIPT")
+    if [ "$sha" != "$want" ]; then
+        log "  MISMATCH: upgrade script sha256 is ${sha:-none}, expected $want"
+        return $EXIT_CLI
+    fi
+    exec_start=$(bounded "$PROBE_TIMEOUT" systemctl show -p ExecStart --value "$UPGRADE_SERVICE" 2>/dev/null)
+    case $exec_start in
+        *"$UPGRADE_SCRIPT"*) ;;
+        *) log "  MISMATCH: unit $UPGRADE_SERVICE does not execute $UPGRADE_SCRIPT (ExecStart: ${exec_start:-unreadable})"
+           return $EXIT_CLI ;;
+    esac
+    return 0
+}
+
+# staged_assets_ok: the two artifacts the remaining steps install still hash as
+# recorded. Checked before any step that installs them and again by the final
+# acceptance, because the state directory is writable between runs.
+staged_assets_ok() {
+    local k want path got rc=0
+    for k in cli_binary_sha256 approved_upgrade_sha256; do
+        want=$(jget "$k" 2>/dev/null || true)
+        case $k in
+            cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
+            approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
+        esac
+        if [ -z "$want" ]; then
+            log "ERROR: the journal records no $k; there is nothing verified left to install"
+            rc=1
+            continue
+        fi
+        if [ ! -f "$path" ]; then
+            log "ERROR: staged asset for $k is missing: $path"
+            rc=1
+            continue
+        fi
+        got=$(sha256_of "$path")
+        if [ "$got" != "$want" ]; then
+            log "ERROR: staged asset $path is $got but the journal recorded $want"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# prepared_state_ok: the read-only re-verification a resume needs before its
+# first side effect. It is the same comparison `prepare` makes when it re-checks
+# an existing snapshot — the journal's recorded hashes against the files on disk
+# — plus the two staged release inputs that `cli` will install later.
+#
+# It deliberately reuses `verify_existing_snapshot` rather than restating the
+# list: a second copy of "what the snapshot consists of" is what let this check
+# and the install-time check drift apart.
+prepared_state_ok() {
+    # `verify_existing_snapshot` already covers the snapshot files, the two
+    # staged release inputs, and the live host files the snapshot describes, and
+    # it logs exactly which item drifted. Reusing it keeps one definition of
+    # "what the snapshot consists of" instead of a second copy that can drift.
+    local rc=0
+    VERIFY_SNAPSHOT_QUIET=1 verify_existing_snapshot || rc=1
+    # One line on success, so the operator can see the window was opened on
+    # verified state; the item-by-item detail would only repeat prepare's output.
+    [ "$rc" -ne 0 ] || log "prepared state re-verified: snapshot, staged assets and host binding all match the journal"
+    return "$rc"
+}
+
+# final_acceptance: everything a `done` journal is allowed to mean, measured on
+# the live system. Called by `verify`, by `thaw` before it starts anything, and
+# by `thaw` again after the units are back — the last read before `done` is
+# written. It never consults the journal's stage.
+final_acceptance() {
+    local rc=0 code
+    health_ok || rc=$?
+    schema_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    candidates_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    cli_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    upgrade_script_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    staged_assets_ok || { [ "$rc" -eq 0 ] && rc=$EXIT_CLI; }
+    # The recovery point is part of what `done` claims: a completed window that
+    # has lost its dump is not a completed window, and thaw is the last moment
+    # at which saying so is still cheap.
+    backup_usable || { [ "$rc" -eq 0 ] && rc=$EXIT_FREEZE; }
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
 # resume_preconditions <stage> <first-step>
 #
 # A stage in the journal says what a previous run got through; it does not say
-# the world still looks like that. Before any step runs:
-#   * past the freeze, every writer must still be down (the API or a oneshot
-#     service can come back between runs);
-#   * past the backup, the recorded dump must exist and still match its hash;
-#   * a failed migration is a latch, not a checkpoint to step over;
-#   * the assets the remaining steps install must still hash as recorded.
+# the world still looks like that. Before any step runs, this re-proves — per
+# stage — every fact the remaining steps will rely on, using the same checks the
+# original pass used:
+#
+#   * before the application is started (backup/migrate/switch): every writer is
+#     still down, and the recorded dump still exists and matches its hash;
+#   * the staged CLIs and scripts still hash as recorded;
+#   * a migration attempt without a verified outcome is a latch, not a
+#     checkpoint to step over;
+#   * from `switched` on the candidate is re-measured: the installed CLI, the
+#     upgrade script and its unit entry point;
+#   * at `verified` (i.e. before thaw) the whole final acceptance runs again.
+#     A previous run's `verified` authorises nothing about now; it is thaw's
+#     input, and thaw starts units.
 resume_preconditions() {
-    local stage=$1 start=$2
+    local stage=$1 start=$2 outcome observed failed
+
+    snapshot_files_ok || {
+        log "REFUSE: immutable recovery files no longer match the journal; nothing was changed."
+        return 1
+    }
     case $start in
-        # Up to and including `switch`, the application is deliberately down:
-        # the backup and the migration both require it. From `cli` onward the
-        # new application is up by design, so a running backend there is
-        # expected rather than a violation.
+        backup|migrate|switch)
+            snapshot_assets_ok || return 1
+            ;;
+    esac
+
+    # `freeze` is the first side effect of the window: it stops five units and
+    # the two containers. Before that happens, the snapshot, the staged release
+    # inputs and the host binding must still be exactly what prepare recorded.
+    #
+    # `journal_complete` only proves the keys are present — it says nothing about
+    # whether the files those keys describe still match. Without this, a tampered
+    # staged updater was discovered by the `cli` step after the writers had been
+    # stopped and the migration had run.
+    case $start in
+        freeze)
+            prepared_state_ok || {
+                log "REFUSE: the prepared snapshot, the staged assets or the host binding"
+                log "        no longer match the journal, so nothing was stopped or changed."
+                log "        Restore the recorded versions, or archive $STATE_DIR and prepare again."
+                return 1
+            }
+            return 0
+            ;;
+    esac
+
+    # Everything up to and including `switch` runs with the application down:
+    # the backup and the migration both require it, and the writers may have been
+    # restarted by an operator, a timer or a crash between runs.
+    case $start in
         backup|migrate|switch)
             writers_stopped || {
                 log "REFUSE: stage '$stage' precedes the application start, but the writers are running now."
@@ -1796,46 +2439,96 @@ resume_preconditions() {
                 return 1
             }
             ;;
-        *) return 0 ;;
     esac
-    case $start in
-        backup) return 0 ;;
-    esac
-    backup_usable || {
-        log "REFUSE: stage '$stage' claims a final backup exists, but it is missing or altered."
-        log "        Without a recovery point the switch cannot continue; nothing was changed."
-        return 1
-    }
-    local latch
-    latch=$(jget migrate_failed 2>/dev/null || true)
-    if [ -n "$latch" ]; then
-        log "REFUSE: a migration already failed here (migrate_failed=$latch)."
+
+    # Two questions, not one: has a migration command been started, and if so did
+    # it commit a complete verified result?
+    #
+    #   * `backup` with no attempt is a clean, normally-reached boundary — the
+    #     window was frozen and dumped, and the first migration has not run. It
+    #     must be resumable; requiring a verified outcome here made the ordinary
+    #     "stopped before the migration" case unrecoverable.
+    #   * `backup` with an attempt that never committed is a latch.
+    #   * `migrated` and later require the complete committed result.
+    #
+    # The stage is deliberately not the input to this decision alone; see
+    # migration_settled.
+    if ! migration_settled; then
+        outcome=$(jget migration_outcome 2>/dev/null || printf 'none')
+        observed=$(jget migration_observed 2>/dev/null || true)
+        failed=$(jget migrate_failed 2>/dev/null || true)
+        if [ -n "$failed" ]; then
+            log "REFUSE: a migration already failed here (migrate_failed=$failed)."
+        else
+            log "REFUSE: a migration was started here and never committed a complete verified result."
+        fi
+        log "        (migration_attempt=$(migration_attempt_state), outcome=$outcome)."
+        # Only meaningful for a verified-but-partial record; a failed attempt has
+        # no result to be missing.
+        if migration_outcome_verified; then
+            log "        the result is incomplete: $(migration_missing_facts | tr '\n' ' ')"
+            log "        a verified migration must be committed with stage=migrated in one write;"
+            log "        this journal has the outcome without its facts, so it was interrupted"
+        fi
+        if [ -n "$observed" ]; then
+            log "        schema when the attempt stopped: $observed"
+        fi
+        log "        schema now: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
         log "        Re-running is not an automatic licence to continue over a possibly half-migrated"
-        log "        database. Inspect the real schema, then hand the decision to the operator:"
-        log "          ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
-        log "        rollback-r1 restores the old images only and refuses an unknown schema shape."
+        log "        database. rollback-r1 restores the old images only and refuses an unknown schema"
+        log "        shape. Inspect the real schema and hand the decision to the operator."
         return 1
     fi
-    local k want path got
+    # `backup` and `migrate` both run *before* a committed migration: `backup`
+    # is the stage, `migrate` is the step it maps to. Neither may demand a
+    # verified outcome — that is the transition they are about to make.
+    case $start in
+        backup|migrate) ;;
+        *)
+            # Past the migration, the settled result is a precondition, not an
+            # optional fact: without it the stage claims a step nobody proved.
+            migration_outcome_verified || {
+                log "REFUSE: stage '$stage' claims the migration finished, but this journal records"
+                log "        no verified attempt (migration_attempt=$(migration_attempt_state))."
+                log "        Nothing was changed; the migration has not been proved to have run."
+                return 1
+            }
+            ;;
+    esac
+
+    # From `migrate` on there is a recovery point to re-prove. (The migrate step
+    # re-checks it too; here it fails before any step is entered.)
+    case $start in
+        backup) ;;
+        *)
+            backup_usable || {
+                log "REFUSE: stage '$stage' claims a final backup exists, but it is missing or altered."
+                log "        Without a recovery point the switch cannot continue; nothing was changed."
+                return 1
+            }
+            ;;
+    esac
     case $start in
         migrate) return 0 ;;
     esac
-    for k in cli_binary_sha256 approved_upgrade_sha256; do
-        want=$(jget "$k" 2>/dev/null || true)
-        case $k in
-            cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
-            approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
-        esac
-        if [ -z "$want" ] || [ ! -f "$path" ]; then
-            log "REFUSE: staged asset for '$k' is missing; the remaining steps cannot install it"
-            return 1
-        fi
-        got=$(sha256_of "$path")
-        if [ "$got" != "$want" ]; then
-            log "REFUSE: staged asset $path is $got but the journal recorded $want"
-            return 1
-        fi
-    done
+
+    # `cli` installs from the staged assets, so they must still hash as recorded
+    # before it replaces anything on the host.
+    case $start in
+        cli)
+            staged_assets_ok || {
+                log "REFUSE: the staged CLI or approved upgrade script no longer matches the journal;"
+                log "        cli cannot install what it cannot verify. Nothing was changed."
+                return 1
+            }
+            ;;
+    esac
+
+    # `verify` and `thaw` both run the full acceptance themselves — verify as its
+    # own work, thaw because starting units on a stale acceptance is the failure
+    # this revision exists to prevent. Running it here as well would only mean a
+    # resumed run reports the refusal instead of the specific mismatch, so the
+    # check stays in the step that owns it.
     return 0
 }
 

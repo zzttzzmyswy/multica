@@ -250,6 +250,38 @@ case ${1:-} in
         ;;
     run)
         printf 'run %s\n' "$*" >>"$S/migrate.log"
+        # What the journal held at the instant the command ran. A latch written
+        # after the command would not appear here.
+        if [ -f "$S/opt/migrate-observe-journal" ]; then
+            cat "$(opt migrate-observe-journal)" >"$S/migrate-journal-at-start" 2>/dev/null || : >"$S/migrate-journal-at-start"
+        fi
+        # A migration that is stopped before it can touch the database, used to
+        # construct the ordinary "the window stopped before migrating" stage.
+        if [ -f "$S/opt/migrate-refuse" ]; then
+            exit "$(opt migrate-refuse)"
+        fi
+        # A migration that is killed while it is running: the schema has already
+        # changed, and nothing was recorded after the command. The case asserts
+        # that the next run refuses instead of re-running the command.
+        if [ -f "$S/opt/migrate-killed" ]; then
+            printf '%s\n' "$(opt ledger-after || printf '660_attachment_upload_session_workspace')" >"$S/ledger"
+            printf '%s\n' "$(opt rows-after || printf '684')" >"$S/ledger_rows"
+            printf '%s\n' "$(opt tables-after || printf '148')" >"$S/tables"
+            printf '%s\n' "$(opt indexes-after || printf '799/0/0')" >"$S/indexes"
+            kill -TERM $$
+            exit 143
+        fi
+        # The command succeeds into the .2 schema, but the journal cannot record
+        # the outcome: the attempt is on disk and the verified outcome is not.
+        if [ -f "$S/opt/break-migration-journal" ]; then
+            printf '%s\n' "$(opt ledger-after || printf '660_attachment_upload_session_workspace')" >"$S/ledger"
+            printf '%s\n' "$(opt rows-after || printf '684')" >"$S/ledger_rows"
+            printf '%s\n' "$(opt tables-after || printf '148')" >"$S/tables"
+            printf '%s\n' "$(opt indexes-after || printf '799/0/0')" >"$S/indexes"
+            rm -f "$S/../state-dir/journal"
+            mkdir -p "$S/../state-dir/journal"
+            exit 0
+        fi
         if [ "$(opt migrate-rc || printf '0')" = 0 ]; then
             printf '%s\n' "$(opt ledger-after || printf '660_attachment_upload_session_workspace')" >"$S/ledger"
             printf '%s\n' "$(opt rows-after || printf '684')" >"$S/ledger_rows"
