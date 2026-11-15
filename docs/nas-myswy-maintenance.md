@@ -63,9 +63,14 @@ compose input (it may differ from the live file only in the two image lines),
 the `.2` images already being on the box, the rollback baseline, and the
 snapshot itself. `prepare` uses no network and runs no container.
 
+GNU coreutils must be available at `/usr/bin/install`. TOS may resolve bare
+`install` to its application installer instead. Verify `/usr/bin/install --version`
+reports GNU coreutils before installing these files; the executor also checks it
+before every write command and uses that exact path for switch and R1.
+
 ```bash
-install -m 755 nas-maintenance.sh /home/myswy/scripts/nas-maintenance.sh
-install -m 600 maintenance.conf /home/myswy/.config/multica-maintenance.conf
+/usr/bin/install -m 755 nas-maintenance.sh /home/myswy/scripts/nas-maintenance.sh
+/usr/bin/install -m 600 maintenance.conf /home/myswy/.config/multica-maintenance.conf
 
 /home/myswy/scripts/nas-maintenance.sh prepare \
   --config /home/myswy/.config/multica-maintenance.conf
