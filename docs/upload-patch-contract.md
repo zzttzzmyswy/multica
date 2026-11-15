@@ -28,6 +28,21 @@ concurrent index under its **new** version — `TestEveryConcurrentUpBuildHasCle
 fails the build otherwise. Every index is also registered for the interrupted-build
 cleanup path, so a failed command is retried by re-running, not by hand.
 
+Current mapping. The bodies are identical; only the prefix differs.
+
+| Object | Fork (deployed, frozen) | Upstream candidate |
+| --- | --- | --- |
+| `attachment_upload_session` table | `657` | `660` |
+| `uq_attachment_upload_session_staging_key` | `658` | `661` |
+| `idx_attachment_upload_session_due` | `659` | `662` |
+| `idx_attachment_upload_session_workspace` | `660` | `663` |
+
+The candidate starts at `660` because upstream claimed `657`–`659`
+(`657_inbox_item_snoozed_until`, `658_project_archive`,
+`659_issue_view_preference_projects_page`) while this feature was in review. A
+candidate built on a later upstream base must move again, to that base's highest
+plus one, and update the cleanup map with it.
+
 `attachment_upload_session` has no foreign keys (repository rule); workspace
 teardown hands its rows to the reconciler instead of deleting them, because the
 row is the only record naming an object the client's write may still materialize.

@@ -20,14 +20,16 @@ Keep the two sets in separate commits, and in separate branches when syncing.
 | **Upload feature** | presign → PUT → complete endpoints, upload-session table and reconciler, storage-side conditional copy, CLI and browser clients, the tests and smoke scripts that cover them | both the fork **and** the upstream candidate |
 | **Distribution** | release workflow and GoReleaser config, pinned update source, installer, image namespace and digest override, Helm defaults, this document | fork only |
 
-The upstream candidate must never contain a distribution file, and a distribution
-file must never contain a fork-only reference. `git diff` between the two
-branches states which is which; the upload feature is the only content they
-share.
+The upstream candidate must never contain a distribution file. That is the whole
+point of the boundary: the candidate is what an upstream reviewer reads, and a
+release workflow, an installer or a pinned image namespace in it would tie the
+fork's release choices to upstream's review. Distribution files in the fork, in
+turn, refer to fork behaviour by design. `git diff` between the two branches
+states which is which; the upload feature is the only content they share.
 
 ## Version scheme and published assets
 
-Tags are `v<upstream>.<patch>-myswy.<N>` — for example `v0.9.0-myswy.2`, where
+Tags are `vX.Y.Z-myswy.N` — for example `v0.9.0-myswy.2`, where
 `0.9.0` is the upstream version the build is based on and `myswy.N` counts this
 distribution's builds on that base.
 
@@ -156,14 +158,24 @@ df -h "$(docker info --format '{{.DockerRootDir}}')"
 ```
 
 An interrupted concurrent build leaves an INVALID index; the runner's per-version
-cleanup hook means a re-run repairs it, not a manual rebuild. Take a backup that
-has been restored into a scratch database before upgrading, and prefer restoring
-that backup over migrating backwards: `migrate down` over this feature's
-migrations drops the upload-session table and the record of any in-flight upload.
+cleanup hook means a re-run repairs it, not a manual rebuild. Take a backup and
+confirm it restores into a scratch database before upgrading. `migrate down` over
+this feature's migrations drops the upload-session table and the record of any
+in-flight upload, so it is not a rollback plan on its own.
 
 **No rollout or rollback path in this document is a tested guarantee for any
 specific deployment.** Whether the previous binary tolerates a newer schema is an
 assumption to be checked against a restored copy of the real database.
+
+### Recovering a database
+
+If an upgrade has to be undone at the data level, **do not restore over the live
+database in place, and do not migrate backwards on it.** Bring up a new database
+(or a new volume) from the verified backup, run the candidate `migrate up` against
+it, and confirm health, authentication and the attachment feature there. Only
+then switch the application's connection string over to it. Keep the previous
+database untouched until the new one has been accepted, so an in-place overwrite
+can never destroy the only copy of the current data.
 
 ## Syncing upstream
 
@@ -177,11 +189,20 @@ Sync from a **formal upstream release tag**, not from upstream `main`: the
 distribution's version number names the upstream version it is based on, and
 `main` moves between releases. Then:
 
-1. **Migrations.** Renumber the upload migrations to follow upstream's highest.
-   Update `concurrentIndexCleanups` in `server/cmd/migrate/main.go` in the same
-   commit — `TestEveryConcurrentUpBuildHasCleanup` fails otherwise. The versions
-   already deployed on any live fork database are frozen: they were applied under
-   those numbers, and a renumbering would re-run or skip them.
+1. **Migrations — check which branch you are on.** Renumbering applies **only**
+   to the undeployed upstream candidate, which is built fresh from an upstream
+   base and has never been applied anywhere: there, number the upload migrations
+   after upstream's highest and update `concurrentIndexCleanups` in
+   `server/cmd/migrate/main.go` in the same commit
+   (`TestEveryConcurrentUpBuildHasCleanup` fails otherwise).
+
+   **Do not renumber on the fork's own line.** The fork's upload migrations are
+   recorded in `schema_migrations` on every deployed database under the numbers
+   they were applied with; moving them would re-run or skip an applied migration.
+   Reconciling the fork's deployed numbers with a future upstream that claims the
+   same ones is an unsolved problem, not a renumbering step — see the migration
+   section of `docs/upload-patch-contract.md`, which records it as a gate that
+   needs its own design and a rehearsal on a restored copy.
 2. **Storage guarantee.** A conflict resolution must keep the conditional copy in
    `server/internal/storage/s3_upload.go`. The guarantee that a client cannot
    overwrite a published object comes from that `If-Match` condition, not from
