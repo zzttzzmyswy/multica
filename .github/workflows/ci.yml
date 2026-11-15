@@ -1044,9 +1044,14 @@ jobs:
         # The suite pins the reasons a switch may and may not proceed — a live
         # writer during backup, a half-migrated schema, a candidate on the wrong
         # digest, a rollback that only restarts the new configuration.
+        # NAS requires GNU coreutils; ubuntu-latest now defaults to uutils.
+        # Keep the executor's preflight and every assertion in the GNU environment.
         run: |
           bash -n scripts/nas-maintenance.sh scripts/nas-maintenance.test.sh
-          bash scripts/nas-maintenance.test.sh
+          docker run --rm --init --network none \
+            --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            ubuntu:22.04 bash scripts/nas-maintenance.test.sh
 
       - name: Test snapshot compose resolution against real Docker Compose
         # Not stubbed: this runs `docker compose config`, which parses and
