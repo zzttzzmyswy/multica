@@ -294,12 +294,12 @@ jset() {
         return 0
     fi
     local tmp="$JOURNAL.tmp.$$"
-    {
+    (
         if [ -f "$JOURNAL" ]; then
-            awk -v k="$k=" 'index($0, k) != 1' "$JOURNAL"
+            awk -v k="$k=" 'index($0, k) != 1' "$JOURNAL" || exit 1
         fi
         printf '%s=%s\n' "$k" "$v"
-    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
+    ) >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
     mv -f "$tmp" "$JOURNAL" 2>/dev/null || { rm -f "$tmp"; log "ERROR: cannot replace journal $JOURNAL"; return 1; }
     return 0
 }
@@ -361,19 +361,19 @@ jcommit() {
     done
 
     local tmp="$JOURNAL.tmp.$$"
-    {
+    (
         if [ -f "$JOURNAL" ]; then
             awk -v drop="$drop" '
                 { key = $0; sub(/=.*/, "", key) }
                 index(drop, " " key " ") == 0 { print }
-            ' "$JOURNAL"
+            ' "$JOURNAL" || exit 1
         fi
         for pair in "$@"; do
-            printf '%s\n' "$pair"
+            printf '%s\n' "$pair" || exit 1
         done
-        printf 'stage=%s\n' "$stage"
+        printf 'stage=%s\n' "$stage" || exit 1
         printf 'stage_at=%s\n' "$(date '+%F %T')"
-    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
+    ) >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
     if ! mv -f "$tmp" "$JOURNAL" 2>/dev/null; then
         rm -f "$tmp"
         log "ERROR: cannot commit stage '$stage' to $JOURNAL; nothing was recorded"
@@ -1255,17 +1255,10 @@ commit_snapshot() {
     return 0
 }
 
-# verify_existing_snapshot: read-only re-check of a completed snapshot.
-#
-# A second `prepare` must never rewrite the pre-change files: the journal keeps
-# the first hashes, so overwriting them would leave R1 restoring nothing. This
-# re-verifies the assets against those recorded hashes and reports whether the
-# live host has since drifted, without touching a byte.
-verify_existing_snapshot() {
+# Immutable recovery files must survive every stage, even after the live files
+# have been upgraded. Keep this separate from the prepared host comparison.
+snapshot_files_ok() {
     local drift=0 k want path got
-    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
-        log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
-
     for k in compose_sha256 cli_sha256 upgrade_script_sha256 compose_new_sha256 compose_rollback_sha256; do
         want=$(jget "initial_$k" 2>/dev/null || true)
         case $k in
@@ -1275,7 +1268,7 @@ verify_existing_snapshot() {
             cli_sha256) path=$ASSETS/previous/multica ;;
             upgrade_script_sha256) path=$ASSETS/previous/upgrade-multica.sh ;;
         esac
-        [ -n "$want" ] || continue          # recorded as absent at prepare
+        [ -n "$want" ] || { log "ERROR: snapshot hash initial_$k is missing"; drift=1; continue; }
         if [ ! -f "$path" ]; then
             log "ERROR: snapshot file missing: $path"
             drift=1
@@ -1288,13 +1281,19 @@ verify_existing_snapshot() {
             drift=1
         fi
     done
+    [ "$drift" -eq 0 ] || return $EXIT_PREPARE
+}
+
+snapshot_assets_ok() {
+    local drift=0 k want path
+    snapshot_files_ok || return $?
     for k in cli_binary_sha256 approved_upgrade_sha256; do
         want=$(jget "$k" 2>/dev/null || true)
         case $k in
             cli_binary_sha256) path=$ASSETS/cli/unpack/multica ;;
             approved_upgrade_sha256) path=$ASSETS/approved-upgrade-multica.sh ;;
         esac
-        [ -n "$want" ] || continue
+        [ -n "$want" ] || { log "ERROR: staged asset hash $k is missing"; drift=1; continue; }
         if [ ! -f "$path" ]; then
             log "ERROR: staged asset missing: $path"
             drift=1
@@ -1303,6 +1302,14 @@ verify_existing_snapshot() {
         [ "$(sha256_of "$path")" = "$want" ] || { log "ERROR: staged asset $path no longer matches $want"; drift=1; }
     done
     [ "$drift" -eq 0 ] || return $EXIT_PREPARE
+}
+
+# A repeated prepare also requires the live host to match its original snapshot.
+verify_existing_snapshot() {
+    local drift=0
+    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
+        log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
+    snapshot_assets_ok || return $?
 
     # The live host is allowed to keep running, but a change to the things the
     # snapshot describes breaks the equivalence R1 relies on.
@@ -1776,6 +1783,11 @@ step_migrate() {
         return $EXIT_REFUSED
     fi
 
+    if [ "$(schema_shape)" != pre ]; then
+        log "REFUSE: schema is no longer the verified pre-migration shape; migrate was not attempted."
+        return $EXIT_MIGRATE
+    fi
+
     dburl=$(database_url)
     if [ -z "$dburl" ]; then
         log "ERROR: cannot read DATABASE_URL from $BACKEND_CONTAINER; migrate was not attempted"
@@ -1920,6 +1932,10 @@ assert_container_digest() {
 step_switch() {
     local rc body commit
     log "== switch: apply the approved compose input with the exact .2 digests =="
+    schema_ok || {
+        log "REFUSE: schema changed before candidate startup; Compose was not replaced."
+        return $EXIT_MIGRATE
+    }
     [ -f "$ASSETS/compose/docker-compose.new.yml" ] || { log "ERROR: staged compose input missing"; return $EXIT_CANDIDATE; }
     [ "$(sha256_of "$ASSETS/compose/docker-compose.new.yml")" = "$(jget initial_compose_new_sha256)" ] || {
         log "ERROR: staged compose input no longer matches the hash recorded at prepare"; return $EXIT_CANDIDATE; }
@@ -2381,6 +2397,16 @@ final_acceptance() {
 #     input, and thaw starts units.
 resume_preconditions() {
     local stage=$1 start=$2 outcome observed failed
+
+    snapshot_files_ok || {
+        log "REFUSE: immutable recovery files no longer match the journal; nothing was changed."
+        return 1
+    }
+    case $start in
+        backup|migrate|switch)
+            snapshot_assets_ok || return 1
+            ;;
+    esac
 
     # `freeze` is the first side effect of the window: it stops five units and
     # the two containers. Before that happens, the snapshot, the staged release

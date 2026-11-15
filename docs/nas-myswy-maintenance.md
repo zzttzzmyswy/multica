@@ -257,6 +257,18 @@ states no rule covers: `stage=backup` with `migration_outcome=verified` recorded
 the backup record, the migration result, and the terminal stage — is therefore
 written as a single `jcommit`, and the result is read back before it is claimed.
 
+Every resume also verifies the immutable Compose and rollback-file snapshots.
+Before a resumed backup, migration or switch, staged release inputs must still
+match their recorded hashes. Live files may already have changed at later
+stages; they are checked against the candidate state, not against the old files.
+The current database shape is checked before the first migration and again
+before candidate startup. A previous `migrated` journal entry cannot authorise
+starting an application against a schema that has since changed.
+
+Journal construction errors are failures too: a failed read or write of the
+temporary journal must preserve the previous journal and cannot proceed to its
+rename, migration or application startup.
+
 ### The migration latch
 
 `migration_attempt=pending` is written **before** `docker run` starts, and

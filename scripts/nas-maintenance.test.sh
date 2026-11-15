@@ -2787,6 +2787,104 @@ else
     bad "an earlier dump was deleted ($(dump_count) dumps)"
 fi
 
+
+# D: every resumed side effect keeps the recovery evidence and actual schema valid.
+stop_at_committed_stage() {
+    local wanted=$1
+    prepare_ok || return 1
+    install_mv_fault "stage=$wanted" kill
+    stub_opt mv-fault-sig "stage=$wanted"
+    run_faulty run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 143
+    expect_journal stage "$wanted"
+}
+
+step "D1: immutable rollback files are checked at every resume boundary"
+while IFS='|' read -r boundary snapshot; do
+    new_case "resume-snapshot-$boundary"
+    stop_at_committed_stage "$boundary"
+    printf '# damaged recovery material\n' >>"$CUR/state-dir/assets/$snapshot"
+    cli_before=$(sha256sum "$CUR/cli-bin/multica" | awk '{print $1}')
+    compose_before=$(sha256sum "$CUR/compose/docker-compose.yml" | awk '{print $1}')
+    mark_calls snapshot-drift
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 80
+    expect_journal stage "$boundary"
+    expect_no_call_since_mark 'docker run|compose .* up|systemctl start' 'no migration, application or unit start'
+    expect_sha "$CUR/cli-bin/multica" "$cli_before"
+    expect_sha "$CUR/compose/docker-compose.yml" "$compose_before"
+done <<'BOUNDARIES'
+frozen|previous/multica
+backup|compose/docker-compose.initial.yml
+migrated|compose/docker-compose.rollback.yml
+switched|previous/upgrade-multica.sh
+cli|compose/docker-compose.new.yml
+verified|previous/multica
+BOUNDARIES
+
+step "D2: staged input drift is refused before resumed database work"
+for boundary in frozen backup migrated; do
+    new_case "resume-source-$boundary"
+    stop_at_committed_stage "$boundary"
+    printf '# damaged staged input\n' >>"$CUR/state-dir/assets/approved-upgrade-multica.sh"
+    mark_calls staged-drift
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 80
+    expect_journal stage "$boundary"
+    expect_no_call_since_mark 'docker run|compose .* up|systemctl start' 'nothing migrated or started'
+done
+
+step "D3: migration and candidate startup require the current schema"
+for boundary in backup migrated; do
+    new_case "resume-schema-$boundary"
+    stop_at_committed_stage "$boundary"
+    printf '130\n' >"$CUR/state/tables"
+    compose_before=$(sha256sum "$CUR/compose/docker-compose.yml" | awk '{print $1}')
+    mark_calls schema-drift
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    expect_rc 40
+    expect_journal stage "$boundary"
+    expect_no_call_since_mark 'docker run|compose .* up' 'schema drift cannot migrate or start candidates'
+    expect_sha "$CUR/compose/docker-compose.yml" "$compose_before"
+done
+
+step "D4: journal construction errors cannot erase prior evidence"
+for fault in attempt backup migrated; do
+    new_case "journal-read-$fault"
+    prepare_ok
+    initial_hash=$(journal_get initial_compose_sha256)
+    fault_stubs="$TMP/journal-fault-$fault"
+    cp -a "$STUBS" "$fault_stubs"
+    cat >"$fault_stubs/awk" <<'AWK_STUB'
+#!/usr/bin/env bash
+if [ "${!#}" = "$TB/state-dir/journal" ]; then
+    mode=$(cat "$TB/state/opt/journal-read-fault" 2>/dev/null)
+    case "$mode:${2:-}" in
+        attempt:k=migration_attempt_at=)
+            [ "${3:-}" != 'index($0, k) != 1' ] || exit 1 ;;
+        backup:drop=*) [[ "$2" != *backup_path* ]] || exit 1 ;;
+        migrated:drop=*) [[ "$2" != *migration_verified_at* ]] || exit 1 ;;
+    esac
+fi
+exec /usr/bin/awk "$@"
+AWK_STUB
+    chmod +x "$fault_stubs/awk"
+    saved_stubs=$STUBS
+    STUBS=$fault_stubs
+    stub_opt journal-read-fault "$fault"
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    STUBS=$saved_stubs
+    case $fault in
+        backup) expect_rc 30; expect_journal stage frozen; expected_calls=0 ;;
+        attempt) expect_rc 40; expect_journal stage backup; expect_journal migration_attempt pending; expected_calls=0 ;;
+        migrated) expect_rc 40; expect_journal stage backup; expect_journal migration_attempt pending; expected_calls=1 ;;
+    esac
+    expect_journal initial_compose_sha256 "$initial_hash"
+    if [ "$(migration_calls)" = "$expected_calls" ]; then ok "only $expected_calls authorised migration calls"; else bad "unexpected migration call count"; fi
+    expect_no_call 'compose .* up' 'no candidates started after a journal construction failure'
+    expect_no_log 'maintenance complete' 'no false completion'
+done
+
 # ---------------------------------------------------------------------------
 printf '\n'
 if [ "$FAIL" -eq 0 ]; then
