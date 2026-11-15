@@ -2885,6 +2885,34 @@ AWK_STUB
     expect_no_log 'maintenance complete' 'no false completion'
 done
 
+step "E: a NAS vendor install command cannot shadow coreutils during switch or R1"
+new_case vendor-install-shadow
+shadow_stubs="$TMP/vendor-install-stubs"
+cp -a "$STUBS" "$shadow_stubs"
+cat >"$shadow_stubs/install" <<'VENDOR_INSTALL'
+#!/usr/bin/env bash
+printf 'tos-install %s\n' "$*" >>"$TB/state/calls.log"
+printf 'flag provided but not defined: -m\n' >&2
+exit 2
+VENDOR_INSTALL
+chmod +x "$shadow_stubs/install"
+saved_stubs=$STUBS
+STUBS=$shadow_stubs
+prepare_ok
+initial_cli=$(journal_get initial_cli_sha256)
+initial_updater=$(journal_get initial_upgrade_script_sha256)
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+expect_log "CLI installed: version=$CLI_VERSION_NEW" 'verifies CLI version despite the vendor installer'
+run_script rollback-r1 --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage rolled-back
+expect_sha "$CUR/cli-bin/multica" "$initial_cli"
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$initial_updater"
+expect_no_call 'tos-install' 'neither switch nor R1 invokes the vendor application installer'
+STUBS=$saved_stubs
+
 # ---------------------------------------------------------------------------
 printf '\n'
 if [ "$FAIL" -eq 0 ]; then

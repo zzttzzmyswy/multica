@@ -245,7 +245,7 @@ atomic_install() {
     local src=$1 dst=$2 mode=${3:-}
     local tmp="$dst.nas-maint.$$"
     if [ -n "$mode" ]; then
-        install -m "$mode" "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+        /usr/bin/install -m "$mode" "$src" "$tmp" || { rm -f "$tmp"; return 1; }
     else
         cp -p "$src" "$tmp" || { rm -f "$tmp"; return 1; }
     fi
@@ -692,6 +692,16 @@ require_config() {
         log "REFUSE: 'timeout' is required; without it no external call can be bounded"
         return $EXIT_USAGE
     fi
+    # TOS puts its unrelated application installer ahead of coreutils in PATH.
+    local install_version
+    if ! install_version=$(bounded "$PROBE_TIMEOUT" /usr/bin/install --version 2>/dev/null); then
+        log "REFUSE: GNU coreutils /usr/bin/install is required"
+        return $EXIT_USAGE
+    fi
+    case $install_version in
+        'install (GNU coreutils) '*) ;;
+        *) log "REFUSE: /usr/bin/install is not GNU coreutils"; return $EXIT_USAGE ;;
+    esac
     case $COMPOSE_FILE in
         /*) ;;
         *) log "REFUSE: COMPOSE_FILE must be an absolute path"; return $EXIT_USAGE ;;
