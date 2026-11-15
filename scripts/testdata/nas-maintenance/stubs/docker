@@ -255,6 +255,11 @@ case ${1:-} in
         if [ -f "$S/opt/migrate-observe-journal" ]; then
             cat "$(opt migrate-observe-journal)" >"$S/migrate-journal-at-start" 2>/dev/null || : >"$S/migrate-journal-at-start"
         fi
+        # A migration that is stopped before it can touch the database, used to
+        # construct the ordinary "the window stopped before migrating" stage.
+        if [ -f "$S/opt/migrate-refuse" ]; then
+            exit "$(opt migrate-refuse)"
+        fi
         # A migration that is killed while it is running: the schema has already
         # changed, and nothing was recorded after the command. The case asserts
         # that the next run refuses instead of re-running the command.

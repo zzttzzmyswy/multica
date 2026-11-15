@@ -304,6 +304,85 @@ jset() {
     return 0
 }
 
+# jcommit <stage> [KEY=VALUE ...]
+#
+# One journal transition: every fact and the stage itself are written into one
+# temp file and renamed once, so a reader sees either the whole transition or
+# none of it.
+#
+# The alternative — a sequence of `jset` calls followed by `stage_set` — leaves
+# persisted states the tool has no rule for. A run that wrote
+# `migration_outcome=verified` and then failed to commit `stage=migrated` leaves
+# `stage=backup / attempt=done / outcome=verified`, which is indistinguishable
+# from "never migrated" to a reader that keys off the stage, so the next run
+# executed `up` a second time. The same shape applies to a backup whose path and
+# hash landed while its byte and TOC counts did not: the stage said the recovery
+# point existed.
+#
+# A transition that carries evidence uses this; nothing may advance a stage and
+# then describe it in a later write.
+jcommit() {
+    local stage=$1
+    shift
+    case $stage in
+        ''|*[!A-Za-z0-9_.-]*) log "ERROR: invalid journal stage '$stage'"; return 1 ;;
+    esac
+    if [ -e "$JOURNAL" ] && [ ! -f "$JOURNAL" ]; then
+        log "ERROR: $JOURNAL exists but is not a regular file"
+        return 1
+    fi
+    local pair k v drop
+    # Reject a malformed fact before anything is written: a half-validated
+    # transition must not reach the journal at all.
+    for pair in "$@"; do
+        case $pair in
+            *=*) ;;
+            *) log "ERROR: jcommit fact '$pair' is not KEY=VALUE"; return 1 ;;
+        esac
+        k=${pair%%=*}
+        v=${pair#*=}
+        case $k in
+            stage|stage_at)
+                log "ERROR: jcommit sets '$k' itself; do not pass it"
+                return 1
+                ;;
+            ''|*[!A-Za-z0-9_.-]*) log "ERROR: invalid journal key '$k'"; return 1 ;;
+        esac
+        case $v in
+            *$'\n'*) log "ERROR: journal value for '$k' contains a newline"; return 1 ;;
+        esac
+    done
+
+    # Every key this transition owns is dropped from the old content, so the new
+    # value is the only one present.
+    drop=" stage stage_at "
+    for pair in "$@"; do
+        drop="$drop${pair%%=*} "
+    done
+
+    local tmp="$JOURNAL.tmp.$$"
+    {
+        if [ -f "$JOURNAL" ]; then
+            awk -v drop="$drop" '
+                { key = $0; sub(/=.*/, "", key) }
+                index(drop, " " key " ") == 0 { print }
+            ' "$JOURNAL"
+        fi
+        for pair in "$@"; do
+            printf '%s\n' "$pair"
+        done
+        printf 'stage=%s\n' "$stage"
+        printf 'stage_at=%s\n' "$(date '+%F %T')"
+    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; log "ERROR: journal $JOURNAL is not writable"; return 1; }
+    if ! mv -f "$tmp" "$JOURNAL" 2>/dev/null; then
+        rm -f "$tmp"
+        log "ERROR: cannot commit stage '$stage' to $JOURNAL; nothing was recorded"
+        return 1
+    fi
+    log "stage -> $stage"
+    return 0
+}
+
 # journal_guard: the journal must exist, parse, belong to this config, and be in
 # a stage this command understands. Anything else refuses to continue.
 journal_guard() {
@@ -398,6 +477,9 @@ journal_required_keys() {
     esac
     # From `cli` on, what was installed is part of the record.
     printf '%s\n' cli_installed_sha256 upgrade_script_installed_sha256
+    case $stage in
+        done) printf '%s\n' completed_at ;;
+    esac
     return 0
 }
 
@@ -802,16 +884,13 @@ record_failure() {
 # believing it is further along than the journal says, so it is fatal: the
 # caller must treat a non-zero return as its own failure code.
 stage_set() {
-    local stage=$1
-    if ! jset stage "$stage"; then
-        log "ERROR: cannot record stage '$stage' in $JOURNAL; aborting rather than continuing unrecorded"
+    # Stage and its timestamp are one write: two renames could leave a stage with
+    # the previous stage's timestamp, and every reader treats stage_at as when the
+    # stage was reached. A transition that also carries evidence uses `jcommit`.
+    jcommit "$1" || {
+        log "ERROR: cannot record stage '$1' in $JOURNAL; aborting rather than continuing unrecorded"
         return 1
-    fi
-    if ! jset stage_at "$(date '+%F %T')"; then
-        log "ERROR: cannot record stage_at in $JOURNAL; aborting rather than continuing unrecorded"
-        return 1
-    fi
-    log "stage -> $stage"
+    }
     return 0
 }
 
@@ -1184,7 +1263,8 @@ commit_snapshot() {
 # live host has since drifted, without touching a byte.
 verify_existing_snapshot() {
     local drift=0 k want path got
-    log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
+    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
+        log "note: a prepared snapshot already exists; re-verifying it read-only (nothing will be rewritten)"
 
     for k in compose_sha256 cli_sha256 upgrade_script_sha256 compose_new_sha256 compose_rollback_sha256; do
         want=$(jget "initial_$k" 2>/dev/null || true)
@@ -1249,7 +1329,8 @@ verify_existing_snapshot() {
         log "        Restore the live files to the recorded versions, or archive $STATE_DIR and start again."
         return $EXIT_PREPARE
     }
-    log "verify ok: snapshot and live files still match the recorded hashes"
+    [ -n "${VERIFY_SNAPSHOT_QUIET:-}" ] || \
+        log "verify ok: snapshot and live files still match the recorded hashes"
     return 0
 }
 
@@ -1455,8 +1536,16 @@ step_backup() {
     writers_stopped || { log "ERROR: refusing to dump a live database"; return $EXIT_FREEZE; }
 
     if backup_recorded; then
+        # A previous attempt committed this dump in full; re-commit the same facts
+        # with the stage, so a journal whose stage did not land is repaired
+        # without touching the bytes on disk.
         log "an earlier attempt already recorded this backup; keeping it and continuing"
-        stage_set backup || return $EXIT_FREEZE
+        jcommit backup \
+            "backup_path=$(jget backup_path)" \
+            "backup_sha256=$(jget backup_sha256)" \
+            "backup_bytes=$(jget backup_bytes)" \
+            "backup_toc_lines=$(jget backup_toc_lines)" \
+            "backup_at=$(jget backup_at)" || return $EXIT_FREEZE
         return 0
     fi
 
@@ -1499,14 +1588,23 @@ step_backup() {
         log "ERROR: pg_restore -l returned only ${toc_lines:-0} TOC entries; the dump is not usable"
         return $EXIT_FREEZE
     fi
-    jset backup_path "$dump" --once || return $EXIT_FREEZE
-    jset backup_sha256 "$sha" --once || return $EXIT_FREEZE
-    jset backup_bytes "$size" --once || return $EXIT_FREEZE
-    jset backup_toc_lines "$toc_lines" --once || return $EXIT_FREEZE
-    jset backup_at "$(date '+%F %T')" --once || return $EXIT_FREEZE
+    # Every fact about this one dump, and the stage that says the recovery point
+    # exists, are a single transition. Written separately, a process that died
+    # after `backup_sha256` left `stage=frozen` with a half-described backup, and
+    # the retry then either reused it (a recovery point with no byte or TOC
+    # counts) or generated a second dump and mixed the two.
+    if ! jcommit backup \
+            "backup_path=$dump" \
+            "backup_sha256=$sha" \
+            "backup_bytes=$size" \
+            "backup_toc_lines=$toc_lines" \
+            "backup_at=$(date '+%F %T')"; then
+        log "ERROR: the dump is complete but its description could not be committed;"
+        log "       stage stays frozen and a re-run will take a fresh backup"
+        return $EXIT_FREEZE
+    fi
     log "backup ok: $dump sha256=$sha bytes=$size toc=$toc_lines"
     log "the data-loss window for any future recovery starts now (writes frozen)"
-    stage_set backup || return $EXIT_FREEZE
     return 0
 }
 
@@ -1545,23 +1643,38 @@ schema_shape() {
 # for steps that ask the question as part of their own logic rather than as a
 # precondition failure. `backup_usable` is the logging form.
 backup_recorded() {
-    local path want got
+    local path want got k
     path=$(jget backup_path 2>/dev/null || true)
     want=$(jget backup_sha256 2>/dev/null || true)
     [ -n "$path" ] && [ -n "$want" ] || return 1
+    # A recovery point is only recorded when it is fully described. Checking the
+    # path and hash alone accepted a half-committed record and then wrote `done`
+    # over a backup with no byte count and no TOC.
+    for k in backup_bytes backup_toc_lines backup_at; do
+        jget "$k" >/dev/null 2>&1 || return 1
+    done
     [ -f "$path" ] || return 1
     got=$(sha256_of "$path")
     [ "$got" = "$want" ]
 }
 
 backup_usable() {
-    local path want got
+    local path want got k
     path=$(jget backup_path 2>/dev/null || true)
     want=$(jget backup_sha256 2>/dev/null || true)
     if [ -z "$path" ] || [ -z "$want" ]; then
         log "ERROR: the journal records no backup; there is no recovery point for this switch"
         return 1
     fi
+    # A backup the journal only half-describes is not a recovery point. Saying so
+    # here keeps a partial record from passing the resume gates that read it.
+    for k in backup_bytes backup_toc_lines backup_at; do
+        if ! jget "$k" >/dev/null 2>&1; then
+            log "ERROR: the recorded backup is incomplete: $k is missing"
+            log "        a partially committed backup record cannot stand as the recovery point"
+            return 1
+        fi
+    done
     if [ ! -f "$path" ]; then
         log "ERROR: the recorded backup $path is missing"
         return 1
@@ -1600,6 +1713,40 @@ migration_attempt_state() { jget migration_attempt 2>/dev/null || printf '%s' "$
 
 migration_outcome_verified() { [ "$(jget migration_outcome 2>/dev/null || true)" = verified ]; }
 
+# migration_settled: no migration command has been started, or the one that was
+# started committed a complete verified result together with `stage=migrated`.
+#
+# This is the only test a resume may use to decide "may the first migration run
+# now". `stage=backup` alone is not it: an interrupted commit, a journal from an
+# older revision, or a `--once` write that landed without its companions all
+# leave the attempt keys behind while the stage still reads `backup`, and running
+# `up` over that is exactly the double migration this revision forbids.
+# migration_missing_facts: the result keys a settled migration must carry but the
+# journal does not hold. Used only for the operator-facing message.
+migration_missing_facts() {
+    local k
+    for k in migration_attempt migration_outcome migrate_rc ledger_after \
+             migration_ledger_rows migration_tables migration_indexes migration_verified_at; do
+        jget "$k" >/dev/null 2>&1 || printf '%s ' "$k"
+    done
+    printf '\n'
+}
+
+migration_settled() {
+    case $(migration_attempt_state) in
+        "$MIGRATION_ATTEMPT_NONE") return 0 ;;
+    esac
+    migration_outcome_verified || return 1
+    # A verified outcome is only half the proof: every fact the result consists
+    # of must be there, or the commit was partial.
+    local k
+    for k in migration_attempt migration_outcome migrate_rc ledger_after \
+             migration_ledger_rows migration_tables migration_indexes migration_verified_at; do
+        jget "$k" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
 step_migrate() {
     local dburl rc lm lr tc ix
     log "== migrate: /app/migrate up from the exact .2 backend image (no server, no worker) =="
@@ -1610,10 +1757,21 @@ step_migrate() {
     backup_usable || { log "ERROR: migrate was not attempted"; return $EXIT_FREEZE; }
     writers_stopped || { log "ERROR: migrate was not attempted; stop the writers first"; return $EXIT_FREEZE; }
 
-    # This is an operator path, never a retry path. If a previous attempt exists
-    # without a verified outcome, refuse before touching anything.
-    if [ "$(migration_attempt_state)" != "$MIGRATION_ATTEMPT_NONE" ] && ! migration_outcome_verified; then
-        log "REFUSE: an earlier migration attempt here never produced a verified schema."
+    # A migration command that was started and did not commit a complete result
+    # has no automatic path forward. This is checked against the journal's real
+    # contents, never against the stage alone: an interrupted commit can leave
+    # `stage=backup` while `migration_attempt` is already set, and that state must
+    # not read as "never migrated".
+    if ! migration_settled; then
+        log "REFUSE: an earlier migration attempt here never committed a complete, verified result."
+        migration_latch_report
+        return $EXIT_REFUSED
+    fi
+    if migration_outcome_verified; then
+        log "REFUSE: migration_attempt=$(migration_attempt_state) but stage is '$stage'."
+        log "        A verified migration must be recorded with stage=migrated in one write;"
+        log "        this journal has the facts without the stage, so it was written by an"
+        log "        older or interrupted run. Migrating again over it is not authorised."
         migration_latch_report
         return $EXIT_REFUSED
     fi
@@ -1669,26 +1827,22 @@ step_migrate() {
         return $EXIT_MIGRATE
     fi
 
-    # Command 0 and every counter verified. Only now is the outcome recorded,
-    # and only with the stage commit below can a resume act on it.
-    if ! jset migration_outcome verified; then
-        migration_latch_failed "cannot record the verified outcome" "$lm" "$lr" "$tc" "$ix"
-        log "ERROR: cannot record migration_outcome=verified; the attempt stays latched"
-        return $EXIT_MIGRATE
-    fi
-    jset migration_attempt "$MIGRATION_ATTEMPT_DONE" >/dev/null 2>&1
-    jset migrate_rc 0 >/dev/null 2>&1
-    jset ledger_after "$lm" --once >/dev/null 2>&1
-    jset migration_ledger_rows "$lr" --once >/dev/null 2>&1
-    jset migration_tables "$tc" --once >/dev/null 2>&1
-    jset migration_indexes "$ix" --once >/dev/null 2>&1
-    if ! jset migration_verified_at "$(date '+%F %T')"; then
-        migration_latch_failed "cannot record migration_verified_at" "$lm" "$lr" "$tc" "$ix"
-        log "ERROR: cannot record migration_verified_at; the attempt stays latched"
-        return $EXIT_MIGRATE
-    fi
-    if ! stage_set migrated; then
-        log "ERROR: cannot record stage 'migrated'; the migration is verified but unrecorded, so a re-run will refuse"
+    # Command 0 and every counter verified. The complete result and the stage are
+    # one transition: writing the facts first and the stage afterwards is what
+    # let a failed last rename leave `stage=backup` with a finished migration
+    # recorded, and the next run migrated a second time.
+    if ! jcommit migrated \
+            "migration_attempt=$MIGRATION_ATTEMPT_DONE" \
+            "migration_outcome=verified" \
+            "migrate_rc=0" \
+            "ledger_after=$lm" \
+            "migration_ledger_rows=$lr" \
+            "migration_tables=$tc" \
+            "migration_indexes=$ix" \
+            "migration_verified_at=$(date '+%F %T')"; then
+        migration_latch_failed "cannot commit the verified migration result" "$lm" "$lr" "$tc" "$ix"
+        log "ERROR: the migration is verified but its result could not be committed with"
+        log "       stage=migrated; the attempt stays latched and a re-run will refuse"
         return $EXIT_MIGRATE
     fi
     return 0
@@ -1700,15 +1854,20 @@ step_migrate() {
 # attempt key is never cleared and no `outcome=verified` is written, so every
 # later `run` refuses before it reaches the step again.
 migration_latch_failed() {
-    local reason=$1 lm=$2 lr=$3 tc=$4 ix=$5
-    jset migration_outcome "failed: $reason" >/dev/null 2>&1 \
-        || log "WARNING: cannot record the migration outcome; migration_attempt=$MIGRATION_ATTEMPT_PENDING is the latch"
-    jset migration_observed "ledger=$lm rows=$lr tables=$tc indexes=$ix" >/dev/null 2>&1
-    # `migrate_failed` is written by the caller when it already has a better value
-    # (the raw exit code); the reason is the fallback and never overwrites it.
-    jset migrate_failed "$reason" --once >/dev/null 2>&1
-    # The stage deliberately stays at `backup`: the position did not advance, and
-    # the latch — attempt without a verified outcome — is what makes a re-run
+    local reason=$1 lm=$2 lr=$3 tc=$4 ix=$5 failed
+    # The latch is the attempt key, already on disk before the command ran. These
+    # facts describe the failure for the operator; none of them is what makes the
+    # next run refuse, so a failure to write them cannot open the door. They are
+    # written in one transition anyway, so a reader never sees half a diagnosis.
+    failed=$(jget migrate_failed 2>/dev/null || true)
+    if ! jcommit "$(jget stage 2>/dev/null || printf 'backup')" \
+            "migration_outcome=failed: $reason" \
+            "migration_observed=ledger=$lm rows=$lr tables=$tc indexes=$ix" \
+            "migrate_failed=${failed:-$reason}"; then
+        log "WARNING: cannot record the failure detail; the attempt key is still the latch"
+    fi
+    # The stage deliberately stays where it was: the position did not advance, and
+    # the latch — an attempt without a verified outcome — is what makes a re-run
     # refuse. Moving the stage would suggest a step completed.
     log "MIGRATION NOT VERIFIED ($reason)."
     log "  the attempt is recorded and no verified schema authorises continuing."
@@ -1798,12 +1957,32 @@ step_switch() {
 }
 
 step_cli() {
-    local staged installed_sha installed_ver old_mode old_uid old_gid exec_start
+    local staged installed_sha installed_ver old_mode old_uid old_gid rc=0 code
     log "== cli: install the frozen CLI, then the approved upgrade script (backend is already .2) =="
+
+    # Nothing is replaced until the world this install assumes has been read
+    # again. `switch` proved the candidate when it started it; a resume from
+    # `switched` runs later, possibly after the backend was rolled back or the
+    # frontend died, and replacing the CLI and updater first would mean mutating
+    # the deployment on the strength of a stale claim.
+    health_ok || rc=$?
+    candidates_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    schema_ok || { code=$?; [ "$rc" -eq 0 ] && rc=$code; }
+    if [ "$rc" -ne 0 ]; then
+        log "REFUSE: the candidate is not the verified .2 deployment right now, so nothing was installed."
+        log "        A resume re-proves the candidate before it touches the CLI or the updater."
+        return "$rc"
+    fi
+
+    # The staged sources, verified again immediately before the copy: the state
+    # directory is writable between runs, and a script that no longer matches its
+    # recorded hash must fail here rather than be installed and detected after.
+    staged_assets_ok || {
+        log "REFUSE: a staged asset no longer matches the journal, so nothing was installed."
+        return $EXIT_CLI
+    }
     staged="$ASSETS/cli/unpack/multica"
     [ -x "$staged" ] || { log "ERROR: staged CLI missing at $staged"; return $EXIT_CLI; }
-    [ "$(sha256_of "$staged")" = "$(jget cli_binary_sha256)" ] || {
-        log "ERROR: staged CLI hash changed since prepare"; return $EXIT_CLI; }
 
     # The environment assertion comes first: a unit that no longer executes the
     # maintained script must fail this step before any file is replaced.
@@ -1964,7 +2143,18 @@ step_thaw() {
         report_state
         return "$rc"
     fi
-    if ! stage_set "done"; then
+    # `done` is the only stage that tells the operator the window is closed, so it
+    # is written last and read back. A journal missing one of its facts — the
+    # half-written record a failed `--once` write leaves — must not be reported as
+    # a completed maintenance just because every live check passed.
+    if ! jcommit "done" "completed_at=$(date '+%F %T')"; then
+        log "ERROR: the maintenance succeeded but the terminal stage could not be recorded"
+        return $EXIT_ROLLBACK
+    fi
+    if ! journal_complete "done"; then
+        log "REFUSE: the terminal journal is incomplete after the final write; not reporting"
+        log "        a completed maintenance. The live system is in its final state, but the"
+        log "        record of it is not, so the next reader cannot trust the stage."
         return $EXIT_ROLLBACK
     fi
     log "maintenance complete: backend/web/CLI on .2, schema 660, services restored"
@@ -2131,6 +2321,27 @@ staged_assets_ok() {
     return "$rc"
 }
 
+# prepared_state_ok: the read-only re-verification a resume needs before its
+# first side effect. It is the same comparison `prepare` makes when it re-checks
+# an existing snapshot — the journal's recorded hashes against the files on disk
+# — plus the two staged release inputs that `cli` will install later.
+#
+# It deliberately reuses `verify_existing_snapshot` rather than restating the
+# list: a second copy of "what the snapshot consists of" is what let this check
+# and the install-time check drift apart.
+prepared_state_ok() {
+    # `verify_existing_snapshot` already covers the snapshot files, the two
+    # staged release inputs, and the live host files the snapshot describes, and
+    # it logs exactly which item drifted. Reusing it keeps one definition of
+    # "what the snapshot consists of" instead of a second copy that can drift.
+    local rc=0
+    VERIFY_SNAPSHOT_QUIET=1 verify_existing_snapshot || rc=1
+    # One line on success, so the operator can see the window was opened on
+    # verified state; the item-by-item detail would only repeat prepare's output.
+    [ "$rc" -ne 0 ] || log "prepared state re-verified: snapshot, staged assets and host binding all match the journal"
+    return "$rc"
+}
+
 # final_acceptance: everything a `done` journal is allowed to mean, measured on
 # the live system. Called by `verify`, by `thaw` before it starts anything, and
 # by `thaw` again after the units are back — the last read before `done` is
@@ -2169,12 +2380,26 @@ final_acceptance() {
 #     A previous run's `verified` authorises nothing about now; it is thaw's
 #     input, and thaw starts units.
 resume_preconditions() {
-    local stage=$1 start=$2 outcome observed
+    local stage=$1 start=$2 outcome observed failed
 
-    # `freeze` is the first step: nothing has been claimed yet beyond the
-    # snapshot, which `journal_complete` already validated.
+    # `freeze` is the first side effect of the window: it stops five units and
+    # the two containers. Before that happens, the snapshot, the staged release
+    # inputs and the host binding must still be exactly what prepare recorded.
+    #
+    # `journal_complete` only proves the keys are present — it says nothing about
+    # whether the files those keys describe still match. Without this, a tampered
+    # staged updater was discovered by the `cli` step after the writers had been
+    # stopped and the migration had run.
     case $start in
-        freeze) return 0 ;;
+        freeze)
+            prepared_state_ok || {
+                log "REFUSE: the prepared snapshot, the staged assets or the host binding"
+                log "        no longer match the journal, so nothing was stopped or changed."
+                log "        Restore the recorded versions, or archive $STATE_DIR and prepare again."
+                return 1
+            }
+            return 0
+            ;;
     esac
 
     # Everything up to and including `switch` runs with the application down:
@@ -2190,27 +2415,60 @@ resume_preconditions() {
             ;;
     esac
 
-    # A migration command that was started and did not reach a verified schema
-    # has no automatic path forward, whatever the remaining steps would be.
-    # `backup` is the only start that has not migrated yet, so it is exempt; every
-    # later start must see the verified outcome.
-    if [ "$start" != "backup" ]; then
-        if [ "$(migration_attempt_state)" = "$MIGRATION_ATTEMPT_NONE" ] || ! migration_outcome_verified; then
-            outcome=$(jget migration_outcome 2>/dev/null || printf 'none')
-            observed=$(jget migration_observed 2>/dev/null || true)
-            log "REFUSE: a migration already failed here (migrate_failed=$(jget migrate_failed 2>/dev/null || printf 'none'),"
-            log "        outcome=$outcome, migration_attempt=$(migration_attempt_state))."
-            log "        Stage '$stage' claims the migration finished; this journal has no verified attempt."
-            if [ -n "$observed" ]; then
-                log "        schema when the attempt stopped: $observed"
-            fi
-            log "        schema now: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
-            log "        An unverified migration is a latch: re-running is not an automatic licence to"
-            log "        continue over a possibly half-migrated database. rollback-r1 restores the old"
-            log "        images only and refuses an unknown schema shape."
-            return 1
+    # Two questions, not one: has a migration command been started, and if so did
+    # it commit a complete verified result?
+    #
+    #   * `backup` with no attempt is a clean, normally-reached boundary — the
+    #     window was frozen and dumped, and the first migration has not run. It
+    #     must be resumable; requiring a verified outcome here made the ordinary
+    #     "stopped before the migration" case unrecoverable.
+    #   * `backup` with an attempt that never committed is a latch.
+    #   * `migrated` and later require the complete committed result.
+    #
+    # The stage is deliberately not the input to this decision alone; see
+    # migration_settled.
+    if ! migration_settled; then
+        outcome=$(jget migration_outcome 2>/dev/null || printf 'none')
+        observed=$(jget migration_observed 2>/dev/null || true)
+        failed=$(jget migrate_failed 2>/dev/null || true)
+        if [ -n "$failed" ]; then
+            log "REFUSE: a migration already failed here (migrate_failed=$failed)."
+        else
+            log "REFUSE: a migration was started here and never committed a complete verified result."
         fi
+        log "        (migration_attempt=$(migration_attempt_state), outcome=$outcome)."
+        # Only meaningful for a verified-but-partial record; a failed attempt has
+        # no result to be missing.
+        if migration_outcome_verified; then
+            log "        the result is incomplete: $(migration_missing_facts | tr '\n' ' ')"
+            log "        a verified migration must be committed with stage=migrated in one write;"
+            log "        this journal has the outcome without its facts, so it was interrupted"
+        fi
+        if [ -n "$observed" ]; then
+            log "        schema when the attempt stopped: $observed"
+        fi
+        log "        schema now: ledger=$(ledger_max) rows=$(ledger_rows) tables=$(table_count) indexes=$(index_state)"
+        log "        Re-running is not an automatic licence to continue over a possibly half-migrated"
+        log "        database. rollback-r1 restores the old images only and refuses an unknown schema"
+        log "        shape. Inspect the real schema and hand the decision to the operator."
+        return 1
     fi
+    # `backup` and `migrate` both run *before* a committed migration: `backup`
+    # is the stage, `migrate` is the step it maps to. Neither may demand a
+    # verified outcome — that is the transition they are about to make.
+    case $start in
+        backup|migrate) ;;
+        *)
+            # Past the migration, the settled result is a precondition, not an
+            # optional fact: without it the stage claims a step nobody proved.
+            migration_outcome_verified || {
+                log "REFUSE: stage '$stage' claims the migration finished, but this journal records"
+                log "        no verified attempt (migration_attempt=$(migration_attempt_state))."
+                log "        Nothing was changed; the migration has not been proved to have run."
+                return 1
+            }
+            ;;
+    esac
 
     # From `migrate` on there is a recovery point to re-prove. (The migrate step
     # re-checks it too; here it fails before any step is entered.)

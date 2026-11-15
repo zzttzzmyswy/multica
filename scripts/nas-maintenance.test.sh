@@ -449,6 +449,7 @@ world_post_switch() {
     jset backup_sha256 "$(sha256sum "$CUR/backup/world.dump" | awk '{ print $1 }')"
     jset backup_bytes 10
     jset backup_toc_lines 500
+    jset backup_at '2026-01-01 00:00:00'
     jset migration_attempt "done"
     jset migration_outcome verified
     jset migrate_rc 0
@@ -456,6 +457,7 @@ world_post_switch() {
     jset migration_ledger_rows 684
     jset migration_tables 148
     jset migration_indexes 799/0/0
+    jset migration_verified_at '2026-01-01 00:00:00'
     jset switched_commit "$REV_NEW"
     # A world at 'cli' has already installed both artifacts, so the fixture
     # installs them instead of only writing the journal keys.
@@ -989,13 +991,24 @@ fi
 step "a staged CLI that changed after prepare is not installed"
 new_case cli-tampered
 prepare_ok
+cli_before="$(sha256sum "$CUR/cli-bin/multica" | awk '{ print $1 }')"
+script_before="$(sha256sum "$CUR/scripts/upgrade-multica.sh" | awk '{ print $1 }')"
 printf '#!/usr/bin/env bash\nprintf "multica %s (commit: deadbee, built: 2026-01-01T00:00:00Z)\\n"\n' "$CLI_VERSION_NEW" \
     >"$CUR/state-dir/assets/cli/unpack/multica"
 chmod 755 "$CUR/state-dir/assets/cli/unpack/multica"
+mark_calls cli-tampered
 run_script run --intent=switch --config "$CUR_CONFIG"
-expect_rc 60
-expect_log 'staged CLI hash changed since prepare' 'refuses a mutated staged binary'
-expect_sha "$CUR/cli-bin/multica" "$(sha256sum "$CUR/state-dir/assets/previous/multica" | awk '{ print $1 }')"
+# The refusal now happens before the window is opened at all: the staged binary
+# is part of what `prepared` means, so it is checked before the first side effect
+# rather than at install time.
+expect_rc 80
+expect_log 'staged asset .* no longer matches' 'refuses a mutated staged binary'
+expect_no_log 'maintenance complete' 'never claims completion'
+expect_no_call_since_mark 'systemctl stop' 'stopped nothing'
+expect_no_call_since_mark 'docker run' 'migrated nothing'
+expect_no_call_since_mark 'compose .* up' 'started nothing'
+expect_sha "$CUR/cli-bin/multica" "$cli_before"
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$script_before"
 
 step "an upgrade unit repointed between prepare and run fails the CLI step"
 new_case cli-wrong-unit
@@ -2471,6 +2484,307 @@ if reach_stage verified; then
     expect_rc 0
     expect_journal stage "done"
     expect_log 'maintenance complete' 'completes once the drift is repaired'
+fi
+
+# ---------------------------------------------------------------------------
+# C: atomic evidence commits and pre-side-effect verification.
+#
+# Round 3 found that several transitions wrote their facts and their stage as
+# separate renames, so an interruption between them produced a journal that read
+# like a different state than the host was in. Every case below injects a failure
+# at one exact write and then asserts on the things an exit code cannot show:
+# how many times a command ran, whether a file on disk changed, and whether the
+# journal holds the complete set of facts it claims.
+# ---------------------------------------------------------------------------
+
+# install_mv_fault <signature> [kill]
+#
+# A `mv` placed ahead of the real one on PATH. It matches the committed journal
+# by *content* — the signature must appear in the temp file being renamed — so a
+# case can fail exactly one transition and let every other one through. Matching
+# on the transition's position would fail whichever write happened to be first.
+#
+# With "kill" the rename is performed and then the executor is signalled, which
+# is how a process interruption at a known point is reproduced without racing.
+install_mv_fault() {
+    # The signature is read from mv-fault-sig by the stub, not by this function;
+    # $1 documents it at the call site.
+    local _sig=$1 action=${2:-fail} dir="$CUR/fault-stubs"
+    mkdir -p "$dir"
+    cp -a "$STUBS/systemctl" "$STUBS/docker" "$STUBS/curl" "$dir/"
+    cat >"$dir/mv" <<STUB
+#!/usr/bin/env bash
+sig=\$(cat "\$TB/state/opt/mv-fault-sig" 2>/dev/null)
+dst=\${!#}
+src=\${@: -2:1}
+if [ -n "\$sig" ] && [ "\$dst" = "\$TB/state-dir/journal" ] && grep -qF -- "\$sig" "\$src" 2>/dev/null; then
+    rm -f "\$TB/state/opt/mv-fault-sig"
+    if [ "$action" = kill ]; then
+        /usr/bin/mv "\$@" || exit \$?
+        cmd=\$(tr '\\0' ' ' <"/proc/\$PPID/cmdline")
+        case "\$cmd" in *nas-maintenance.sh*run*) kill -TERM "\$PPID" ;; *) exit 99 ;; esac
+        exit 0
+    fi
+    exit 1
+fi
+exec /usr/bin/mv "\$@"
+STUB
+    chmod +x "$dir/mv"
+    RUN_STUBS="$dir"
+}
+
+run_faulty() {
+    local saved=$STUBS
+    STUBS="$RUN_STUBS"
+    run_script "$@"
+    STUBS=$saved
+}
+
+# Counts that survive `grep` finding nothing: `grep -c` prints 0 *and* exits 1,
+# so a bare `|| printf 0` would append a second zero.
+count_calls() { grep -c -- "$1" "$CUR/state/calls.log" 2>/dev/null | head -1; }
+migration_calls() { local n; n=$(count_calls '^docker run '); printf '%s' "${n:-0}"; }
+unit_stop_calls() { local n; n=$(count_calls '^systemctl stop '); printf '%s' "${n:-0}"; }
+
+step "C1: a failed migrated commit does not authorise a second migration"
+# The commit that carries the verified result *and* stage=migrated is refused.
+# What must be true afterwards: the result facts are not on disk without the
+# stage, and a retry does not run the migration a second time.
+new_case migrated-commit-fail
+prepare_ok
+# Fail the rename that carries `stage=migrated`. On a revision that writes the
+# result first and the stage second, this leaves the result on disk without the
+# stage — the exact state that made a retry migrate twice. On this revision both
+# are in one write, so the whole transition is refused and nothing lands.
+install_mv_fault 'stage=migrated'
+stub_opt mv-fault-sig 'stage=migrated'
+run_faulty run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the run failed (exit $RC)"; else bad "the run reported success without committing its stage"; fi
+# The failure record legitimately writes `migration_outcome=failed: ...`; what
+# must never appear is a *verified* outcome, because that is the fact a resume
+# reads as "the migration is done".
+if [ "$(journal_get migration_outcome 2>/dev/null)" = verified ]; then
+    bad "a verified migration outcome was committed without stage=migrated"
+else
+    ok "no verified migration result was committed without its stage"
+fi
+expect_journal migration_attempt pending
+expect_journal stage backup
+first_calls="$(migration_calls)"
+if [ "$first_calls" = 1 ]; then ok "the migration ran once"; else bad "the migration ran $first_calls times"; fi
+stub_opt mv-fault-sig
+mark_calls migrated-retry
+run_faulty run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the retry refused (exit $RC)"; else bad "the retry reported success"; fi
+expect_no_log 'maintenance complete' 'never claims completion'
+after_calls="$(migration_calls)"
+if [ "$after_calls" = "$first_calls" ]; then
+    ok "the retry did not run the migration again ($after_calls calls)"
+else
+    bad "migration calls went $first_calls -> $after_calls"
+fi
+expect_no_call_since_mark 'compose .* up' 'the application was not started'
+
+step "C2: a partially written migration result cannot reach done"
+new_case migration-fact-write-fail
+prepare_ok
+# Fail only the commit that carries the verified result, leaving the attempt and
+# every live check intact. The run must not exit 0.
+install_mv_fault 'migration_outcome=verified'
+stub_opt mv-fault-sig 'migration_outcome=verified'
+run_faulty run --intent=switch --config "$CUR_CONFIG"
+stub_opt mv-fault-sig
+if [ "$RC" -ne 0 ]; then ok "the run failed (exit $RC)"; else bad "the run reported success with no committed result"; fi
+if [ "$(journal_get stage)" = "done" ]; then bad "the journal reached done"; else ok "the journal did not reach done"; fi
+for k in migration_tables migration_indexes migration_verified_at; do
+    if journal_get "$k" >/dev/null 2>&1; then
+        bad "journal holds $k even though the commit failed"
+    else
+        ok "journal has no $k"
+    fi
+done
+if [ "$(journal_get migration_outcome 2>/dev/null)" = verified ]; then
+    bad "the failed commit still recorded a verified outcome"
+else
+    ok "the failed commit did not record a verified outcome"
+fi
+
+step "C2: a done journal is only written together with its completion fact"
+new_case done-completes-journal
+prepare_ok
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+expect_journal completed_at "$(journal_get completed_at)"
+if journal_get completed_at >/dev/null 2>&1; then
+    ok "the terminal stage carries its completion time"
+else
+    bad "the terminal stage was written without completed_at"
+fi
+# And the whole record must still satisfy the done-stage key list.
+run_script status --config "$CUR_CONFIG"
+expect_rc 0
+expect_no_log 'CORRUPT' 'the terminal journal is not corrupt'
+
+step "C3: a clean backup with no migration attempt continues the first migration"
+# The ordinary "the window stopped before migrating" state, built through the
+# real flow: a full backup is committed and the process is interrupted right
+# after. That leaves stage=backup with a complete recovery point and no attempt
+# key — which must be resumable, and must run the first migration.
+new_case backup-clean-resume
+prepare_ok
+install_mv_fault 'backup_path=' kill
+stub_opt mv-fault-sig 'backup_path='
+run_faulty run --intent=switch --config "$CUR_CONFIG"
+stub_opt mv-fault-sig
+if [ "$(journal_get stage)" = "backup" ]; then
+    ok "the window stopped at backup"
+else
+    bad "could not arrange a clean backup stage (stage=$(journal_get stage))"
+fi
+# A clean backup: the recovery point is fully described and nothing migrated.
+expect_no_journal migration_attempt
+for k in backup_path backup_sha256 backup_bytes backup_toc_lines backup_at; do
+    if journal_get "$k" >/dev/null 2>&1; then
+        ok "the recovery point is complete ($k)"
+    else
+        bad "the recovery point has no $k"
+    fi
+done
+before="$(migration_calls)"
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+expect_journal stage "done"
+after="$(migration_calls)"
+if [ "$after" -gt "$before" ]; then
+    ok "the resume ran the first migration ($before -> $after)"
+else
+    bad "the resume did not run the migration ($before -> $after)"
+fi
+expect_log 'maintenance complete' 'completes the window'
+
+step "C4: a drifted candidate is refused before the CLI and updater are replaced"
+# Reach `switched` through the real flow (the staged CLI made non-executable
+# stops the cli step after switch committed), then restore it and drift the
+# candidate. Nothing may be installed once the candidate is wrong.
+new_case switched-drift-before-install
+prepare_ok
+chmod 644 "$CUR/state-dir/assets/cli/unpack/multica"
+run_script run --intent=switch --config "$CUR_CONFIG"
+chmod 755 "$CUR/state-dir/assets/cli/unpack/multica"
+if [ "$(journal_get stage)" = "switched" ]; then
+    ok "the window stopped at switched"
+else
+    bad "could not stop at switched (stage=$(journal_get stage))"
+fi
+cli_sha_before="$(sha256sum "$CUR/cli-bin/multica" | awk '{ print $1 }')"
+script_sha_before="$(sha256sum "$CUR/scripts/upgrade-multica.sh" | awk '{ print $1 }')"
+set_container multica-backend-1 "$BACKEND_IMAGE_OLD"
+mark_calls switched-drift
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success over a drifted candidate"; fi
+expect_sha "$CUR/cli-bin/multica" "$cli_sha_before"
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$script_sha_before"
+expect_no_call_since_mark 'systemctl start' 'started no unit'
+expect_no_log 'maintenance complete' 'never claims completion'
+
+step "C4: each candidate dimension is checked before the install"
+# The same case for the frontend and the schema: the CLI and updater must be
+# untouched in every one of them.
+for drift in frontend schema; do
+    if [ "$drift" = frontend ]; then
+        step "C4: a frontend that stopped before the resume blocks the install"
+    else
+        step "C4: a schema that regressed before the resume blocks the install"
+    fi
+    new_case "switched-drift-$drift"
+    prepare_ok
+    chmod 644 "$CUR/state-dir/assets/cli/unpack/multica"
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    chmod 755 "$CUR/state-dir/assets/cli/unpack/multica"
+    cli_sha_before="$(sha256sum "$CUR/cli-bin/multica" | awk '{ print $1 }')"
+    script_sha_before="$(sha256sum "$CUR/scripts/upgrade-multica.sh" | awk '{ print $1 }')"
+    if [ "$drift" = frontend ]; then
+        printf 'false\n' >"$CUR/state/containers/multica-frontend-1.running"
+        printf 'exited\n' >"$CUR/state/containers/multica-frontend-1.status"
+    else
+        printf '616_member_pinned\n' >"$CUR/state/ledger"
+    fi
+    run_script run --intent=switch --config "$CUR_CONFIG"
+    if [ "$RC" -ne 0 ]; then ok "the resume refused (exit $RC)"; else bad "the resume reported success"; fi
+    expect_sha "$CUR/cli-bin/multica" "$cli_sha_before"
+    expect_sha "$CUR/scripts/upgrade-multica.sh" "$script_sha_before"
+    expect_no_log 'maintenance complete' 'never claims completion'
+done
+
+step "C5: tampered staged assets stop the window before it opens"
+new_case prepared-updater-tamper
+prepare_ok
+target_before="$(sha256sum "$CUR/scripts/upgrade-multica.sh" | awk '{ print $1 }')"
+printf '# tampered staged source\n' >>"$CUR/state-dir/assets/approved-upgrade-multica.sh"
+mark_calls prepared-tamper
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the run refused (exit $RC)"; else bad "the run reported success over a tampered staged asset"; fi
+stops="$(unit_stop_calls)"; stops=${stops:-0}
+if [ "$stops" -eq 0 ]; then ok "stopped no unit before noticing"; else bad "stopped $stops units before noticing"; fi
+migs="$(migration_calls)"; migs=${migs:-0}
+if [ "$migs" -eq 0 ]; then ok "ran no migration before noticing"; else bad "ran the migration $migs times before noticing"; fi
+expect_no_call_since_mark 'compose .* up' 'started no container'
+expect_sha "$CUR/scripts/upgrade-multica.sh" "$target_before"
+expect_no_log 'maintenance complete' 'never claims completion'
+
+step "C5: a snapshot that drifted after prepare stops the window before it opens"
+new_case prepared-snapshot-drift
+prepare_ok
+printf '\n# drifted\n' >>"$CUR/state-dir/assets/compose/docker-compose.initial.yml"
+mark_calls prepared-snapshot
+run_script run --intent=switch --config "$CUR_CONFIG"
+if [ "$RC" -ne 0 ]; then ok "the run refused (exit $RC)"; else bad "the run reported success over a drifted snapshot"; fi
+stops="$(unit_stop_calls)"; stops=${stops:-0}
+if [ "$stops" -eq 0 ]; then ok "stopped no unit"; else bad "stopped $stops units"; fi
+migs="$(migration_calls)"; migs=${migs:-0}
+if [ "$migs" -eq 0 ]; then ok "ran no migration"; else bad "ran the migration $migs times"; fi
+
+step "C6: an interrupted backup record never becomes a recovery point"
+new_case backup-partial-record
+prepare_ok
+# Fail the one commit that would publish the backup facts and stage. The dump
+# itself exists on disk; the record must not claim a recovery point exists.
+install_mv_fault 'backup_toc_lines='
+stub_opt mv-fault-sig 'backup_toc_lines='
+run_faulty run --intent=switch --config "$CUR_CONFIG"
+stub_opt mv-fault-sig
+if [ "$RC" -ne 0 ]; then ok "the run failed (exit $RC)"; else bad "the run reported success with no committed backup"; fi
+expect_journal stage frozen
+for k in backup_path backup_sha256 backup_bytes backup_toc_lines; do
+    if journal_get "$k" >/dev/null 2>&1; then
+        bad "journal holds $k without the stage that describes it"
+    else
+        ok "journal has no $k"
+    fi
+done
+# The retry takes a backup and must end with one fully described recovery point.
+run_script run --intent=switch --config "$CUR_CONFIG"
+expect_rc 0
+for k in backup_path backup_sha256 backup_bytes backup_toc_lines backup_at; do
+    if journal_get "$k" >/dev/null 2>&1; then
+        ok "the recovery point is recorded with $k"
+    else
+        bad "the recovery point has no $k"
+    fi
+done
+recorded="$(journal_get backup_path)"
+expect_sha "$recorded" "$(journal_get backup_sha256)"
+if [ "$(journal_get backup_bytes)" = "$(stat -c '%s' "$recorded")" ]; then
+    ok "the recorded byte count matches the file"
+else
+    bad "the recorded byte count does not match the file"
+fi
+# Every dump an earlier attempt left behind is kept as evidence.
+if [ "$(dump_count)" -ge 2 ]; then
+    ok "the interrupted attempt's dump was kept ($(dump_count) dumps)"
+else
+    bad "an earlier dump was deleted ($(dump_count) dumps)"
 fi
 
 # ---------------------------------------------------------------------------

@@ -224,20 +224,38 @@ actually finished, and a resume re-measures the world before it acts:
 
 | stage | a re-run may | journal must already hold |
 | --- | --- | --- |
-| `prepared` | `freeze` | the snapshot and the staged release inputs |
-| `frozen` | retry `backup` | + `freeze_at`; writers are down, no dump yet |
-| `backup` | `migrate` | + the recorded, verified dump |
-| `migrated` | `switch` | + `migration_attempt` with `migration_outcome=verified` and the schema counters that gate saw |
-| `switched` | `cli` | + the revision the candidate reported |
-| `cli` | `verify` | + the hashes of both installed artifacts |
+| `prepared` | `freeze`, after re-verifying the snapshot and staged inputs | the snapshot, the staged release inputs, and a host that still matches them |
+| `frozen` | retry `backup` | `freeze_at`; writers are down, no dump yet |
+| `backup`, no attempt | `migrate` — this is the first one | `freeze_at` + a fully described dump; **no** `migration_attempt` |
+| `backup`, attempt without a committed result | nothing automatic | — the attempt key is the latch |
+| `migrated` | `switch` | `migration_attempt` with `migration_outcome=verified` **and** every result counter |
+| `switched` | `cli`, after re-verifying the candidate | the revision, both digests, a serving frontend, the 660 schema, and both staged sources |
+| `cli` | `verify` | the hashes of both installed artifacts |
 | `verified` | `thaw` | same as `cli` — `verify` adds no fact of its own |
-| `done` | nothing | terminal |
+| `done` | nothing | terminal, plus `completed_at` |
 
-`frozen` is deliberately **not** required to carry a backup. A failed or
-interrupted `pg_dump` leaves exactly that stage, and the operator's remedy is to
-fix the cause and take the backup — not to abandon the window or edit the journal.
-A retried dump never overwrites the bytes an earlier attempt left behind, and a
-backup the journal already recorded is reused rather than replaced.
+Two boundaries are worth stating because they are the ones a naive reading gets
+wrong:
+
+- **`frozen` is not required to carry a backup.** A failed or interrupted
+  `pg_dump` leaves exactly that stage, and the operator's remedy is to fix the
+  cause and take the backup — not to abandon the window or edit the journal. A
+  retried dump never overwrites the bytes an earlier attempt left behind, and a
+  backup the journal already recorded in full is reused rather than replaced.
+- **`backup` does not mean "a migration was attempted".** The ordinary window
+  that stopped before migrating is at `backup` with no attempt key, and must be
+  able to run the first migration. What forbids a re-run is a `migration_attempt`
+  that never committed a complete result — never the stage name.
+
+### Every transition that carries evidence is one write
+
+The journal is replaced by rename, so a transition is atomic only if everything
+it says is written at once. Writing the facts first and the stage afterwards left
+states no rule covers: `stage=backup` with `migration_outcome=verified` recorded
+(the next run migrated a second time), or `stage=frozen` with only a backup path
+(the retry built a second dump and mixed the two records). Each such transition —
+the backup record, the migration result, and the terminal stage — is therefore
+written as a single `jcommit`, and the result is read back before it is claimed.
 
 ### The migration latch
 
