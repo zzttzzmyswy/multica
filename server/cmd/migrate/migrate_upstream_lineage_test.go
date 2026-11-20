@@ -105,11 +105,19 @@ func (f *ledgerFixture) relationCount(t *testing.T) int {
 
 // runOnce applies the given versions' real files through the production code
 // path, with the production preflight enabled.
-func (f *ledgerFixture) runOnce(t *testing.T, versions ...string) error {
+// runOnce drives the production path with the FULL shipped migration set, which
+// is what the lineage preflight assumes. These tests are about refusing a bad
+// ledger before anything runs, so the files are never applied — passing the whole
+// set keeps the preflight enabled rather than opting out via a subset.
+func (f *ledgerFixture) runOnce(t *testing.T, _ ...string) error {
 	t.Helper()
+	files, err := shippedMigrationFiles(t)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return runMigrations(f.ctx, f.pool, runOptions{
 		Direction:             "up",
-		Files:                 realMigrationFiles(t, versions, "up"),
+		Files:                 files,
 		SchemaMigrationsTable: f.table,
 		AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
 		Hooks:                 hooksForDirection("up"),
@@ -180,6 +188,61 @@ func TestMixedLedgerIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "historical upstream candidate") {
 		t.Errorf("refusal should explain the candidate-lineage collision: %v", err)
 	}
+}
+
+// TestRecordedVersionAheadOfItsPredecessorsIsRefused is the acceptance finding
+// for round 2: every name in the ledger is legitimate, but one of them is
+// recorded while the migrations before it are not.
+//
+// Reproduced against a real `v0.9.0-myswy.2` database plus a single added
+// `700_inbox_item_active_shown_idx`: two `up` runs exited 0, the ledger reached
+// 724 rows, and `idx_inbox_active_shown` was never created — the runner saw 700
+// recorded and skipped the only migration that builds it. Name-level checking
+// cannot catch this, because 700 IS a version this build ships.
+func TestRecordedVersionAheadOfItsPredecessorsIsRefused(t *testing.T) {
+	t.Parallel()
+	f := newLedgerFixture(t, "ahead_of_prefix_")
+	// A plausible prefix: the first shipped versions, then a jump to the last.
+	f.seed(t, "001_init", "002_agent_config", "003_task_context")
+	f.seed(t, "700_inbox_item_active_shown_idx")
+	f.seeded = f.ledger(t)
+	f.seededRelations = f.relationCount(t)
+
+	err := f.runOnce(t, "001_init", "002_agent_config", "003_task_context")
+	if err == nil {
+		t.Fatal("run succeeded with a version recorded ahead of its predecessors; it must refuse")
+	}
+	// The message names the first gap — the migration that would be skipped —
+	// which is more actionable than naming the version recorded too early.
+	if !strings.Contains(err.Error(), "004_agent_runtime_loop") {
+		t.Errorf("refusal does not name the missing migration: %v", err)
+	}
+	if !strings.Contains(err.Error(), "contiguous prefix") {
+		t.Errorf("refusal does not explain the ordering rule: %v", err)
+	}
+	f.assertRefusedWithNoSideEffect(t, err, "contiguous prefix")
+}
+
+// A hole in the middle of an otherwise complete ledger is refused too — the
+// ledger must cover a contiguous prefix, not merely start at the beginning and
+// end at the end.
+func TestMidLedgerHoleIsRefused(t *testing.T) {
+	t.Parallel()
+	f := newLedgerFixture(t, "mid_hole_")
+	f.seed(t, "001_init", "002_agent_config", "003_task_context")
+	// 005 recorded, 004 missing.
+	f.seed(t, "005_daemon_pairing")
+	f.seeded = f.ledger(t)
+	f.seededRelations = f.relationCount(t)
+
+	err := f.runOnce(t, "001_init", "002_agent_config", "003_task_context")
+	if err == nil {
+		t.Fatal("run succeeded across a hole in the ledger; it must refuse")
+	}
+	if !strings.Contains(err.Error(), "004_") {
+		t.Errorf("refusal does not name the missing migration: %v", err)
+	}
+	f.assertRefusedWithNoSideEffect(t, err, "004_")
 }
 
 // The other half of the historical upload numbering: the candidate's table and
@@ -425,7 +488,11 @@ func TestLineageTablesMatchTheShippedTree(t *testing.T) {
 		}
 		// An alias must NOT be a file this build ships: otherwise it is not an
 		// alias but a current version, and listing it would hide a rename bug.
-		for _, file := range shippedMigrationFiles(t) {
+		files, err := shippedMigrationFiles(t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range files {
 			if strings.HasSuffix(file, "/"+alias+".up.sql") {
 				t.Errorf("alias %s is also a shipped migration; it does not need an alias", alias)
 			}
@@ -441,13 +508,9 @@ func TestLineageTablesMatchTheShippedTree(t *testing.T) {
 }
 
 // shippedMigrationFiles returns every up-migration path this build ships.
-func shippedMigrationFiles(t *testing.T) []string {
+func shippedMigrationFiles(t *testing.T) ([]string, error) {
 	t.Helper()
-	files, err := migrations.Files("up")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return files
+	return migrations.Files("up")
 }
 
 // leadingMigrationNumber parses the numeric prefix of a migration version such

@@ -212,19 +212,16 @@ it("cancels an in-flight search when the production router switches workspace", 
   await openSearch();
   holdA = true;
   fireEvent.change(input(), { target: { value: "alpha" } });
-  // Every search endpoint the palette issues for scope "all" is held, one request
-  // each. Which endpoints those are depends on feature flags — the fixture enables
-  // docs_v1, so docs search runs too — so derive the expectation from the requests
-  // actually made rather than pinning a count.
-  const issued = () => new Set(
-    requests
-      .filter((request) => request.workspace === "synthetic-a" && request.path.endsWith("/search"))
-      .map((request) => request.path),
-  );
-  await waitFor(() => expect(held.length).toBe(issued().size), NETWORK_WAIT);
-  // One held request per endpoint: a duplicate would mean the same search was
-  // issued twice, which the cancellation below could not distinguish.
-  expect(new Set(held.map((entry) => entry.path)).size).toBe(held.length);
+  // The fixture enables docs_v1, so a scope-"all" search issues exactly three
+  // requests: issues, projects and docs. Name them instead of counting whatever
+  // happened to arrive — a count derived from the same stream it checks is true
+  // at zero, and `requests` also holds this suite's earlier calls, so comparing
+  // against it would pass before anything was held at all.
+  const SEARCH_PATHS = ["/api/issues/search", "/api/projects/search", "/api/docs/search"] as const;
+  await waitFor(() => expect(held.length).toBe(SEARCH_PATHS.length), NETWORK_WAIT);
+  // Each one exactly once: the workspace switch below has to cancel one held
+  // request per endpoint, and a duplicate would leave a second copy to race.
+  expect(held.map((entry) => entry.path).sort()).toEqual([...SEARCH_PATHS].sort());
   await notify("synthetic-b");
   await act(async () => {
     for (const { response, payload } of held.splice(0)) response.end(JSON.stringify(payload));

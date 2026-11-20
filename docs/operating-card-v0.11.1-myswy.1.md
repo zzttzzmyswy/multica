@@ -97,29 +97,70 @@ Each machine:
 Two different failures, two different answers. Decide which one you are in
 before touching anything.
 
-**Decide first — is the migration state known?** Run
-`SELECT max(version), count(*) FROM schema_migrations;` and compare it with the
-value recorded at backup time.
+**Decide first — is the migrated schema complete?** Neither the maximum
+version nor the runner's exit code answers this. A recorded version means the
+runner *skipped* it; the v0.11.1-myswy.1 cliff was exactly a ledger that had
+`700_inbox_item_active_shown_idx` recorded while `idx_inbox_active_shown` did not
+exist, and `up` exited 0 twice. The current runner refuses that ledger, but a
+database migrated by an earlier build of this branch may already be in it, so
+verify the schema itself:
 
-- max is `700_inbox_item_active_shown_idx` (or the run completed and reported
-  success): the migration is known-good. Application rollback is available.
-- Anything else — a mid-run failure, a count that does not match, an error from
-  the runner: migration state is **unknown**. Do **not** attempt an application
-  rollback. Stop, keep the volume and logs, and go to the restored-copy path.
+1. **The ledger is the expected one.** Compare `SELECT version FROM
+   schema_migrations ORDER BY version` against the list recorded at backup time
+   plus exactly the versions this release adds. The count is not enough — a
+   count can be right while one name is wrong. Expect the 661–700 block appended
+   and every earlier row byte-identical.
+2. **The DDL this release adds exists.** `700_inbox_item_active_shown_idx`
+   exists only for its index, so check the objects, not the rows:
 
-**A. Application rollback (known-good migration only).** Restore the
-`v0.9.0-myswy.2` image digests and start them. The 661–700 ledger rows stay; the
-old binary ignores versions above its own last migration, which is what makes
-this the cheap path. Release this path only when all of the following hold, and
-record each one:
+   ```
+   SELECT relname, relkind FROM pg_class
+    WHERE relname IN ('idx_inbox_active_shown','doc','doc_folder','doc_version',
+                      'chat_wakeup','project_folder','runtime_rate_limit',
+                      'entitlement_limit_overage','entitlement_feature_attempt');
+   ```
 
+3. **Every index this release builds is present AND valid.** A concurrent build
+   that was interrupted leaves an `indisvalid = false` relation that `IF NOT
+   EXISTS` will not rebuild:
+
+   ```
+   SELECT c.relname, i.indisvalid FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE NOT i.indisvalid;
+   ```
+
+   Any row here means the migration did not finish, whatever `max(version)` says.
+4. **The backup is still the fallback,** and nothing was written after it that
+   you are not prepared to lose.
+5. **Business data is intact** — one issue read and one write, one upload
+   round-trip, and the counts you recorded before the switch.
+
+Only when all five pass is the migration "known". Otherwise treat it as unknown
+and take path B.
+
+**A. Application rollback.** Restore the `v0.9.0-myswy.2` image digests and start
+them. The 661–700 ledger rows stay; the old binary ignores versions above its own
+last migration. Release this path only when all of the following hold, and record
+each one:
+
+- [ ] steps 1–5 above all pass;
 - [ ] the running digests are the `v0.11.1-myswy.1` ones this card shipped
       (compare with the release notes, not with `latest`);
-- [ ] `schema_migrations` ends at `700_inbox_item_active_shown_idx`;
 - [ ] the backup taken at step 2 restores cleanly on an isolated copy, so B is
       still available if A fails;
 - [ ] no task was running when the switch happened, so no task is stranded on a
-      half-written run.
+      half-written run;
+- [ ] **the old application has been run against the migrated schema in
+      isolation and read and wrote normally.**
+
+That last point is not covered by the migration passing. A completed migration
+proves the schema matches what the *new* server expects; it says nothing about
+the `v0.9.0-myswy.2` binary, which queries the tables it knew about and ignores
+the rest. Dropping or reshaping a column it still reads would break it and the
+migration would not notice. **This release has not made that measurement**, so
+as of this card path A is not released: until an isolated old-application run is
+recorded, treat A as unavailable and use B.
 
 **B. Database rollback (unknown migration state, or A failed).** Use the
 restored copy, never the production volume:
@@ -159,14 +200,37 @@ attributes runtimes to.
 | `v0.9.0-myswy.2` daemon + `v0.11.1` server | **exercised**: registered, heartbeated, claimed a queued task and reported its terminal result against the candidate server. A real agent run was not completed (no CLI login on the rehearsal host), so treat "old daemon runs real work against the new server" as unproven until one task is watched on the first machine you roll |
 | `v0.11.1` daemon + `v0.9.0-myswy.2` server | not a target and not exercised; docs/wakeup/rate-limit endpoints are absent there, so upgrade the server first |
 
-Also exercised against the candidate server, as a bounded record rather than a
-soak: 25 identities × 6 rounds of concurrent registration (150/150 `200`,
-exactly 25 distinct runtimes — no duplicates), 25 reconnects (25/25 `200`),
-25 runtimes × 5 heartbeat rounds (125/125 `200`), and 10/10 invalid credentials
-refused with `401`. The invitation rate limiter was driven past its actor limit:
-10 × `201` then `429`, and `201` again once the limit was raised — trigger and
-recovery both observed. These numbers describe one 20-core host with a warm
-process, not a capacity claim.
+Two different kinds of observation are recorded here, and they must not be read
+as one:
+
+**Connection and registration behaviour** (bounded record, not a soak): 25
+identities × 6 rounds of concurrent registration (150/150 `200`, exactly 25
+distinct runtimes — no duplicates), 25 reconnects (25/25 `200`), 25 runtimes × 5
+heartbeat rounds (125/125 `200`), and 10/10 invalid credentials refused with
+`401`. This says the registration, reconnect and heartbeat paths hold under
+concurrency on one 20-core host with a warm process. It is not a capacity claim
+and it is not a rate-limit measurement.
+
+**Rate limiting is a separate mechanism** and was measured separately: the
+invitation limiter was driven past its actor limit — 10 × `201`, then `429`, and
+`201` again after the limit was raised, so trigger and recovery were both
+observed. That exercises the invitation gate only. It does **not** show that
+daemon registration or heartbeat are throttled: neither path had a limiter in
+this release, which is why the 150-request burst above returned 150 × `200`
+rather than some `429`s. Do not cite the registration numbers as evidence of
+limit behaviour, or the limiter numbers as evidence about daemon traffic.
+
+**Test scope.** The migration rehearsal uses a database built by running the
+released `.2` migration tree against an empty isolated database — a synthetic
+fixture, not a copy of production. The daemon and limiter observations are
+against a locally built server on the same host. Nothing in this card was
+measured on the NAS, on real production data, or through the real reverse proxy
+and TLS path; those belong to each machine's managing agent.
+
+**Not measured, and therefore not claimed:** a real agent run completing
+successfully (no CLI login on the rehearsal host), the `v0.9.0-myswy.2`
+application reading and writing against the migrated schema (see path A above),
+and anything at production data volume.
 
 ## Gates before a deployment card is issued
 

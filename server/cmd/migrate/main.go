@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -598,6 +599,15 @@ type ledgerLineage struct {
 	upstream map[string]string
 	// candidate is the historical upstream candidate's upload numbering.
 	candidate map[string]string
+	// order is the apply order of the versions this build ships, and position
+	// maps a version to its index in that order. Together they let the check
+	// verify that a ledger is a PREFIX of what a run would apply, not merely a
+	// set of names that exist.
+	order    []string
+	position map[string]int
+	// aliasPosition maps a historical alias to the position of the version that
+	// replaced it, so an alias occupies the same slot its predecessor did.
+	aliasPosition map[string]int
 }
 
 // newLedgerLineage derives the acceptable set from the files this run would
@@ -614,15 +624,26 @@ func newLedgerLineage() (*ledgerLineage, error) {
 		upstream:  upstreamLineageVersions,
 		candidate: historicalCandidateUploadVersions,
 	}
+	lineage.position = make(map[string]int, len(files))
+	lineage.aliasPosition = make(map[string]int, len(historicalLedgerAliases))
 	for _, file := range files {
 		version := migrations.ExtractVersion(file)
 		if version == "" {
 			continue
 		}
 		lineage.known[version] = "shipped by this build"
+		lineage.position[version] = len(lineage.order)
+		lineage.order = append(lineage.order, version)
 	}
 	for alias, entry := range historicalLedgerAliases {
 		lineage.known[alias] = entry.reason
+		// An alias stands in for the version that replaced it, so it belongs at
+		// that version's slot. 665_runtime_rate_limit was renamed to
+		// 677_runtime_rate_limit; an installation that applied the old name has
+		// the object the new one builds, at the same point in the sequence.
+		if pos, ok := lineage.position[entry.successor]; ok {
+			lineage.aliasPosition[alias] = pos
+		}
 	}
 	return lineage, nil
 }
@@ -677,7 +698,22 @@ func (l *ledgerLineage) check(ctx context.Context, q ledgerQuerier, table string
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read migration ledger: %w", err)
 	}
+	// Every recorded version is a name this build knows. That is necessary but
+	// not sufficient: a migration may only be recorded after everything before it
+	// in apply order, because that is the only way the runner can produce it.
+	//
+	// Without this, a ledger holding all of `.2` PLUS one later version was
+	// accepted — the version was a legitimate stem, so the name check passed —
+	// and the run then applied the versions in between on top of a schema that
+	// claimed to already have the later one. Acceptance found exactly that with
+	// `700_inbox_item_active_shown_idx` added to a `.2` database: two `up` runs
+	// exited 0, the ledger reached 724, and `idx_inbox_active_shown` — the index
+	// that version exists to build — was never created, because the runner saw
+	// 700 recorded and skipped it.
 	if len(unknown) == 0 && len(foreign) == 0 && len(candidate) == 0 {
+		if err := l.requireApplyOrderPrefix(ctx, q, table); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -698,6 +734,100 @@ func (l *ledgerLineage) check(ctx context.Context, q ledgerQuerier, table string
 	sort.Strings(unknown)
 	return fmt.Errorf("refusing to migrate a database whose schema_migrations contains %d version(s) this build does not ship or recognise as one of its own historical names: %s. Applying migrations on top would record this build's versions beside another lineage's rows, and the shared numbers mean different objects. Restore a backup taken from this distribution, rebuild the database, or — if these are legitimate earlier release names — add them to historicalLedgerAliases with the reason",
 		len(unknown), strings.Join(unknown, ", "))
+}
+
+// requireApplyOrderPrefix refuses a ledger that does not cover a contiguous
+// prefix of the apply order.
+//
+// The runner applies files in sorted order and records each one as it goes, so
+// every ledger it produced — complete, interrupted, or holding versions whose SQL
+// a condition skipped — covers positions 0..k-1 with no holes. Nothing else is
+// reachable: to record the version at position k it must first have recorded all
+// of 0..k-1.
+//
+// Aliases are placed at the position of the version that replaced them. An
+// installation that applied `665_runtime_rate_limit` before the rename HAS the
+// object `677_runtime_rate_limit` builds, so the alias covers that slot; it is
+// evidence of an older renumber, not a gap. A ledger may hold both the alias and
+// the successor — the rename changed the version string, so the successor was
+// applied later on top of it — and because this works on a SET of positions that
+// is not a collision.
+//
+// Historical duplicate NUMBERS (020, 026, ... up to 128) are separate files with
+// separate positions, so they need no special case. Conditional skips are still
+// recorded by the runner, so they occupy their position like any other.
+//
+// Without this check a ledger holding all of `.2` PLUS one later version was
+// accepted: that version is a legitimate stem, so the name check passed. The run
+// then applied the versions in between on a schema that already claimed the later
+// one. Acceptance found exactly that with `700_inbox_item_active_shown_idx` added
+// to a `.2` database: two `up` runs exited 0, the ledger reached 724 rows, and
+// `idx_inbox_active_shown` — the index that version exists to build — was never
+// created, because the runner saw 700 recorded and skipped its SQL.
+func (l *ledgerLineage) requireApplyOrderPrefix(ctx context.Context, q ledgerQuerier, table string) error {
+	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s ORDER BY version", table))
+	if err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	defer rows.Close()
+
+	covered := make(map[int]string)
+	var aliases int
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("read migration ledger: %w", err)
+		}
+		if pos, ok := l.position[version]; ok {
+			covered[pos] = version
+			continue
+		}
+		if pos, ok := l.aliasPosition[version]; ok {
+			// Do not overwrite a shipped version already at this slot: the
+			// recorded file is the better name to report.
+			if _, taken := covered[pos]; !taken {
+				covered[pos] = version
+			}
+			aliases++
+			continue
+		}
+		// Anything else was classified earlier; it cannot reach here.
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	if len(covered) == 0 {
+		return nil
+	}
+
+	// The covered positions must be exactly 0..len(covered)-1. Anything else is
+	// either a hole (a missing migration) or a version recorded ahead of the
+	// migrations before it.
+	maxPos := 0
+	for pos := range covered {
+		if pos > maxPos {
+			maxPos = pos
+		}
+	}
+	for pos := 0; pos <= maxPos; pos++ {
+		if _, ok := covered[pos]; ok {
+			continue
+		}
+		// The hole names the missing migration: the first shipped version at or
+		// after the hole that is not itself covered.
+		missing := "<unknown>"
+		for probe := pos; probe < len(l.order); probe++ {
+			if _, recorded := covered[probe]; !recorded {
+				missing = l.order[probe]
+				break
+			}
+		}
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations does not cover a contiguous prefix of the migrations this build applies: apply position %d (0-based) is missing, so %q — and everything from there — would be skipped, because the runner treats a recorded version as already applied. The ledger holds %d distinct position(s) with %d historical alias row(s). Record the missing migrations, restore a backup taken before the ledger was edited, or rebuild the database; do not delete ledger rows to force the run through",
+			pos, missing, len(covered), aliases)
+	}
+	// Reaching here means every position in 0..maxPos is covered, so there are
+	// exactly maxPos+1 of them.
+	return nil
 }
 
 // quoteLiteral renders a Go string as a SQL string literal.
@@ -1074,6 +1204,25 @@ type runOptions struct {
 	AllowUnknownLedgerVersions bool
 }
 
+// coversShippedSet reports whether opts.Files is the full set this build ships
+// for the direction, which is what the lineage preflight assumes. Tests pass
+// curated subsets to a scratch schema; a subset can never be a prefix of the
+// full order, and its purpose is to exercise one migration, not to validate a
+// database. Production callers pass migrations.Files and therefore always
+// return true here.
+func (o runOptions) coversShippedSet() bool {
+	shipped, err := migrations.Files(o.Direction)
+	if err != nil || len(shipped) != len(o.Files) {
+		return false
+	}
+	for i := range shipped {
+		if filepath.Base(shipped[i]) != filepath.Base(o.Files[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func main() {
 	logger.Init()
 
@@ -1259,7 +1408,12 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 	// them, so continuing would create objects and record versions and only then
 	// fail — or, worse, succeed and leave the database describing two lineages at
 	// once. See ledgerLineage.check.
-	if opts.Direction == "up" && !opts.AllowUnknownLedgerVersions {
+	// The preflight only has meaning against the full shipped set: "is this
+	// ledger a prefix of what a run would apply" is unanswerable when the run is
+	// a hand-picked subset. Production always passes migrations.Files, so it
+	// always gets the check; a curated file list (a test fixture) is by
+	// construction a subset and opts out here rather than in each test.
+	if opts.Direction == "up" && !opts.AllowUnknownLedgerVersions && opts.coversShippedSet() {
 		lineage, err := newLedgerLineage()
 		if err != nil {
 			return fmt.Errorf("load the shipped migration set: %w", err)
