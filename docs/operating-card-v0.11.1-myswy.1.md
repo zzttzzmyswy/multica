@@ -27,10 +27,21 @@ substitute `latest`.
 ## Order of operations
 
 Server first, then daemons, one daemon at a time. The reason is the migration:
-a daemon from `v0.11.1` talking to a `v0.9.0-myswy.2` server sees no docs, chat
-wakeup or rate-limit endpoints, and those features degrade rather than break —
-but the reverse (old daemon, new server) is the combination that has been
-exercised, so server-first keeps every intermediate state on the tested path.
+a daemon from `v0.11.1` talking to a `v0.9.0-myswy.2` server would meet a build
+without the 661–700 objects, while an old daemon talking to the new server meets
+a complete schema and only loses feature endpoints it does not call yet.
+
+What was actually exercised for this card, and what was not:
+
+| Claim | Evidence |
+| --- | --- |
+| `.2` daemon registers against the candidate server | measured — real `v0.9.0-myswy.2` binary, two runtimes `online` |
+| `.2` daemon heartbeats | measured — `agent_runtime.last_seen_at` advancing |
+| `.2` daemon claims a queued task | measured — task moved `queued` → `dispatched` → `running` |
+| `.2` daemon reports a terminal result | measured — task ended `failed` with the agent's own error, i.e. the report path worked |
+| candidate daemon does the same | measured — identical lifecycle and identical error |
+| real agent run completes successfully | **not** measured — no agent CLI login exists on the rehearsal host, so every run ends at "Not logged in". The task lifecycle around the run is proven; the run itself is not |
+| NAS hardware, real backup, production data | **not** measured — belongs to the NAS managing agent |
 
 ### 1. NAS server
 
@@ -38,11 +49,16 @@ exercised, so server-first keeps every intermediate state on the tested path.
    the two image digests, the `schema_migrations` maximum, and free disk. Do not
    assume the compose file still matches [the first deployment](../docs/self-host-distribution.md);
    re-read it.
-2. Back up the database and verify the backup restores, on an isolated copy.
-   The 40 new migrations include several `CREATE INDEX CONCURRENTLY` builds on
-   large tables; they are not reversible in place once partway through, so the
-   backup is the rollback.
-3. Confirm no agent task is running, then stop write traffic.
+2. Confirm no agent task is running, then stop write traffic. Take the backup
+   **after** writes have stopped, never before: a backup taken while tasks are
+   still committing can restore to a point the ledger never reached, and the
+   new server would then either replay those writes or refuse the ledger. Record
+   the `schema_migrations` max at the moment of the backup and keep it with the
+   file.
+3. Verify that backup restores, on an isolated copy — not on the production
+   volume. The 40 new migrations include several `CREATE INDEX CONCURRENTLY`
+   builds on large tables, so a partly-applied run is not reversible in place;
+   the restored copy is the rollback.
 4. Pin `MULTICA_BACKEND_DIGEST` and `MULTICA_WEB_DIGEST` to the release digests
    and start with `make selfhost-digest`. The entrypoint runs `migrate up`.
 5. Verify: both containers report the release revision, `/health` is green, a
@@ -78,22 +94,79 @@ Each machine:
 
 ### 3. Rollback
 
-- **Application only:** if the old app is compatible with the migrated schema,
-  restore the `v0.9.0-myswy.2` images and digests. The 661–700 ledger rows stay.
-  This is the cheap path and the expected one.
-- **Database:** only with a restored backup on a new volume. Do not run
-  `migrate down` across 661–700 in place, and never clear the database to
-  "start clean".
-- **Daemon:** restore the previous binary and its service configuration, then
-  re-check registration and heartbeat.
+Two different failures, two different answers. Decide which one you are in
+before touching anything.
+
+**Decide first — is the migration state known?** Run
+`SELECT max(version), count(*) FROM schema_migrations;` and compare it with the
+value recorded at backup time.
+
+- max is `700_inbox_item_active_shown_idx` (or the run completed and reported
+  success): the migration is known-good. Application rollback is available.
+- Anything else — a mid-run failure, a count that does not match, an error from
+  the runner: migration state is **unknown**. Do **not** attempt an application
+  rollback. Stop, keep the volume and logs, and go to the restored-copy path.
+
+**A. Application rollback (known-good migration only).** Restore the
+`v0.9.0-myswy.2` image digests and start them. The 661–700 ledger rows stay; the
+old binary ignores versions above its own last migration, which is what makes
+this the cheap path. Release this path only when all of the following hold, and
+record each one:
+
+- [ ] the running digests are the `v0.11.1-myswy.1` ones this card shipped
+      (compare with the release notes, not with `latest`);
+- [ ] `schema_migrations` ends at `700_inbox_item_active_shown_idx`;
+- [ ] the backup taken at step 2 restores cleanly on an isolated copy, so B is
+      still available if A fails;
+- [ ] no task was running when the switch happened, so no task is stranded on a
+      half-written run.
+
+**B. Database rollback (unknown migration state, or A failed).** Use the
+restored copy, never the production volume:
+
+1. Restore the verified backup into a **new database on a new volume**.
+2. Start the `v0.9.0-myswy.2` stack against that new database and verify
+   `/health` plus one read and one write.
+3. Switch the application's connection to the new database only after step 2
+   passes.
+4. Leave the old volume untouched. It is the evidence for what went wrong and
+   the only remaining copy of any write that happened after the backup.
+
+Never run `migrate down` across 661–700 in place, never drop the database to
+"start clean", and never edit `schema_migrations` by hand to get past a refusal.
+A hand-edited ledger is exactly the mixed-lineage state the runner refuses.
+
+**Daemon rollback.** Restore the previous binary and its service configuration,
+then re-check registration, heartbeat, and one task. Do not restore a daemon
+binary without also restoring its profile: the daemon id is what the server
+attributes runtimes to.
+
+### Pre-switch checks for the NAS host
+
+- [ ] the old CLI updater/timer is disabled or retargeted — the current pin is
+      `v0.9.0-myswy.2`, and a timer that reinstalls it will silently undo the
+      upgrade (see step 2 of the daemon section);
+- [ ] only one update control source is active for that binary;
+- [ ] free disk covers the new images plus a full database backup;
+- [ ] the compose file, project name and service names in use match what this
+      card assumes, re-read rather than remembered.
 
 ## Compatibility
 
-| Combination | Expected |
+| Combination | Status |
 | --- | --- |
-| `v0.11.1` daemon + `v0.11.1` server | supported, the tested target |
-| `v0.9.0-myswy.2` daemon + `v0.11.1` server | expected to work; upstream preserves daemon compatibility within a minor line, and the CLI falls back when an endpoint is absent. Verify one real task before rolling the rest |
-| `v0.11.1` daemon + `v0.9.0-myswy.2` server | not a target; docs/wakeup/rate-limit features degrade, so upgrade the server first |
+| `v0.11.1` daemon + `v0.11.1` server | the target |
+| `v0.9.0-myswy.2` daemon + `v0.11.1` server | **exercised**: registered, heartbeated, claimed a queued task and reported its terminal result against the candidate server. A real agent run was not completed (no CLI login on the rehearsal host), so treat "old daemon runs real work against the new server" as unproven until one task is watched on the first machine you roll |
+| `v0.11.1` daemon + `v0.9.0-myswy.2` server | not a target and not exercised; docs/wakeup/rate-limit endpoints are absent there, so upgrade the server first |
+
+Also exercised against the candidate server, as a bounded record rather than a
+soak: 25 identities × 6 rounds of concurrent registration (150/150 `200`,
+exactly 25 distinct runtimes — no duplicates), 25 reconnects (25/25 `200`),
+25 runtimes × 5 heartbeat rounds (125/125 `200`), and 10/10 invalid credentials
+refused with `401`. The invitation rate limiter was driven past its actor limit:
+10 × `201` then `429`, and `201` again once the limit was raised — trigger and
+recovery both observed. These numbers describe one 20-core host with a warm
+process, not a capacity claim.
 
 ## Gates before a deployment card is issued
 

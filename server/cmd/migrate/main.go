@@ -490,18 +490,10 @@ type rowQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// upstreamLineageVersions maps an upstream migration filename to the fork
-// filename that now occupies the same number. The fork released its upload
-// feature as 657-660 and this distribution shifted the whole upstream block up
-// by four (657-696 -> 661-700) so both lineages keep unique numbers.
-//
-// A database migrated by the upstream line records the LEFT-hand strings. The
-// fork ledger never produces them, so seeing one means the schema_migrations
-// table belongs to a different lineage that merely shares numbers — the
-// columns those versions guard are not the columns this build expects. Applying
-// the fork's 661+ block on top would fail halfway through with "relation
-// already exists" after already creating objects and writing ledger rows, so
-// the run must stop before its first statement.
+// upstreamLineageVersions names, for each number this distribution reuses, the
+// filename the upstream line records there. It is used only to explain the
+// refusal: detection itself is the allowlist in ledgerLineage.check, so a
+// foreign ledger is caught even when its version is not listed here.
 var upstreamLineageVersions = map[string]string{
 	"657_inbox_item_snoozed_until":              "657_attachment_upload_session",
 	"658_project_archive":                       "658_attachment_upload_session_staging_key",
@@ -545,40 +537,167 @@ var upstreamLineageVersions = map[string]string{
 	"696_inbox_item_active_shown_idx": "696_doc_folder_workspace_idx",
 }
 
-// refusedUpstreamLineage reports the upstream-lineage versions present in the
-// ledger, sorted, so the error names every collision at once instead of the
-// first one the runner happens to trip over. A ledger table that does not exist
-// yet cannot have been written by any lineage, so it yields no collisions.
-func refusedUpstreamLineage(ctx context.Context, q ledgerQuerier, table string) ([]string, error) {
-	var exists bool
-	if err := q.QueryRow(ctx, fmt.Sprintf("SELECT to_regclass(%s) IS NOT NULL", quoteLiteral(table))).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, nil
-	}
+// historicalCandidateUploadVersions is the upload feature's numbering on the
+// upstream CANDIDATE branch (branch mys-2811-upload-upstream-clean), which
+// numbered it 660-663 because upstream had claimed 657-659 at candidate time. See
+// docs/upload-patch-contract.md.
+//
+// These are not this distribution's names and not upstream's either, but an
+// operator who built or tried the candidate can leave one behind — typically
+// beside a legitimate `.2` prefix. Naming them lets the refusal say which lineage
+// it found instead of a generic "unknown version".
+var historicalCandidateUploadVersions = map[string]string{
+	"660_attachment_upload_session":             "the historical upstream candidate numbered the upload table 660; this distribution has 657",
+	"661_attachment_upload_session_staging_key": "the historical upstream candidate numbered this index 661; this distribution has 658",
+	"662_attachment_upload_session_due":         "the historical upstream candidate numbered this index 662; this distribution has 659",
+	"663_attachment_upload_session_workspace":   "the historical upstream candidate numbered this index 663; this distribution has 660",
+}
 
-	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s", table))
+// ledgerAlias is a version string this distribution may legitimately find in
+// schema_migrations without shipping a file of that name today: a name an earlier
+// build of THIS distribution shipped before renumbering it. The run ledger has to
+// keep accepting them, because renaming an applied migration would either re-run
+// or skip it.
+//
+// The successor is what makes the entry verifiable rather than an assertion: it
+// must be a file this build ships today, so an alias cannot be invented to wave a
+// foreign ledger through. TestLineageTablesMatchTheShippedTree pins that.
+type ledgerAlias struct {
+	successor string
+	reason    string
+}
+
+// historicalLedgerAliases is deliberately small. Each entry is a renumber this
+// package already has a regression test for; do not add one without that test.
+var historicalLedgerAliases = map[string]ledgerAlias{
+	"458_activity_log_member_assignee_frequency_index": {
+		successor: "466_activity_log_member_assignee_frequency_index",
+		reason:    "renamed before release; see TestAssigneeFrequencyRenumberPreservesExistingIndex",
+	},
+	"665_runtime_rate_limit": {
+		successor: "677_runtime_rate_limit",
+		reason:    "renamed before release; see TestRuntimeRateLimitRenumberPreservesExistingSnapshot",
+	},
+	"665_runtime_profile_daemon": {
+		successor: "678_runtime_profile_daemon",
+		reason:    "renamed before release; see TestRuntimeProfileDaemonRenumberPreservesPreviewBindings",
+	},
+}
+
+// ledgerLineage is the set of version strings a run may find in an existing
+// schema_migrations table and still proceed. Reaching outside it means the
+// ledger was written by a lineage this build does not upgrade in place, and the
+// run must stop before its first statement.
+type ledgerLineage struct {
+	// known maps every acceptable version to a short provenance note, used in
+	// the refusal message.
+	known map[string]string
+	// upstream is the set of filenames the upstream line records under numbers
+	// this distribution reuses. Seeing one is the specific, common case of a
+	// foreign ledger and gets a targeted explanation.
+	upstream map[string]string
+	// candidate is the historical upstream candidate's upload numbering.
+	candidate map[string]string
+}
+
+// newLedgerLineage derives the acceptable set from the files this run would
+// apply, so the check tracks the shipped tree instead of a hand-maintained
+// list. It is a superset across directions: a rollback runs a subset of the
+// same versions, and a ledger is good or bad regardless of direction.
+func newLedgerLineage() (*ledgerLineage, error) {
+	files, err := migrations.Files("up")
 	if err != nil {
 		return nil, err
 	}
+	lineage := &ledgerLineage{
+		known:     make(map[string]string, len(files)+len(historicalLedgerAliases)),
+		upstream:  upstreamLineageVersions,
+		candidate: historicalCandidateUploadVersions,
+	}
+	for _, file := range files {
+		version := migrations.ExtractVersion(file)
+		if version == "" {
+			continue
+		}
+		lineage.known[version] = "shipped by this build"
+	}
+	for alias, entry := range historicalLedgerAliases {
+		lineage.known[alias] = entry.reason
+	}
+	return lineage, nil
+}
+
+// check refuses a ledger this build must not write to. Unknown versions are the
+// real signal: a ledger written by the fork, by any earlier release of it, or by
+// an interrupted run of either contains only shipped versions and verified
+// aliases. Anything else — the upstream line, a hand-edited ledger, a database
+// from another product — would receive DDL under numbers that mean something
+// else here.
+//
+// This is an allowlist rather than a denylist on purpose. The first version of
+// this guard listed the 40 upstream filenames and refused only those, so a
+// ledger holding a legitimate `.2` prefix PLUS one leftover stem from the
+// historical candidate (661_attachment_upload_session_staging_key) passed the
+// check and the run appended 40 migrations on top of it.
+func (l *ledgerLineage) check(ctx context.Context, q ledgerQuerier, table string) error {
+	var exists bool
+	if err := q.QueryRow(ctx, fmt.Sprintf("SELECT to_regclass(%s) IS NOT NULL", quoteLiteral(table))).Scan(&exists); err != nil {
+		return fmt.Errorf("inspect migration ledger: %w", err)
+	}
+	if !exists {
+		// No ledger: a fresh database. Nothing has been written by any lineage.
+		return nil
+	}
+
+	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s ORDER BY version", table))
+	if err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
 	defer rows.Close()
 
-	var refused []string
+	var unknown, foreign, candidate []string
 	for rows.Next() {
 		var version string
 		if err := rows.Scan(&version); err != nil {
-			return nil, err
+			return fmt.Errorf("read migration ledger: %w", err)
 		}
-		if _, ok := upstreamLineageVersions[version]; ok {
-			refused = append(refused, version)
+		if _, ok := l.known[version]; ok {
+			continue
 		}
+		if _, ok := l.upstream[version]; ok {
+			foreign = append(foreign, version)
+			continue
+		}
+		if _, ok := l.candidate[version]; ok {
+			candidate = append(candidate, version)
+			continue
+		}
+		unknown = append(unknown, version)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return fmt.Errorf("read migration ledger: %w", err)
 	}
-	sort.Strings(refused)
-	return refused, nil
+	if len(unknown) == 0 && len(foreign) == 0 && len(candidate) == 0 {
+		return nil
+	}
+
+	if len(candidate) > 0 {
+		sort.Strings(candidate)
+		details := make([]string, 0, len(candidate))
+		for _, version := range candidate {
+			details = append(details, version+" ("+l.candidate[version]+")")
+		}
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations holds %s from the historical upstream candidate branch, which numbered the upload feature 660-663 while this distribution keeps it at 657-660. The two share numbers with different objects, so applying migrations here would record this build's versions beside another lineage's rows. Restore a backup taken from this distribution, or rebuild the database",
+			strings.Join(details, "; "))
+	}
+	if len(foreign) > 0 {
+		sort.Strings(foreign)
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this build numbers those same files 661_inbox_item_snoozed_until..700_inbox_item_active_shown_idx and keeps its own upload feature at 657-660, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
+			strings.Join(foreign, ", "))
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("refusing to migrate a database whose schema_migrations contains %d version(s) this build does not ship or recognise as one of its own historical names: %s. Applying migrations on top would record this build's versions beside another lineage's rows, and the shared numbers mean different objects. Restore a backup taken from this distribution, rebuild the database, or — if these are legitimate earlier release names — add them to historicalLedgerAliases with the reason",
+		len(unknown), strings.Join(unknown, ", "))
 }
 
 // quoteLiteral renders a Go string as a SQL string literal.
@@ -947,6 +1066,12 @@ type runOptions struct {
 	// migration ledger, allowing later migrations to run in environments where
 	// this version's DDL is intentionally unnecessary.
 	Conditions map[string]migrationCondition
+	// AllowUnknownLedgerVersions skips the lineage preflight. Production main()
+	// leaves this false: every version in a real ledger must be one this build
+	// ships or a verified historical alias. Tests that hand-runMigrations a
+	// curated file set and seed arbitrary version strings set it, because their
+	// ledgers are deliberately synthetic.
+	AllowUnknownLedgerVersions bool
 }
 
 func main() {
@@ -1129,21 +1254,18 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		}
 	}()
 
-	// Refuse a foreign lineage before the first statement of the run. An
-	// upstream-ledger database shares this build's numbers 657-700 but not the
-	// objects behind them, so continuing would create objects and record
-	// versions and only then fail, leaving a half-upgraded schema.
-	if opts.Direction == "up" {
-		refused, err := refusedUpstreamLineage(ctx, conn, tableIdent)
+	// Refuse a ledger this build must not write to, before the first statement.
+	// A foreign ledger shares numbers with this one but not the objects behind
+	// them, so continuing would create objects and record versions and only then
+	// fail — or, worse, succeed and leave the database describing two lineages at
+	// once. See ledgerLineage.check.
+	if opts.Direction == "up" && !opts.AllowUnknownLedgerVersions {
+		lineage, err := newLedgerLineage()
 		if err != nil {
-			return fmt.Errorf("inspect migration ledger lineage: %w", err)
+			return fmt.Errorf("load the shipped migration set: %w", err)
 		}
-		if len(refused) > 0 {
-			return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this fork numbers the same files %s..%s, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
-				strings.Join(refused, ", "),
-				upstreamLineageVersions[refused[0]],
-				"700_inbox_item_active_shown_idx",
-			)
+		if err := lineage.check(ctx, conn, tableIdent); err != nil {
+			return err
 		}
 	}
 

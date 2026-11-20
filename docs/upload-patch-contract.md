@@ -64,29 +64,46 @@ the four files that name a sibling. `server/cmd/migrate/main.go` lists the
 concurrent-index cleanup hooks under the **new** numbers, and
 `TestEveryConcurrentUpBuildHasCleanup` fails the build if an entry is missed.
 
-Because the two lineages now hold different filenames under 657–700, a
-`schema_migrations` table written by upstream is not a valid starting point.
-`runMigrations` refuses it **before the first statement** —
-`upstreamLineageVersions` in `server/cmd/migrate/main.go` names every colliding
-upstream filename, and `TestRunMigrationsRefusesUpstreamLineageBeforeAnySideEffect`
-pins that no table is created and no ledger row is written before the refusal.
-Without that guard the run reached `665_chat_task_supplement`, failed on
-`relation already exists`, and left a half-upgraded schema behind.
+Because the lineages hold different filenames under 657–700, a ledger is only a
+valid starting point if **every** row in it belongs to this distribution.
+`runMigrations` checks that **before the first statement**, as an allowlist:
+each recorded version must be a file this build ships, or one of the verified
+`historicalLedgerAliases` (a name an earlier build of this distribution shipped
+before renumbering it, each paired with its regression test).
+
+An allowlist rather than a denylist is deliberate. The first version of this
+guard listed the 40 upstream filenames and refused only those; a ledger holding
+a legitimate `.2` prefix **plus one leftover stem from the historical upstream
+candidate** (`661_attachment_upload_session_staging_key`, the candidate's name
+for the staging-key index) passed it, and the run appended 40 migrations on top
+— ledger 685 → 725, tables 148 → 159. The regression
+`TestMixedLedgerIsRefused` reproduces exactly that ledger and
+`TestUnsupportedLedgersAreRefused` covers unknown stems, a stem past the
+supported range and a ledger from another product.
+
+Three lineages are named explicitly so the refusal says which one it found:
+`upstreamLineageVersions` (upstream 657–696),
+`historicalCandidateUploadVersions` (the candidate's upload numbering 660–663),
+and anything else is reported as an unrecognised version.
 
 What this supports, and what it does not:
 
 - **Supported:** a database this distribution migrated (upstream `v0.9.0` plus
   the fork's 657–660), upgraded by running `migrate up` at `v0.11.1-myswy.1` or
   later. The upload rows, their indexes (same OIDs) and the 657–660 ledger rows
-  all survive; the new 661–700 block appends.
-- **Refused:** a database the upstream line migrated. The error names the
-  colliding versions. Rebuild it, or restore a backup taken from this
-  distribution — do not delete ledger rows to force it through.
-- **Not covered:** any lineage that has applied neither. A partial or mixed
-  ledger needs the same treatment as the refused case.
-
 Rehearse on a restored copy before a real switch; the operations card for the
 version being deployed owns the backup, compatibility and rollback conditions.
+
+**What the rehearsal in this repository is, and is not.** The `.2` database used
+to prove the upgrade path was built by running the released `v0.9.0-myswy.2`
+migration tree against an empty isolated database and then inserting a few
+identifiable rows. That is a *synthetic fixture reconstructed from the release
+tree*, not a copy of any deployed database: it proves the migration ordering,
+the ledger handling and that the upload objects survive, and it says nothing
+about the data volume, row counts or data shapes on the NAS. Accepting an actual
+production backup, and restoring it to a scratch volume, is the NAS managing
+agent's step in the next phase — this repository does not have that data and
+must not imply it was checked.
 
 ## Behaviour that must survive a conflict resolution
 

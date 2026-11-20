@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -19,10 +20,39 @@ import (
 	"github.com/multica-ai/multica/server/internal/projectaccess"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/storage"
 	dbfx "github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// routeUploadStorage makes the router upload-capable for this test. The default
+// fixture storage is local-disk and does not implement the presigned-upload
+// capability set, so CompleteAttachmentUpload answered 501
+// "attachment_presign_unsupported" before the handler ever looked at the target
+// — and the project gate under test was never reached.
+//
+// Nothing here talks to a network: the methods exist so the capability check
+// passes and the handler proceeds to the authorization it is being probed for.
+// The session the route is probed with is already `completed`, so completion
+// takes the replay path, which reads only the published attachment row.
+type routeUploadStorage struct{ storage.Storage }
+
+func (routeUploadStorage) PresignPut(context.Context, string, time.Duration, string, int64) (string, map[string]string, error) {
+	return "", nil, storage.ErrUnsupported
+}
+
+func (routeUploadStorage) HeadObject(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, storage.ErrObjectNotFound
+}
+
+func (routeUploadStorage) ReadPrefix(context.Context, string, int, string) ([]byte, error) {
+	return nil, storage.ErrObjectNotFound
+}
+
+func (routeUploadStorage) FinalizeObject(context.Context, string, string, string, int64, string, string, string) error {
+	return storage.ErrObjectNotFound
+}
 
 // A route parameter is keyed by the literal path segment before it and its
 // own name, "autopilots/{id}" or "runs/{runId}": `{id}` alone names a
@@ -149,6 +179,29 @@ var privateProjectRoutesNotProbed = map[string]string{
 	"POST /api/projects/{id}/join":              "the workspace owner's way into a private project they cannot see; TestWorkspaceOwnerJoinsPrivateProject covers who may call it",
 }
 
+// privateRouteOutsiderRefusal documents the routes whose outsider answer is
+// deliberately distinguishable from the missing-id answer, with the status and
+// code they must return instead. Every other project-scoped route must make the
+// two indistinguishable.
+//
+// An entry here is not an exemption from the rule the probe enforces — the
+// outsider still has to be refused, and the member still has to get through.
+// It narrows the assertion to "refused, in exactly this way, on purpose".
+var privateRouteOutsiderRefusal = map[string]struct {
+	status int
+	// message is matched against the response body; it is the human-readable
+	// refusal, since this path answers through requireProjectVisible, which
+	// writes a plain error rather than a capability code.
+	message string
+	reason  string
+}{
+	"POST /api/attachments/{id}/complete-upload": {
+		status:  http.StatusConflict,
+		message: "the issue this upload targeted is no longer available",
+		reason:  "the direct-upload completion re-checks the target's project visibility and tells the uploader their target became unavailable (409), rather than claiming the session never existed. That is deliberate: the caller holds a credential this server issued to them, so it is not a stranger probing for ids, and a 404 would hide from a legitimately revoked member why their in-flight upload cannot be published. TestCompleteAttachmentUpload_RefusedAfterProjectRevocation pins the same message at the handler level",
+	},
+}
+
 // privateRouteRequest shapes the probe for a route an empty request cannot
 // get past: body is its JSON body, and params override a parameter's default
 // object with a more specific one.
@@ -164,6 +217,12 @@ var privateProjectRouteRequests = map[string]privateRouteRequest{
 	"PUT /api/issues/{id}/metadata/{key}": {body: func(*privateRouteFixture, string) string { return `{"value":"probe"}` }},
 	"POST /api/comments/{commentId}/sub-issues": {body: func(f *privateRouteFixture, _ string) string {
 		return fmt.Sprintf(`{"mode":"manual","capture_token":%q,"issue":{"title":"Probe sub-issue"}}`, f.captureToken())
+	}},
+	"POST /api/attachments/{id}/complete-upload": {params: map[string]privateRouteResolver{
+		// A completed session, so the handler re-checks project visibility on
+		// the replay path. The session is per caller: complete-upload refuses a
+		// session whose actor is a different user.
+		"attachments/{id}": func(f *privateRouteFixture, caller string) string { return f.uploadSession(caller) },
 	}},
 	"POST /api/tasks/{taskId}/retry-source-context": {params: map[string]privateRouteResolver{
 		"tasks/{taskId}": func(f *privateRouteFixture, caller string) string { return f.quickCreateRun(caller) },
@@ -247,6 +306,40 @@ func (f *privateRouteFixture) attachment() string {
 			"workspace_id": f.fx.WorkspaceID, "issue_id": f.issue(), "uploader_type": "member",
 			"uploader_id": f.shared.insiderID, "filename": "probe.txt", "url": "/uploads/" + key,
 			"content_type": "text/plain", "size_bytes": len(body),
+		})
+	})
+}
+
+// uploadSession is a COMPLETED direct-upload session whose target is the private
+// issue named by the route's {id}. complete-upload is probed with it because a
+// completed session takes the replay path: it re-checks the target's project
+// visibility (the rule under test) and reads only the published attachment row,
+// without touching object storage.
+//
+// The actor fields must match the caller exactly — complete-upload only lets the
+// actor that asked for the credential publish it — and each caller gets its own
+// session, because the insider's control call and the outsider's probe are
+// different users.
+func (f *privateRouteFixture) uploadSession(caller string) string {
+	return f.once("uploadSession:"+caller, func() string {
+		attachmentID := f.attachment()
+		return f.fx.Insert(f.t, "attachment_upload_session", dbfx.Cols{
+			"id":                    uuid.NewString(),
+			"workspace_id":          f.fx.WorkspaceID,
+			"actor_type":            "member",
+			"actor_id":              caller,
+			"actor_user_id":         caller,
+			"issue_id":              f.issue(),
+			"filename":              "probe.txt",
+			"declared_content_type": "text/plain",
+			"expected_size":         5,
+			"staging_key":           "workspaces/" + f.fx.WorkspaceID + "/staging/" + uuid.NewString(),
+			"final_key":             "workspaces/" + f.fx.WorkspaceID + "/final/" + uuid.NewString(),
+			"publish_state":         "completed",
+			"cleanup_state":         "none",
+			"attachment_id":         attachmentID,
+			"expires_at":            dbfx.Raw("now() + interval '1 hour'"),
+			"completed_at":          dbfx.Raw("now()"),
 		})
 	})
 }
@@ -489,7 +582,13 @@ func TestEveryRouteByProjectObjectIDHidesPrivateProjects(t *testing.T) {
 	t.Setenv("LOCAL_UPLOAD_BASE_URL", "")
 	shared.uploadDir = t.TempDir()
 	t.Setenv("LOCAL_UPLOAD_DIR", shared.uploadDir)
-	router, _ := NewRouterWithOptions(testPool, realtime.NewHub(), events.New(), analytics.NoopClient{}, nil, RouterOptions{})
+	router, routeHandler := NewRouterWithOptions(testPool, realtime.NewHub(), events.New(), analytics.NoopClient{}, nil, RouterOptions{})
+	// Make the router upload-capable so /api/attachments/{id}/complete-upload
+	// reaches its authorization gate instead of answering 501 for a storage
+	// backend this fixture never had. See routeUploadStorage.
+	if current, ok := routeHandler.Storage.(routeUploadStorage); !ok || current.Storage == nil {
+		routeHandler.Storage = routeUploadStorage{Storage: routeHandler.Storage}
+	}
 	call := func(token, method, path, body string) routeAnswer {
 		var req *http.Request
 		switch method {
@@ -551,7 +650,14 @@ func TestEveryRouteByProjectObjectIDHidesPrivateProjects(t *testing.T) {
 		for i := range existing {
 			hidden.body = strings.ReplaceAll(hidden.body, existing[i], missing[i])
 		}
-		if hidden != notFound {
+		if refusal, ok := privateRouteOutsiderRefusal[method+" "+pattern]; ok {
+			// The route refuses the outsider on purpose in a way that differs
+			// from the missing-id answer; require exactly the documented refusal
+			// so a change to it is caught here rather than silently accepted.
+			if hidden.status != refusal.status || !strings.Contains(hidden.body, refusal.message) {
+				t.Errorf("an outsider got %v; this route documents %d %q (%s)", hidden, refusal.status, refusal.message, refusal.reason)
+			}
+		} else if hidden != notFound {
 			t.Errorf("a workspace admin outside the project got %v; an id that does not exist gets %v. Does the handler check the project visibility of the object it loads?", hidden, notFound)
 		}
 
