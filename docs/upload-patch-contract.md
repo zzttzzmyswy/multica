@@ -47,12 +47,63 @@ plus one, and update the cleanup map with it.
 teardown hands its rows to the reconciler instead of deleting them, because the
 row is the only record naming an object the client's write may still materialize.
 
-**Migrating a live fork database to a future sync is not solved here.** The 657–660
-rows exist; a future upstream line will allocate the same numbers to different
-changes. Which migration runs on which database, and whether the upload table's
-numbers can move at all, has to be designed against the deployed schema and
-rehearsed on a restored copy before any sync ships. Do not treat a clean
-cherry-pick as evidence that a deployed database can be upgraded.
+## Migrating a deployed fork database (solved in `v0.11.1-myswy.1`)
+
+The 657–660 rows exist on every deployed database, and upstream later allocated
+the same numbers to different changes. The resolution keeps the fork's numbers
+frozen and shifts the **whole** upstream block up by four:
+
+| Lineage | 657–660 | 661–700 |
+| --- | --- | --- |
+| fork (deployed, `v0.9.0-myswy.2`) | upload feature (frozen) | — |
+| fork (`v0.11.1-myswy.1` and later) | upload feature (frozen) | upstream's 657–696, renumbered +4 |
+
+Upstream 657–696 become 661–700 in this distribution. Their SQL bodies are
+unchanged; only the prefix moves, plus the `migration NNN` cross-references in
+the four files that name a sibling. `server/cmd/migrate/main.go` lists the
+concurrent-index cleanup hooks under the **new** numbers, and
+`TestEveryConcurrentUpBuildHasCleanup` fails the build if an entry is missed.
+
+Because the lineages hold different filenames under 657–700, a ledger is only a
+valid starting point if **every** row in it belongs to this distribution.
+`runMigrations` checks that **before the first statement**, as an allowlist:
+each recorded version must be a file this build ships, or one of the verified
+`historicalLedgerAliases` (a name an earlier build of this distribution shipped
+before renumbering it, each paired with its regression test).
+
+An allowlist rather than a denylist is deliberate. The first version of this
+guard listed the 40 upstream filenames and refused only those; a ledger holding
+a legitimate `.2` prefix **plus one leftover stem from the historical upstream
+candidate** (`661_attachment_upload_session_staging_key`, the candidate's name
+for the staging-key index) passed it, and the run appended 40 migrations on top
+— ledger 685 → 725, tables 148 → 159. The regression
+`TestMixedLedgerIsRefused` reproduces exactly that ledger and
+`TestUnsupportedLedgersAreRefused` covers unknown stems, a stem past the
+supported range and a ledger from another product.
+
+Three lineages are named explicitly so the refusal says which one it found:
+`upstreamLineageVersions` (upstream 657–696),
+`historicalCandidateUploadVersions` (the candidate's upload numbering 660–663),
+and anything else is reported as an unrecognised version.
+
+What this supports, and what it does not:
+
+- **Supported:** a database this distribution migrated (upstream `v0.9.0` plus
+  the fork's 657–660), upgraded by running `migrate up` at `v0.11.1-myswy.1` or
+  later. The upload rows, their indexes (same OIDs) and the 657–660 ledger rows
+Rehearse on a restored copy before a real switch; the operations card for the
+version being deployed owns the backup, compatibility and rollback conditions.
+
+**What the rehearsal in this repository is, and is not.** The `.2` database used
+to prove the upgrade path was built by running the released `v0.9.0-myswy.2`
+migration tree against an empty isolated database and then inserting a few
+identifiable rows. That is a *synthetic fixture reconstructed from the release
+tree*, not a copy of any deployed database: it proves the migration ordering,
+the ledger handling and that the upload objects survive, and it says nothing
+about the data volume, row counts or data shapes on the NAS. Accepting an actual
+production backup, and restoring it to a scratch volume, is the NAS managing
+agent's step in the next phase — this repository does not have that data and
+must not imply it was checked.
 
 ## Behaviour that must survive a conflict resolution
 
@@ -95,6 +146,22 @@ the multi-agent concurrent-registration smoke. A change confined to upload
 sessions instead needs the concurrent-complete and cleanup-race regression; that
 coverage already exists in `attachment_upload_test.go` and
 `attachment_upload_reconciler_test.go` and must not be deleted.
+
+## Frontend checks run on CI's Node version
+
+The `frontend-test` job pins Node 22. Run these on 22 as well, not on whatever
+`node` is on the developer machine: Node 25+ ships a global `localStorage` that
+`packages/vitest-setup/web-storage.ts` replaces with an in-memory shim, and
+`Object.keys(shim)` returns the shim's *methods*, so
+`clearAllWorkspaceStorage` cannot enumerate stored keys and
+`platform/doc-session-cleanup.test.ts` fails. That is a Node-version artifact,
+not a regression — it reproduces on the unmodified upstream tag.
+
+```bash
+pnpm --filter @multica/core test        # Node 22
+pnpm --filter @multica/core typecheck
+pnpm --filter @multica/core lint
+```
 
 ## Where the history went
 

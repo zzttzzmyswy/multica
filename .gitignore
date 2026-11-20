@@ -11,6 +11,7 @@ out
 build
 bin
 dist-electron
+storybook-static
 *.tsbuildinfo
 # `next dev` writes this rules file into each Next app directory on every
 # start, so running the dev server (or the browser smoke test) dirties the tree

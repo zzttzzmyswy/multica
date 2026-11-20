@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -143,6 +145,25 @@ var concurrentIndexCleanups = map[string]string{
 	"660_attachment_upload_session_workspace":                   "idx_attachment_upload_session_workspace",
 	"659_attachment_upload_session_due":                         "idx_attachment_upload_session_due",
 	"658_attachment_upload_session_staging_key":                 "uq_attachment_upload_session_staging_key",
+	"680_chat_wakeup_due_idx":                                   "idx_chat_wakeup_due",
+	"681_chat_wakeup_session_idx":                               "idx_chat_wakeup_session",
+	"682_chat_wakeup_requester_idx":                             "idx_chat_wakeup_requester",
+	"684_entitlement_limit_overage_scope_idx":                   "uq_entitlement_limit_overage_scope",
+	"686_project_folder_name_idx":                               "uq_project_folder_workspace_name",
+	"688_entitlement_feature_attempt_scope_idx":                 "uq_entitlement_feature_attempt_scope",
+	"690_doc_folder_pkey_index":                                 "doc_folder_pkey_idx",
+	"692_doc_pkey_index":                                        "doc_pkey_idx",
+	"694_doc_version_pkey_index":                                "doc_version_pkey_idx",
+	"696_doc_folder_workspace_idx":                              "doc_folder_workspace_idx",
+	"697_doc_workspace_idx":                                     "doc_workspace_idx",
+	"698_doc_version_workspace_idx":                             "doc_version_workspace_idx",
+	"700_inbox_item_active_shown_idx":                           "idx_inbox_active_shown",
+	"675_weixin_account_state_unique_index":                     "weixin_account_state_pkey",
+	"673_weixin_login_session_unique_index":                     "weixin_login_session_pkey",
+	"670_weixin_login_expiry_idx":                               "weixin_login_expiry_idx",
+	"666_chat_task_supplement_message":                          "uq_chat_task_supplement_message",
+	"667_chat_task_supplement_task":                             "idx_chat_task_supplement_task",
+	"668_chat_task_supplement_workspace":                        "idx_chat_task_supplement_workspace",
 	"654_chat_submission_receipt_key":                           "uq_chat_submission_receipt_key",
 	"655_chat_submission_receipt_workspace":                     "idx_chat_submission_receipt_workspace",
 	"651_task_context_receipt_issue_idx":                        "idx_task_context_receipt_issue",
@@ -467,6 +488,344 @@ var sourceContextMigrationVersions = []string{
 }
 
 type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// upstreamLineageVersions names, for each number this distribution reuses, the
+// filename the upstream line records there. It is used only to explain the
+// refusal: detection itself is the allowlist in ledgerLineage.check, so a
+// foreign ledger is caught even when its version is not listed here.
+var upstreamLineageVersions = map[string]string{
+	"657_inbox_item_snoozed_until":              "657_attachment_upload_session",
+	"658_project_archive":                       "658_attachment_upload_session_staging_key",
+	"659_issue_view_preference_projects_page":   "659_attachment_upload_session_due",
+	"660_inbox_item_snoozed_at":                 "660_attachment_upload_session_workspace",
+	"661_chat_task_supplement":                  "661_inbox_item_snoozed_until",
+	"662_chat_task_supplement_message":          "662_project_archive",
+	"663_chat_task_supplement_task":             "663_issue_view_preference_projects_page",
+	"664_chat_task_supplement_workspace":        "664_inbox_item_snoozed_at",
+	"665_weixin_state":                          "665_chat_task_supplement",
+	"666_weixin_login_expiry_idx":               "666_chat_task_supplement_message",
+	"667_issue_origin_weixin_chat":              "667_chat_task_supplement_task",
+	"668_issue_origin_weixin_chat_validate":     "668_chat_task_supplement_workspace",
+	"669_weixin_login_session_unique_index":     "669_weixin_state",
+	"670_weixin_login_session_primary_key":      "670_weixin_login_expiry_idx",
+	"671_weixin_account_state_unique_index":     "671_issue_origin_weixin_chat",
+	"672_weixin_account_state_primary_key":      "672_issue_origin_weixin_chat_validate",
+	"673_runtime_rate_limit":                    "673_weixin_login_session_unique_index",
+	"674_runtime_profile_daemon":                "674_weixin_login_session_primary_key",
+	"675_chat_wakeup":                           "675_weixin_account_state_unique_index",
+	"676_chat_wakeup_due_idx":                   "676_weixin_account_state_primary_key",
+	"677_chat_wakeup_session_idx":               "677_runtime_rate_limit",
+	"678_chat_wakeup_requester_idx":             "678_runtime_profile_daemon",
+	"679_entitlement_limit_overage":             "679_chat_wakeup",
+	"680_entitlement_limit_overage_scope_idx":   "680_chat_wakeup_due_idx",
+	"681_project_folder":                        "681_chat_wakeup_session_idx",
+	"682_project_folder_name_idx":               "682_chat_wakeup_requester_idx",
+	"683_entitlement_feature_attempt":           "683_entitlement_limit_overage",
+	"684_entitlement_feature_attempt_scope_idx": "684_entitlement_limit_overage_scope_idx",
+	"685_docs":                        "685_project_folder",
+	"686_doc_folder_pkey_index":       "686_project_folder_name_idx",
+	"687_doc_folder_pkey":             "687_entitlement_feature_attempt",
+	"688_doc_pkey_index":              "688_entitlement_feature_attempt_scope_idx",
+	"689_doc_pkey":                    "689_docs",
+	"690_doc_version_pkey_index":      "690_doc_folder_pkey_index",
+	"691_doc_version_pkey":            "691_doc_folder_pkey",
+	"692_doc_folder_workspace_idx":    "692_doc_pkey_index",
+	"693_doc_workspace_idx":           "693_doc_pkey",
+	"694_doc_version_workspace_idx":   "694_doc_version_pkey_index",
+	"695_inbox_item_returned_at":      "695_doc_version_pkey",
+	"696_inbox_item_active_shown_idx": "696_doc_folder_workspace_idx",
+}
+
+// historicalCandidateUploadVersions is the upload feature's numbering on the
+// upstream CANDIDATE branch (branch mys-2811-upload-upstream-clean), which
+// numbered it 660-663 because upstream had claimed 657-659 at candidate time. See
+// docs/upload-patch-contract.md.
+//
+// These are not this distribution's names and not upstream's either, but an
+// operator who built or tried the candidate can leave one behind — typically
+// beside a legitimate `.2` prefix. Naming them lets the refusal say which lineage
+// it found instead of a generic "unknown version".
+var historicalCandidateUploadVersions = map[string]string{
+	"660_attachment_upload_session":             "the historical upstream candidate numbered the upload table 660; this distribution has 657",
+	"661_attachment_upload_session_staging_key": "the historical upstream candidate numbered this index 661; this distribution has 658",
+	"662_attachment_upload_session_due":         "the historical upstream candidate numbered this index 662; this distribution has 659",
+	"663_attachment_upload_session_workspace":   "the historical upstream candidate numbered this index 663; this distribution has 660",
+}
+
+// ledgerAlias is a version string this distribution may legitimately find in
+// schema_migrations without shipping a file of that name today: a name an earlier
+// build of THIS distribution shipped before renumbering it. The run ledger has to
+// keep accepting them, because renaming an applied migration would either re-run
+// or skip it.
+//
+// The successor is what makes the entry verifiable rather than an assertion: it
+// must be a file this build ships today, so an alias cannot be invented to wave a
+// foreign ledger through. TestLineageTablesMatchTheShippedTree pins that.
+type ledgerAlias struct {
+	successor string
+	reason    string
+}
+
+// historicalLedgerAliases is deliberately small. Each entry is a renumber this
+// package already has a regression test for; do not add one without that test.
+var historicalLedgerAliases = map[string]ledgerAlias{
+	"458_activity_log_member_assignee_frequency_index": {
+		successor: "466_activity_log_member_assignee_frequency_index",
+		reason:    "renamed before release; see TestAssigneeFrequencyRenumberPreservesExistingIndex",
+	},
+	"665_runtime_rate_limit": {
+		successor: "677_runtime_rate_limit",
+		reason:    "renamed before release; see TestRuntimeRateLimitRenumberPreservesExistingSnapshot",
+	},
+	"665_runtime_profile_daemon": {
+		successor: "678_runtime_profile_daemon",
+		reason:    "renamed before release; see TestRuntimeProfileDaemonRenumberPreservesPreviewBindings",
+	},
+}
+
+// ledgerLineage is the set of version strings a run may find in an existing
+// schema_migrations table and still proceed. Reaching outside it means the
+// ledger was written by a lineage this build does not upgrade in place, and the
+// run must stop before its first statement.
+type ledgerLineage struct {
+	// known maps every acceptable version to a short provenance note, used in
+	// the refusal message.
+	known map[string]string
+	// upstream is the set of filenames the upstream line records under numbers
+	// this distribution reuses. Seeing one is the specific, common case of a
+	// foreign ledger and gets a targeted explanation.
+	upstream map[string]string
+	// candidate is the historical upstream candidate's upload numbering.
+	candidate map[string]string
+	// order is the apply order of the versions this build ships, and position
+	// maps a version to its index in that order. Together they let the check
+	// verify that a ledger is a PREFIX of what a run would apply, not merely a
+	// set of names that exist.
+	order    []string
+	position map[string]int
+	// aliasPosition maps a historical alias to the position of the version that
+	// replaced it, so an alias occupies the same slot its predecessor did.
+	aliasPosition map[string]int
+}
+
+// newLedgerLineage derives the acceptable set from the files this run would
+// apply, so the check tracks the shipped tree instead of a hand-maintained
+// list. It is a superset across directions: a rollback runs a subset of the
+// same versions, and a ledger is good or bad regardless of direction.
+func newLedgerLineage() (*ledgerLineage, error) {
+	files, err := migrations.Files("up")
+	if err != nil {
+		return nil, err
+	}
+	lineage := &ledgerLineage{
+		known:     make(map[string]string, len(files)+len(historicalLedgerAliases)),
+		upstream:  upstreamLineageVersions,
+		candidate: historicalCandidateUploadVersions,
+	}
+	lineage.position = make(map[string]int, len(files))
+	lineage.aliasPosition = make(map[string]int, len(historicalLedgerAliases))
+	for _, file := range files {
+		version := migrations.ExtractVersion(file)
+		if version == "" {
+			continue
+		}
+		lineage.known[version] = "shipped by this build"
+		lineage.position[version] = len(lineage.order)
+		lineage.order = append(lineage.order, version)
+	}
+	for alias, entry := range historicalLedgerAliases {
+		lineage.known[alias] = entry.reason
+		// An alias stands in for the version that replaced it, so it belongs at
+		// that version's slot. 665_runtime_rate_limit was renamed to
+		// 677_runtime_rate_limit; an installation that applied the old name has
+		// the object the new one builds, at the same point in the sequence.
+		if pos, ok := lineage.position[entry.successor]; ok {
+			lineage.aliasPosition[alias] = pos
+		}
+	}
+	return lineage, nil
+}
+
+// check refuses a ledger this build must not write to. Unknown versions are the
+// real signal: a ledger written by the fork, by any earlier release of it, or by
+// an interrupted run of either contains only shipped versions and verified
+// aliases. Anything else — the upstream line, a hand-edited ledger, a database
+// from another product — would receive DDL under numbers that mean something
+// else here.
+//
+// This is an allowlist rather than a denylist on purpose. The first version of
+// this guard listed the 40 upstream filenames and refused only those, so a
+// ledger holding a legitimate `.2` prefix PLUS one leftover stem from the
+// historical candidate (661_attachment_upload_session_staging_key) passed the
+// check and the run appended 40 migrations on top of it.
+func (l *ledgerLineage) check(ctx context.Context, q ledgerQuerier, table string) error {
+	var exists bool
+	if err := q.QueryRow(ctx, fmt.Sprintf("SELECT to_regclass(%s) IS NOT NULL", quoteLiteral(table))).Scan(&exists); err != nil {
+		return fmt.Errorf("inspect migration ledger: %w", err)
+	}
+	if !exists {
+		// No ledger: a fresh database. Nothing has been written by any lineage.
+		return nil
+	}
+
+	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s ORDER BY version", table))
+	if err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	defer rows.Close()
+
+	var unknown, foreign, candidate []string
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("read migration ledger: %w", err)
+		}
+		if _, ok := l.known[version]; ok {
+			continue
+		}
+		if _, ok := l.upstream[version]; ok {
+			foreign = append(foreign, version)
+			continue
+		}
+		if _, ok := l.candidate[version]; ok {
+			candidate = append(candidate, version)
+			continue
+		}
+		unknown = append(unknown, version)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	// Every recorded version is a name this build knows. That is necessary but
+	// not sufficient: a migration may only be recorded after everything before it
+	// in apply order, because that is the only way the runner can produce it.
+	//
+	// Without this, a ledger holding all of `.2` PLUS one later version was
+	// accepted — the version was a legitimate stem, so the name check passed —
+	// and the run then applied the versions in between on top of a schema that
+	// claimed to already have the later one. Acceptance found exactly that with
+	// `700_inbox_item_active_shown_idx` added to a `.2` database: two `up` runs
+	// exited 0, the ledger reached 724, and `idx_inbox_active_shown` — the index
+	// that version exists to build — was never created, because the runner saw
+	// 700 recorded and skipped it.
+	if len(unknown) == 0 && len(foreign) == 0 && len(candidate) == 0 {
+		if err := l.requireApplyOrderPrefix(ctx, q, table); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if len(candidate) > 0 {
+		sort.Strings(candidate)
+		details := make([]string, 0, len(candidate))
+		for _, version := range candidate {
+			details = append(details, version+" ("+l.candidate[version]+")")
+		}
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations holds %s from the historical upstream candidate branch, which numbered the upload feature 660-663 while this distribution keeps it at 657-660. The two share numbers with different objects, so applying migrations here would record this build's versions beside another lineage's rows. Restore a backup taken from this distribution, or rebuild the database",
+			strings.Join(details, "; "))
+	}
+	if len(foreign) > 0 {
+		sort.Strings(foreign)
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this build numbers those same files 661_inbox_item_snoozed_until..700_inbox_item_active_shown_idx and keeps its own upload feature at 657-660, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
+			strings.Join(foreign, ", "))
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("refusing to migrate a database whose schema_migrations contains %d version(s) this build does not ship or recognise as one of its own historical names: %s. Applying migrations on top would record this build's versions beside another lineage's rows, and the shared numbers mean different objects. Restore a backup taken from this distribution, rebuild the database, or — if these are legitimate earlier release names — add them to historicalLedgerAliases with the reason",
+		len(unknown), strings.Join(unknown, ", "))
+}
+
+// requireApplyOrderPrefix refuses a ledger that does not cover a contiguous
+// prefix of the apply order.
+//
+// The runner applies files in sorted order and records each one as it goes, so
+// every ledger it produced — complete, interrupted, or holding versions whose SQL
+// a condition skipped — covers positions 0..k-1 with no holes. Nothing else is
+// reachable: to record the version at position k it must first have recorded all
+// of 0..k-1.
+//
+// Aliases are placed at the position of the version that replaced them. An
+// installation that applied `665_runtime_rate_limit` before the rename HAS the
+// object `677_runtime_rate_limit` builds, so the alias covers that slot; it is
+// evidence of an older renumber, not a gap. A ledger may hold both the alias and
+// the successor — the rename changed the version string, so the successor was
+// applied later on top of it — and because this works on a SET of positions that
+// is not a collision.
+//
+// Historical duplicate NUMBERS (020, 026, ... up to 128) are separate files with
+// separate positions, so they need no special case. Conditional skips are still
+// recorded by the runner, so they occupy their position like any other.
+//
+// Without this check a ledger holding all of `.2` PLUS one later version was
+// accepted: that version is a legitimate stem, so the name check passed. The run
+// then applied the versions in between on a schema that already claimed the later
+// one. Acceptance found exactly that with `700_inbox_item_active_shown_idx` added
+// to a `.2` database: two `up` runs exited 0, the ledger reached 724 rows, and
+// `idx_inbox_active_shown` — the index that version exists to build — was never
+// created, because the runner saw 700 recorded and skipped its SQL.
+func (l *ledgerLineage) requireApplyOrderPrefix(ctx context.Context, q ledgerQuerier, table string) error {
+	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s ORDER BY version", table))
+	if err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	defer rows.Close()
+
+	covered := make(map[int]string)
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return fmt.Errorf("read migration ledger: %w", err)
+		}
+		if pos, ok := l.position[version]; ok {
+			covered[pos] = version
+			continue
+		}
+		if pos, ok := l.aliasPosition[version]; ok {
+			// Do not overwrite a shipped version already at this slot: the
+			// recorded file is the better name to report.
+			if _, taken := covered[pos]; !taken {
+				covered[pos] = version
+			}
+			continue
+		}
+		// Anything else was classified earlier; it cannot reach here.
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	if len(covered) == 0 {
+		return nil
+	}
+
+	// The covered positions must be exactly 0..len(covered)-1. Anything else is
+	// either a hole (a missing migration) or a version recorded ahead of the
+	// migrations before it.
+	maxPos := 0
+	for pos := range covered {
+		if pos > maxPos {
+			maxPos = pos
+		}
+	}
+	for pos := 0; pos <= maxPos; pos++ {
+		if _, ok := covered[pos]; ok {
+			continue
+		}
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations does not cover a contiguous prefix: %q is missing at apply position %d (0-based), but %q is already recorded at position %d. Preserve this database for inspection and restore a verified backup to a separate database before retrying. Do not insert or delete migration ledger rows",
+			l.order[pos], pos, covered[maxPos], maxPos)
+	}
+	// Reaching here means every position in 0..maxPos is covered, so there are
+	// exactly maxPos+1 of them.
+	return nil
+}
+
+// quoteLiteral renders a Go string as a SQL string literal.
+func quoteLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+type ledgerQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
@@ -826,6 +1185,31 @@ type runOptions struct {
 	// migration ledger, allowing later migrations to run in environments where
 	// this version's DDL is intentionally unnecessary.
 	Conditions map[string]migrationCondition
+	// AllowUnknownLedgerVersions skips the lineage preflight. Production main()
+	// leaves this false: every version in a real ledger must be one this build
+	// ships or a verified historical alias. Tests that hand-runMigrations a
+	// curated file set and seed arbitrary version strings set it, because their
+	// ledgers are deliberately synthetic.
+	AllowUnknownLedgerVersions bool
+}
+
+// coversShippedSet reports whether opts.Files is the full set this build ships
+// for the direction, which is what the lineage preflight assumes. Tests pass
+// curated subsets to a scratch schema; a subset can never be a prefix of the
+// full order, and its purpose is to exercise one migration, not to validate a
+// database. Production callers pass migrations.Files and therefore always
+// return true here.
+func (o runOptions) coversShippedSet() bool {
+	shipped, err := migrations.Files(o.Direction)
+	if err != nil || len(shipped) != len(o.Files) {
+		return false
+	}
+	for i := range shipped {
+		if filepath.Base(shipped[i]) != filepath.Base(o.Files[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func main() {
@@ -1007,6 +1391,26 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 			slog.Warn("failed to release migration advisory lock", "error", err)
 		}
 	}()
+
+	// Refuse a ledger this build must not write to, before the first statement.
+	// A foreign ledger shares numbers with this one but not the objects behind
+	// them, so continuing would create objects and record versions and only then
+	// fail — or, worse, succeed and leave the database describing two lineages at
+	// once. See ledgerLineage.check.
+	// The preflight only has meaning against the full shipped set: "is this
+	// ledger a prefix of what a run would apply" is unanswerable when the run is
+	// a hand-picked subset. Production always passes migrations.Files, so it
+	// always gets the check; a curated file list (a test fixture) is by
+	// construction a subset and opts out here rather than in each test.
+	if opts.Direction == "up" && !opts.AllowUnknownLedgerVersions && opts.coversShippedSet() {
+		lineage, err := newLedgerLineage()
+		if err != nil {
+			return fmt.Errorf("load the shipped migration set: %w", err)
+		}
+		if err := lineage.check(ctx, conn, tableIdent); err != nil {
+			return err
+		}
+	}
 
 	// Create migrations tracking table.
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`

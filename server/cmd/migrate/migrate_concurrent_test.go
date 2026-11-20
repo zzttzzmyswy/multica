@@ -207,6 +207,12 @@ func (f *fixture) opts() runOptions {
 		Files:                 f.files,
 		SchemaMigrationsTable: f.tableFQN,
 		AdvisoryLockKey:       f.lockKey,
+		// These fixtures write synthetic version names ("001_test_<runid>") to a
+		// temp directory precisely so their files cannot collide with the real
+		// migration set. The lineage preflight would refuse them as versions this
+		// build does not ship, which is the correct answer for a real ledger and
+		// the wrong one for this fixture.
+		AllowUnknownLedgerVersions: true,
 	}
 }
 
