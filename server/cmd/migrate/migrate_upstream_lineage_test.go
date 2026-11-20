@@ -318,55 +318,50 @@ func TestUnsupportedLedgersAreRefused(t *testing.T) {
 // duplicate numeric prefixes, and a recorded conditional skip.
 func TestSupportedLedgersAreAccepted(t *testing.T) {
 	t.Parallel()
+	files, err := migrations.Files("up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineage, err := newLedgerLineage()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
-		name string
-		seed []string
+		name, through, alias string
+		replaceLast          bool
 	}{
-		{name: "empty database", seed: nil},
-		{
-			name: "released .2 upload set",
-			seed: []string{
-				"657_attachment_upload_session",
-				"658_attachment_upload_session_staging_key",
-				"659_attachment_upload_session_due",
-				"660_attachment_upload_session_workspace",
-			},
-		},
-		{
-			name: "interrupted run: an ordered prefix of shipped versions",
-			seed: []string{"001_init", "002_agent_config", "003_task_context"},
-		},
-		{
-			name: "historical duplicate numeric prefixes stay acceptable",
-			seed: []string{"020_issue_number", "020_task_session", "026_comment_reactions", "026_task_messages"},
-		},
-		{
-			name: "a recorded conditional skip is still a shipped version",
-			// Upstream conditions skip these on most databases but still record
-			// them; see upMigrationConditions.
-			seed: []string{"139_issue_description_trgm_index", "140_comment_content_trgm_index", "469_issue_status_lifecycle_categories"},
-		},
-		{
-			name: "verified historical alias",
-			seed: []string{"665_runtime_rate_limit"},
-		},
-		{
-			name: "verified historical alias beside its renumbered successor",
-			seed: []string{"665_runtime_rate_limit", "677_runtime_rate_limit"},
-		},
+		{name: "empty database"},
+		{name: "released .2 upload set", through: "660_attachment_upload_session_workspace"},
+		{name: "interrupted run", through: "003_task_context"},
+		{name: "duplicate numeric prefixes", through: "026_task_messages"},
+		{name: "conditional skips", through: "469_issue_status_lifecycle_categories"},
+		{name: "alias replaces successor", through: "677_runtime_rate_limit", alias: "665_runtime_rate_limit", replaceLast: true},
+		{name: "alias beside successor", through: "677_runtime_rate_limit", alias: "665_runtime_rate_limit"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newLedgerFixture(t, "supported_")
-			f.seed(t, tc.seed...)
-			// An empty file list exercises the preflight alone without running
-			// DDL against objects the seeded ledger claims exist.
-			err := runMigrations(f.ctx, f.pool, runOptions{
-				Direction:             "up",
-				SchemaMigrationsTable: f.table,
-				AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
-			})
-			if err != nil {
+			var versions []string
+			if tc.through != "" {
+				for _, file := range files {
+					version := migrations.ExtractVersion(file)
+					versions = append(versions, version)
+					if version == tc.through {
+						break
+					}
+				}
+				if len(versions) == 0 || versions[len(versions)-1] != tc.through {
+					t.Fatalf("shipped prefix does not end at %q", tc.through)
+				}
+				if tc.replaceLast {
+					versions = versions[:len(versions)-1]
+				}
+			}
+			if tc.alias != "" {
+				versions = append(versions, tc.alias)
+			}
+			f.seed(t, versions...)
+			if err := lineage.check(f.ctx, f.pool, f.table); err != nil {
 				t.Fatalf("supported ledger was refused: %v", err)
 			}
 		})

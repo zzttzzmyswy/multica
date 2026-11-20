@@ -772,7 +772,6 @@ func (l *ledgerLineage) requireApplyOrderPrefix(ctx context.Context, q ledgerQue
 	defer rows.Close()
 
 	covered := make(map[int]string)
-	var aliases int
 	for rows.Next() {
 		var version string
 		if err := rows.Scan(&version); err != nil {
@@ -788,7 +787,6 @@ func (l *ledgerLineage) requireApplyOrderPrefix(ctx context.Context, q ledgerQue
 			if _, taken := covered[pos]; !taken {
 				covered[pos] = version
 			}
-			aliases++
 			continue
 		}
 		// Anything else was classified earlier; it cannot reach here.
@@ -813,17 +811,8 @@ func (l *ledgerLineage) requireApplyOrderPrefix(ctx context.Context, q ledgerQue
 		if _, ok := covered[pos]; ok {
 			continue
 		}
-		// The hole names the missing migration: the first shipped version at or
-		// after the hole that is not itself covered.
-		missing := "<unknown>"
-		for probe := pos; probe < len(l.order); probe++ {
-			if _, recorded := covered[probe]; !recorded {
-				missing = l.order[probe]
-				break
-			}
-		}
-		return fmt.Errorf("refusing to migrate a database whose schema_migrations does not cover a contiguous prefix of the migrations this build applies: apply position %d (0-based) is missing, so %q — and everything from there — would be skipped, because the runner treats a recorded version as already applied. The ledger holds %d distinct position(s) with %d historical alias row(s). Record the missing migrations, restore a backup taken before the ledger was edited, or rebuild the database; do not delete ledger rows to force the run through",
-			pos, missing, len(covered), aliases)
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations does not cover a contiguous prefix: %q is missing at apply position %d (0-based), but %q is already recorded at position %d. Preserve this database for inspection and restore a verified backup to a separate database before retrying. Do not insert or delete migration ledger rows",
+			l.order[pos], pos, covered[maxPos], maxPos)
 	}
 	// Reaching here means every position in 0..maxPos is covered, so there are
 	// exactly maxPos+1 of them.
