@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -143,6 +144,25 @@ var concurrentIndexCleanups = map[string]string{
 	"660_attachment_upload_session_workspace":                   "idx_attachment_upload_session_workspace",
 	"659_attachment_upload_session_due":                         "idx_attachment_upload_session_due",
 	"658_attachment_upload_session_staging_key":                 "uq_attachment_upload_session_staging_key",
+	"680_chat_wakeup_due_idx":                                   "idx_chat_wakeup_due",
+	"681_chat_wakeup_session_idx":                               "idx_chat_wakeup_session",
+	"682_chat_wakeup_requester_idx":                             "idx_chat_wakeup_requester",
+	"684_entitlement_limit_overage_scope_idx":                   "uq_entitlement_limit_overage_scope",
+	"686_project_folder_name_idx":                               "uq_project_folder_workspace_name",
+	"688_entitlement_feature_attempt_scope_idx":                 "uq_entitlement_feature_attempt_scope",
+	"690_doc_folder_pkey_index":                                 "doc_folder_pkey_idx",
+	"692_doc_pkey_index":                                        "doc_pkey_idx",
+	"694_doc_version_pkey_index":                                "doc_version_pkey_idx",
+	"696_doc_folder_workspace_idx":                              "doc_folder_workspace_idx",
+	"697_doc_workspace_idx":                                     "doc_workspace_idx",
+	"698_doc_version_workspace_idx":                             "doc_version_workspace_idx",
+	"700_inbox_item_active_shown_idx":                           "idx_inbox_active_shown",
+	"675_weixin_account_state_unique_index":                     "weixin_account_state_pkey",
+	"673_weixin_login_session_unique_index":                     "weixin_login_session_pkey",
+	"670_weixin_login_expiry_idx":                               "weixin_login_expiry_idx",
+	"666_chat_task_supplement_message":                          "uq_chat_task_supplement_message",
+	"667_chat_task_supplement_task":                             "idx_chat_task_supplement_task",
+	"668_chat_task_supplement_workspace":                        "idx_chat_task_supplement_workspace",
 	"654_chat_submission_receipt_key":                           "uq_chat_submission_receipt_key",
 	"655_chat_submission_receipt_workspace":                     "idx_chat_submission_receipt_workspace",
 	"651_task_context_receipt_issue_idx":                        "idx_task_context_receipt_issue",
@@ -467,6 +487,107 @@ var sourceContextMigrationVersions = []string{
 }
 
 type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// upstreamLineageVersions maps an upstream migration filename to the fork
+// filename that now occupies the same number. The fork released its upload
+// feature as 657-660 and this distribution shifted the whole upstream block up
+// by four (657-696 -> 661-700) so both lineages keep unique numbers.
+//
+// A database migrated by the upstream line records the LEFT-hand strings. The
+// fork ledger never produces them, so seeing one means the schema_migrations
+// table belongs to a different lineage that merely shares numbers — the
+// columns those versions guard are not the columns this build expects. Applying
+// the fork's 661+ block on top would fail halfway through with "relation
+// already exists" after already creating objects and writing ledger rows, so
+// the run must stop before its first statement.
+var upstreamLineageVersions = map[string]string{
+	"657_inbox_item_snoozed_until":              "657_attachment_upload_session",
+	"658_project_archive":                       "658_attachment_upload_session_staging_key",
+	"659_issue_view_preference_projects_page":   "659_attachment_upload_session_due",
+	"660_inbox_item_snoozed_at":                 "660_attachment_upload_session_workspace",
+	"661_chat_task_supplement":                  "661_inbox_item_snoozed_until",
+	"662_chat_task_supplement_message":          "662_project_archive",
+	"663_chat_task_supplement_task":             "663_issue_view_preference_projects_page",
+	"664_chat_task_supplement_workspace":        "664_inbox_item_snoozed_at",
+	"665_weixin_state":                          "665_chat_task_supplement",
+	"666_weixin_login_expiry_idx":               "666_chat_task_supplement_message",
+	"667_issue_origin_weixin_chat":              "667_chat_task_supplement_task",
+	"668_issue_origin_weixin_chat_validate":     "668_chat_task_supplement_workspace",
+	"669_weixin_login_session_unique_index":     "669_weixin_state",
+	"670_weixin_login_session_primary_key":      "670_weixin_login_expiry_idx",
+	"671_weixin_account_state_unique_index":     "671_issue_origin_weixin_chat",
+	"672_weixin_account_state_primary_key":      "672_issue_origin_weixin_chat_validate",
+	"673_runtime_rate_limit":                    "673_weixin_login_session_unique_index",
+	"674_runtime_profile_daemon":                "674_weixin_login_session_primary_key",
+	"675_chat_wakeup":                           "675_weixin_account_state_unique_index",
+	"676_chat_wakeup_due_idx":                   "676_weixin_account_state_primary_key",
+	"677_chat_wakeup_session_idx":               "677_runtime_rate_limit",
+	"678_chat_wakeup_requester_idx":             "678_runtime_profile_daemon",
+	"679_entitlement_limit_overage":             "679_chat_wakeup",
+	"680_entitlement_limit_overage_scope_idx":   "680_chat_wakeup_due_idx",
+	"681_project_folder":                        "681_chat_wakeup_session_idx",
+	"682_project_folder_name_idx":               "682_chat_wakeup_requester_idx",
+	"683_entitlement_feature_attempt":           "683_entitlement_limit_overage",
+	"684_entitlement_feature_attempt_scope_idx": "684_entitlement_limit_overage_scope_idx",
+	"685_docs":                        "685_project_folder",
+	"686_doc_folder_pkey_index":       "686_project_folder_name_idx",
+	"687_doc_folder_pkey":             "687_entitlement_feature_attempt",
+	"688_doc_pkey_index":              "688_entitlement_feature_attempt_scope_idx",
+	"689_doc_pkey":                    "689_docs",
+	"690_doc_version_pkey_index":      "690_doc_folder_pkey_index",
+	"691_doc_version_pkey":            "691_doc_folder_pkey",
+	"692_doc_folder_workspace_idx":    "692_doc_pkey_index",
+	"693_doc_workspace_idx":           "693_doc_pkey",
+	"694_doc_version_workspace_idx":   "694_doc_version_pkey_index",
+	"695_inbox_item_returned_at":      "695_doc_version_pkey",
+	"696_inbox_item_active_shown_idx": "696_doc_folder_workspace_idx",
+}
+
+// refusedUpstreamLineage reports the upstream-lineage versions present in the
+// ledger, sorted, so the error names every collision at once instead of the
+// first one the runner happens to trip over. A ledger table that does not exist
+// yet cannot have been written by any lineage, so it yields no collisions.
+func refusedUpstreamLineage(ctx context.Context, q ledgerQuerier, table string) ([]string, error) {
+	var exists bool
+	if err := q.QueryRow(ctx, fmt.Sprintf("SELECT to_regclass(%s) IS NOT NULL", quoteLiteral(table))).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+
+	rows, err := q.Query(ctx, fmt.Sprintf("SELECT version FROM %s", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var refused []string
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+		if _, ok := upstreamLineageVersions[version]; ok {
+			refused = append(refused, version)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(refused)
+	return refused, nil
+}
+
+// quoteLiteral renders a Go string as a SQL string literal.
+func quoteLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+type ledgerQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
@@ -1007,6 +1128,24 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 			slog.Warn("failed to release migration advisory lock", "error", err)
 		}
 	}()
+
+	// Refuse a foreign lineage before the first statement of the run. An
+	// upstream-ledger database shares this build's numbers 657-700 but not the
+	// objects behind them, so continuing would create objects and record
+	// versions and only then fail, leaving a half-upgraded schema.
+	if opts.Direction == "up" {
+		refused, err := refusedUpstreamLineage(ctx, conn, tableIdent)
+		if err != nil {
+			return fmt.Errorf("inspect migration ledger lineage: %w", err)
+		}
+		if len(refused) > 0 {
+			return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this fork numbers the same files %s..%s, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
+				strings.Join(refused, ", "),
+				upstreamLineageVersions[refused[0]],
+				"700_inbox_item_active_shown_idx",
+			)
+		}
+	}
 
 	// Create migrations tracking table.
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`

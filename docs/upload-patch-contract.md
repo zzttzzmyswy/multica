@@ -47,12 +47,46 @@ plus one, and update the cleanup map with it.
 teardown hands its rows to the reconciler instead of deleting them, because the
 row is the only record naming an object the client's write may still materialize.
 
-**Migrating a live fork database to a future sync is not solved here.** The 657–660
-rows exist; a future upstream line will allocate the same numbers to different
-changes. Which migration runs on which database, and whether the upload table's
-numbers can move at all, has to be designed against the deployed schema and
-rehearsed on a restored copy before any sync ships. Do not treat a clean
-cherry-pick as evidence that a deployed database can be upgraded.
+## Migrating a deployed fork database (solved in `v0.11.1-myswy.1`)
+
+The 657–660 rows exist on every deployed database, and upstream later allocated
+the same numbers to different changes. The resolution keeps the fork's numbers
+frozen and shifts the **whole** upstream block up by four:
+
+| Lineage | 657–660 | 661–700 |
+| --- | --- | --- |
+| fork (deployed, `v0.9.0-myswy.2`) | upload feature (frozen) | — |
+| fork (`v0.11.1-myswy.1` and later) | upload feature (frozen) | upstream's 657–696, renumbered +4 |
+
+Upstream 657–696 become 661–700 in this distribution. Their SQL bodies are
+unchanged; only the prefix moves, plus the `migration NNN` cross-references in
+the four files that name a sibling. `server/cmd/migrate/main.go` lists the
+concurrent-index cleanup hooks under the **new** numbers, and
+`TestEveryConcurrentUpBuildHasCleanup` fails the build if an entry is missed.
+
+Because the two lineages now hold different filenames under 657–700, a
+`schema_migrations` table written by upstream is not a valid starting point.
+`runMigrations` refuses it **before the first statement** —
+`upstreamLineageVersions` in `server/cmd/migrate/main.go` names every colliding
+upstream filename, and `TestRunMigrationsRefusesUpstreamLineageBeforeAnySideEffect`
+pins that no table is created and no ledger row is written before the refusal.
+Without that guard the run reached `665_chat_task_supplement`, failed on
+`relation already exists`, and left a half-upgraded schema behind.
+
+What this supports, and what it does not:
+
+- **Supported:** a database this distribution migrated (upstream `v0.9.0` plus
+  the fork's 657–660), upgraded by running `migrate up` at `v0.11.1-myswy.1` or
+  later. The upload rows, their indexes (same OIDs) and the 657–660 ledger rows
+  all survive; the new 661–700 block appends.
+- **Refused:** a database the upstream line migrated. The error names the
+  colliding versions. Rebuild it, or restore a backup taken from this
+  distribution — do not delete ledger rows to force it through.
+- **Not covered:** any lineage that has applied neither. A partial or mixed
+  ledger needs the same treatment as the refused case.
+
+Rehearse on a restored copy before a real switch; the operations card for the
+version being deployed owns the backup, compatibility and rollback conditions.
 
 ## Behaviour that must survive a conflict resolution
 
@@ -95,6 +129,22 @@ the multi-agent concurrent-registration smoke. A change confined to upload
 sessions instead needs the concurrent-complete and cleanup-race regression; that
 coverage already exists in `attachment_upload_test.go` and
 `attachment_upload_reconciler_test.go` and must not be deleted.
+
+## Frontend checks run on CI's Node version
+
+The `frontend-test` job pins Node 22. Run these on 22 as well, not on whatever
+`node` is on the developer machine: Node 25+ ships a global `localStorage` that
+`packages/vitest-setup/web-storage.ts` replaces with an in-memory shim, and
+`Object.keys(shim)` returns the shim's *methods*, so
+`clearAllWorkspaceStorage` cannot enumerate stored keys and
+`platform/doc-session-cleanup.test.ts` fails. That is a Node-version artifact,
+not a regression — it reproduces on the unmodified upstream tag.
+
+```bash
+pnpm --filter @multica/core test        # Node 22
+pnpm --filter @multica/core typecheck
+pnpm --filter @multica/core lint
+```
 
 ## Where the history went
 
