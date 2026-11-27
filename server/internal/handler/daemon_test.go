@@ -2041,10 +2041,10 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	autopilotID := dbfx.Insert(t, "autopilot", testutil.Cols{
 		"workspace_id":    testWorkspaceID,
@@ -2341,10 +2341,10 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	const projectDescription = "Use only the bound project resources."
 	projectID := dbfx.Project(t, "Run-only autopilot project", testutil.Cols{
@@ -2545,10 +2545,10 @@ func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *test
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	setWorkspaceIssuePrefixForTest(t, "MUL")
 
@@ -2632,10 +2632,10 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "mul-1198 dedup fixture", testutil.Cols{
 		"status": "in_progress",
@@ -2686,10 +2686,10 @@ func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T)
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "trivial-done-suppression fixture", testutil.Cols{
 		"status": "in_progress",
@@ -2734,10 +2734,10 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "assignment-trivial-done fixture", testutil.Cols{
 		"status": "in_progress",
@@ -4017,10 +4017,10 @@ func TestGetTaskGCCheck(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	// Quick-create-shaped task: no issue_id, no chat_session_id, no run id.
 	// context.type is set so ResolveTaskWorkspaceID can recover workspace.
@@ -4723,10 +4723,10 @@ func TestAckTaskCancelled(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	chatSessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
 		"title": "cancel ack test",
