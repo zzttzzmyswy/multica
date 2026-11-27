@@ -450,11 +450,24 @@ func TestInterruptedRunResumes(t *testing.T) {
 // The explanatory upstream map and the alias table are part of the contract: the
 // map must describe real number collisions, and every alias must name a version
 // this build actually ships at a different number.
+//
+// The count is deliberately NOT pinned to a constant. Each upstream sync adds
+// exactly the migrations it renumbers, and a hardcoded total turns every future
+// sync into a test edit that says nothing about the property being checked. What
+// matters is the shape: every entry is a real collision (same number, different
+// file) whose upstream name is absent from this build and whose shifted
+// successor is present. TestEveryRenumberedUpstreamMigrationHasALineageEntry
+// covers the other direction — no shifted migration may go unlisted.
 func TestLineageTablesMatchTheShippedTree(t *testing.T) {
 	t.Parallel()
 
-	if got, want := len(upstreamLineageVersions), 40; got != want {
-		t.Fatalf("upstreamLineageVersions has %d entries, want %d (upstream 657-696)", got, want)
+	shipped := map[string]bool{}
+	files, err := shippedMigrationFiles(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		shipped[migrations.ExtractVersion(file)] = true
 	}
 	for upstream, fork := range upstreamLineageVersions {
 		upstreamNumber, err := leadingMigrationNumber(upstream)
@@ -472,6 +485,12 @@ func TestLineageTablesMatchTheShippedTree(t *testing.T) {
 				upstream, fork, upstreamNumber, forkNumber)
 		}
 		realMigrationFiles(t, []string{fork}, "up")
+		// The upstream name is the one THIS BUILD DOES NOT HAVE. Without this
+		// the entry could silently become an alias for a shipped version and
+		// the refusal would no longer explain a real foreign ledger.
+		if shipped[upstream] {
+			t.Errorf("upstream version %q is also shipped by this build; it is not a collision", upstream)
+		}
 		// The upstream change itself must live on in this build, shifted by four.
 		_, suffix, _ := strings.Cut(upstream, "_")
 		realMigrationFiles(t, []string{fmt.Sprintf("%d_%s", upstreamNumber+4, suffix)}, "up")

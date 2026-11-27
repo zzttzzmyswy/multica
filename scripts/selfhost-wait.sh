@@ -87,6 +87,9 @@ else
   echo "Images: ${MULTICA_BACKEND_IMAGE:-ghcr.io/zzttzzmyswy/multica-backend}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.2}"
   echo "        ${MULTICA_WEB_IMAGE:-ghcr.io/zzttzzmyswy/multica-web}:${MULTICA_IMAGE_TAG:-v0.9.0-myswy.2}"
 fi
+case ",${COMPOSE_PROFILES:-}," in
+  *,collab,*) echo "Live doc co-editing: on (collab service)" ;;
+esac
 echo ""
 echo "Log in: configure RESEND_API_KEY in .env for email codes,"
 echo "        or read the generated code from backend logs when Resend is unset."

@@ -51,18 +51,31 @@ row is the only record naming an object the client's write may still materialize
 
 The 657–660 rows exist on every deployed database, and upstream later allocated
 the same numbers to different changes. The resolution keeps the fork's numbers
-frozen and shifts the **whole** upstream block up by four:
+frozen and shifts the **whole** upstream block up by four. It is cumulative: each
+later sync shifts its own block the same way.
 
-| Lineage | 657–660 | 661–700 |
-| --- | --- | --- |
-| fork (deployed, `v0.9.0-myswy.2`) | upload feature (frozen) | — |
-| fork (`v0.11.1-myswy.1` and later) | upload feature (frozen) | upstream's 657–696, renumbered +4 |
+| Lineage | 657–660 | 661–700 | 701–759 |
+| --- | --- | --- | --- |
+| fork (deployed, `v0.9.0-myswy.2`) | upload feature (frozen) | — | — |
+| fork (`v0.11.1-myswy.1`) | upload feature (frozen) | upstream's 657–696, +4 | — |
+| fork (`v0.13.0-myswy.1` and later) | upload feature (frozen) | upstream's 657–696, +4 | upstream's 697–755, +4 |
 
-Upstream 657–696 become 661–700 in this distribution. Their SQL bodies are
-unchanged; only the prefix moves, plus the `migration NNN` cross-references in
-the four files that name a sibling. `server/cmd/migrate/main.go` lists the
-concurrent-index cleanup hooks under the **new** numbers, and
+Upstream 657–696 became 661–700, and upstream 697–755 became 701–759. Their SQL
+bodies are unchanged; only the prefix moves, plus the `migration NNN`
+cross-references in the files that name a sibling. `server/cmd/migrate/main.go`
+lists the concurrent-index cleanup hooks under the **new** numbers (a down
+direction registers under the down file's version, not the up one), and
 `TestEveryConcurrentUpBuildHasCleanup` fails the build if an entry is missed.
+
+Renumbering is easy to get subtly wrong in a way no default test run notices, so
+three checks pin the shipped tree without needing a database:
+`TestLatestUpstreamBlockSuffixesMatchTheFrozenList` (every shifted number has the
+upstream change that belongs there), `TestRenumberedMigrationBodiesAreTheUpstreamBytes`
+(the bodies are upstream's bytes, so a rename applied to the wrong pair fails)
+and `TestEveryRenumberedUpstreamMigrationHasALineageEntry` (every renumbered
+version is explainable to an operator whose ledger came from another lineage).
+`TestFirstSyncBlockAndFrozenUploadNumbersAreUnchanged` keeps the earlier blocks
+from drifting while a new one is added.
 
 Because the lineages hold different filenames under 657–700, a ledger is only a
 valid starting point if **every** row in it belongs to this distribution.
@@ -72,7 +85,7 @@ each recorded version must be a file this build ships, or one of the verified
 before renumbering it, each paired with its regression test).
 
 An allowlist rather than a denylist is deliberate. The first version of this
-guard listed the 40 upstream filenames and refused only those; a ledger holding
+guard listed the then-known upstream filenames and refused only those; a ledger holding
 a legitimate `.2` prefix **plus one leftover stem from the historical upstream
 candidate** (`661_attachment_upload_session_staging_key`, the candidate's name
 for the staging-key index) passed it, and the run appended 40 migrations on top
@@ -82,7 +95,7 @@ for the staging-key index) passed it, and the run appended 40 migrations on top
 supported range and a ledger from another product.
 
 Three lineages are named explicitly so the refusal says which one it found:
-`upstreamLineageVersions` (upstream 657–696),
+`upstreamLineageVersions` (upstream 657–755, the numbers this distribution reuses),
 `historicalCandidateUploadVersions` (the candidate's upload numbering 660–663),
 and anything else is reported as an unrecognised version.
 

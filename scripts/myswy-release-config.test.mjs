@@ -263,15 +263,39 @@ test("self-host image defaults point at the distribution namespace", () => {
   const envExample = read("../.env.example");
   const helmValues = readYaml("../deploy/helm/multica/values.yaml");
 
-  assert.doesNotMatch(
-    compose,
-    new RegExp(`ghcr\\.io/${UPSTREAM_OWNER}/multica-`),
-    "docker-compose.selfhost.yml must not default to upstream images",
+  // Exactly one image may name upstream: the optional collab service, which
+  // this distribution does not build or publish, so it has to come from
+  // upstream at the upstream version. Every other reference — backend, web —
+  // must be the distribution's own, or a published fork build would silently be
+  // replaced by an upstream one (or the pull would fail, for collab, if it used
+  // a fork tag).
+  const upstreamImages =
+    /ghcr\.io\/multica-ai\/multica-(?!collab\b)[a-z]+/g;
+  const upstreamRefs = (text) => text.match(upstreamImages) ?? [];
+  assert.deepEqual(
+    upstreamRefs(compose),
+    [],
+    "docker-compose.selfhost.yml may only default the collab service to an upstream image",
   );
-  assert.doesNotMatch(
-    envExample,
-    new RegExp(`ghcr\\.io/${UPSTREAM_OWNER}/multica-`),
-    ".env.example must not default to upstream images",
+  assert.deepEqual(
+    upstreamRefs(envExample),
+    [],
+    ".env.example may only default the collab service to an upstream image",
+  );
+  assert.match(
+    compose,
+    /MULTICA_COLLAB_IMAGE:-ghcr\.io\/multica-ai\/multica-collab\}:\$\{MULTICA_COLLAB_IMAGE_TAG:-v\d+\.\d+\.\d+\}/,
+    "the collab service must keep its own pinned upstream tag, not MULTICA_IMAGE_TAG",
+  );
+  assert.equal(
+    helmValues.images?.collab?.repository,
+    `ghcr.io/${UPSTREAM_OWNER}/multica-collab`,
+    "the chart's collab image is the one image that stays upstream",
+  );
+  assert.match(
+    String(helmValues.images?.collab?.tag ?? ""),
+    /^v\d+\.\d+\.\d+$/,
+    "the chart's collab tag must pin an upstream version, since no fork collab image exists",
   );
   assert.equal(
     helmValues.images?.backend?.repository,

@@ -6,10 +6,18 @@ import { configStore } from "@multica/core/config";
 import { BILLING_WORKSPACE_SUBSCRIPTIONS_FLAG } from "@multica/core/feature-flags";
 import type {
   AutopilotQuotaUsage,
+  MemberLimit,
+  StorageUsage,
+  AppCallUsage,
   WorkspaceSubscriptionEntitlements,
   WorkspaceSubscriptionPrices,
   WorkspaceSubscriptionSummary,
 } from "@multica/core/types";
+import {
+  bindUpgradeInviteCheckout,
+  readUpgradeInvite,
+  saveUpgradeInvite,
+} from "@multica/core/billing";
 import { renderWithI18n } from "../../test/i18n";
 
 const mocks = vi.hoisted(() => ({
@@ -28,6 +36,12 @@ const mocks = vi.hoisted(() => ({
   refetchPrices: vi.fn(),
   openExternal: vi.fn(),
   workspaceId: "workspace-1",
+  invalidateQueries: vi.fn(() => Promise.resolve()),
+  memberLimit: { action: "off", limit: null, members: null, pendingInvitations: null } as MemberLimit,
+  storageUsage: { action: "off", usedBytes: null, limitBytes: null, reached: null } as StorageUsage,
+  refetchStorage: vi.fn(),
+  appCallUsage: { action: "off", used: null, limit: null, reached: null, resetAt: null, members: [] } as AppCallUsage,
+  members: [] as { user_id: string; name: string }[],
   prices: null as WorkspaceSubscriptionPrices | null,
   pricesLoading: false,
   pricesFetching: false,
@@ -81,7 +95,9 @@ const mocks = vi.hoisted(() => ({
       purchaseSeats: false,
       changePlan: false,
       checkPlanChange: false,
+      purchaseAutopilotRuns: false,
     },
+    autopilotAddon: null,
     planChange: null as WorkspaceSubscriptionSummary["planChange"],
     trial: null as WorkspaceSubscriptionSummary["trial"],
   } as WorkspaceSubscriptionSummary,
@@ -101,9 +117,12 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@tanstack/react-query", () => ({
   useQuery: (options: unknown) => mocks.useQuery(options),
+  useQueryClient: () => ({ invalidateQueries: mocks.invalidateQueries }),
+  queryOptions: <T,>(options: T) => options,
 }));
 
-vi.mock("@multica/core/billing", () => ({
+vi.mock("@multica/core/billing", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@multica/core/billing")>()),
   workspaceSubscriptionPricesOptions: (wsId: string) => ({
     queryKey: ["workspace-subscriptions", wsId, "prices"],
   }),
@@ -157,13 +176,14 @@ vi.mock("@multica/core/paths", () => ({
 const navigationState = {
   search: "tab=billing",
   replace: vi.fn(),
+  push: vi.fn(),
 };
 vi.mock("../../navigation", () => ({
   useNavigation: () => ({
     pathname: "/acme/settings",
     searchParams: new URLSearchParams(navigationState.search),
     hash: "",
-    push: vi.fn(),
+    push: navigationState.push,
     replace: navigationState.replace,
     back: vi.fn(),
     getShareableUrl: vi.fn(),
@@ -171,6 +191,17 @@ vi.mock("../../navigation", () => ({
 }));
 
 vi.mock("../../platform", () => ({ openExternal: mocks.openExternal }));
+
+vi.mock("../../billing/autopilot-addon-dialog", () => ({
+  AutopilotAddonDialog: ({ open }: { open: boolean }) =>
+    open ? <div role="dialog" aria-label="Buy more autopilot runs" /> : null,
+}));
+
+vi.mock("../../billing/autopilot-addon-return-notice", () => ({
+  AutopilotAddonReturnNotice: ({ sessionId }: { sessionId: string | null }) => (
+    <div role="status" aria-label="Add-on return">{sessionId}</div>
+  ),
+}));
 
 import { BillingTab, formatStripeMinorAmount } from "./billing-tab";
 
@@ -259,6 +290,7 @@ describe("BillingTab", () => {
           intervalCount: 1,
         },
       },
+      autopilotAddon: null,
     };
     mocks.changePlanPending = false;
     mocks.pricesLoading = false;
@@ -299,7 +331,9 @@ describe("BillingTab", () => {
         purchaseSeats: false,
         changePlan: false,
         checkPlanChange: false,
+        purchaseAutopilotRuns: false,
       },
+      autopilotAddon: null,
       planChange: null,
       trial: null,
     });
@@ -315,8 +349,25 @@ describe("BillingTab", () => {
       reset_at: "2030-02-01T00:00:00Z",
       blocked_counts: {},
     });
+    localStorage.clear();
+    mocks.memberLimit = { action: "off", limit: null, members: null, pendingInvitations: null };
+    mocks.storageUsage = { action: "off", usedBytes: null, limitBytes: null, reached: null };
+    mocks.appCallUsage = { action: "off", used: null, limit: null, reached: null, resetAt: null, members: [] };
+    mocks.members = [];
     mocks.useQuery.mockImplementation((options: unknown) => {
       const queryKey = (options as { queryKey?: readonly unknown[] }).queryKey;
+      if (queryKey?.[0] === "workspace-storage-usage") {
+        return { data: mocks.storageUsage, isPending: false, isError: false, refetch: mocks.refetchStorage };
+      }
+      if (queryKey?.[0] === "workspace-app-call-usage") {
+        return { data: mocks.appCallUsage, isPending: false, isError: false, isFetching: false, refetch: vi.fn() };
+      }
+      if (queryKey?.length === 3 && queryKey[0] === "workspaces" && queryKey[2] === "members") {
+        return { data: mocks.members, isPending: false, isError: false };
+      }
+      if (queryKey?.[queryKey.length - 1] === "limit") {
+        return { data: mocks.memberLimit, isPending: false, isError: false };
+      }
       if (queryKey?.[queryKey.length - 1] === "prices") {
         return {
           data: mocks.prices,
@@ -421,6 +472,20 @@ describe("BillingTab", () => {
     expect(mocks.useQuery).not.toHaveBeenCalled();
   });
 
+  it("shows the plan's analytics history range only when Cloud reports it", () => {
+    const { unmount } = renderWithI18n(<BillingTab />);
+    expect(screen.queryByText("Analytics history")).toBeNull();
+    unmount();
+
+    mocks.entitlements.limits = {
+      ...mocks.entitlements.limits,
+      dashboardHistoryDays: { mode: "limited", limit: 30 },
+    };
+    renderWithI18n(<BillingTab />);
+    expect(screen.getByText("Analytics history")).toBeInTheDocument();
+    expect(screen.getByText("Last 30 days")).toBeInTheDocument();
+  });
+
   it("shows server prices and keeps the selected interval in sync", async () => {
     const user = userEvent.setup();
     renderWithI18n(<BillingTab />);
@@ -510,7 +575,7 @@ describe("BillingTab", () => {
 
       expect(
         screen.getByText(
-          /Stripe Checkout shows the authoritative per-seat price/,
+          /Stripe shows the final per-seat price/,
         ),
       ).toBeInTheDocument();
       expect(screen.queryByText(/\$0/)).not.toBeInTheDocument();
@@ -590,6 +655,343 @@ describe("BillingTab", () => {
       "https://checkout.stripe.com/test-session",
       { webTarget: "same-tab" },
     );
+  });
+
+  describe("member limit", () => {
+    const upgraded = () => {
+      Object.assign(mocks.entitlements, { plan: "pro", status: "active", version: 1 });
+      mocks.summary.availableActions.checkout = false;
+      mocks.summaryDataUpdatedAt = Date.now() + 1;
+      mocks.summaryFetchedAfterMount = true;
+    };
+    const boundHeldInvite = (email: string, requestId: string) => {
+      const token = saveUpgradeInvite("acme", { email, role: "member" });
+      bindUpgradeInviteCheckout("acme", token, { requestId, baseVersion: 0 });
+      return token;
+    };
+    const membersResume = (token: string) =>
+      `/acme/settings?tab=members&invite=resume&held_invite=${token}`;
+
+    it("opens the Pro checkout confirmation when Members asks for an upgrade", async () => {
+      navigationState.search = "tab=billing&upgrade=pro";
+      renderWithI18n(<BillingTab />);
+
+      const confirm = await screen.findByRole("alertdialog");
+      expect(confirm).toHaveTextContent("Plan: Pro");
+      expect(navigationState.replace).toHaveBeenCalledWith("/acme/settings?tab=billing");
+    });
+
+    it("buys a seat for the held invitation and binds it to that checkout", async () => {
+      const token = saveUpgradeInvite("acme", { email: "sarah@acme.dev", role: "member" });
+      navigationState.search = `tab=billing&upgrade=pro&held_invite=${token}`;
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+        "One more paid seat is included for the invitation to sarah@acme.dev",
+      );
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+      expect(mocks.checkout.mock.calls[0]?.[0]).toMatchObject({ plan: "pro", additionalSeats: 1 });
+      expect(readUpgradeInvite("acme", token)?.checkout).toMatchObject({ requestId: "request-1", baseVersion: 0 });
+    });
+
+    // Desktop: Stripe opens in the system browser, the person closes it and
+    // upgrades again from the same page. That checkout is a plain one.
+    it("makes the next checkout from the same page a plain one once the held one started", async () => {
+      const token = saveUpgradeInvite("acme", { email: "sarah@acme.dev", role: "member" });
+      navigationState.search = `tab=billing&upgrade=pro&held_invite=${token}`;
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      await screen.findByRole("alertdialog");
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      expect(screen.getByRole("alertdialog")).not.toHaveTextContent("One more paid seat");
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(2));
+
+      const [held, plain] = mocks.checkout.mock.calls.map(([request]) => request);
+      expect(plain).not.toHaveProperty("additionalSeats");
+      expect(plain.idempotencyKey).not.toBe(held.idempotencyKey);
+    });
+
+    it("drops a cancelled held invitation, so a later upgrade buys no seat for it", async () => {
+      const token = saveUpgradeInvite("acme", { email: "sarah@acme.dev", role: "member" });
+      navigationState.search = `tab=billing&upgrade=pro&held_invite=${token}`;
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      await screen.findByRole("alertdialog");
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(readUpgradeInvite("acme", token)).toBeNull();
+
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+      expect(mocks.checkout.mock.calls[0]?.[0]).not.toHaveProperty("additionalSeats");
+    });
+
+    it("leaves other tabs' held invitations alone when an upgrade starts without one", async () => {
+      const token = boundHeldInvite("sarah@acme.dev", "req-tab-a");
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+      expect(mocks.checkout.mock.calls[0]?.[0]).not.toHaveProperty("additionalSeats");
+      expect(readUpgradeInvite("acme", token)?.checkout?.requestId).toBe("req-tab-a");
+    });
+
+    it("waits for the paid plan: an incomplete payment still reads as Free", () => {
+      const token = boundHeldInvite("sarah@acme.dev", "req-held");
+      navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+      Object.assign(mocks.entitlements, { plan: "free", status: "incomplete", version: 1 });
+      mocks.summary.availableActions.checkout = false;
+      renderWithI18n(<BillingTab />);
+
+      expect(navigationState.push).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Send invitation" })).not.toBeInTheDocument();
+      expect(readUpgradeInvite("acme", token)).not.toBeNull();
+    });
+
+    // Desktop pays in the system browser and never sees the return; another
+    // admin may also have upgraded from elsewhere. Neither proves this
+    // invitation's checkout was paid.
+    it("asks before sending when no return ties the paid plan to the held checkout", async () => {
+      const token = boundHeldInvite("sarah@acme.dev", "req-unverified");
+      upgraded();
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      expect(navigationState.push).not.toHaveBeenCalled();
+      expect(screen.getByText("The workspace is on Pro now")).toBeInTheDocument();
+      expect(
+        screen.getByText("You held back an invitation for sarah@acme.dev as a member until the upgrade. Send it now?"),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Send invitation" }));
+      expect(navigationState.push).toHaveBeenCalledWith(membersResume(token));
+    });
+
+    // Desktop: held checkout A, then plain checkout B, then A is paid in the
+    // system browser. Nothing proves which was paid, so A stays on offer.
+    it("keeps offering a held invitation a later plain checkout might have hidden", async () => {
+      const token = boundHeldInvite("sarah@acme.dev", "req-a");
+      const user = userEvent.setup();
+      const view = renderWithI18n(<BillingTab />);
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+      view.unmount();
+
+      upgraded();
+      renderWithI18n(<BillingTab />);
+      await user.click(screen.getByRole("button", { name: "Send invitation" }));
+      expect(navigationState.push).toHaveBeenCalledWith(membersResume(token));
+    });
+
+    it("starts only plain checkouts from this page after a held checkout failed", async () => {
+      const token = saveUpgradeInvite("acme", { email: "sarah@acme.dev", role: "member" });
+      navigationState.search = `tab=billing&upgrade=pro&held_invite=${token}`;
+      mocks.checkout.mockRejectedValueOnce(new Error("timeout creating the Stripe session"));
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      await screen.findByRole("alertdialog");
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(1));
+
+      await user.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+      expect(screen.getByRole("alertdialog")).not.toHaveTextContent("One more paid seat");
+      await user.click(screen.getByRole("button", { name: "Continue to Stripe" }));
+      await waitFor(() => expect(mocks.checkout).toHaveBeenCalledTimes(2));
+      expect(mocks.checkout.mock.calls[1]?.[0]).not.toHaveProperty("additionalSeats");
+    });
+
+    it("keeps the upgrade intent and its invitation while the summary cannot be read", () => {
+      const token = saveUpgradeInvite("acme", { email: "sarah@acme.dev", role: "admin" });
+      navigationState.search = `tab=billing&upgrade=pro&held_invite=${token}`;
+      mocks.summaryError = true;
+      renderWithI18n(<BillingTab />);
+
+      expect(navigationState.replace).not.toHaveBeenCalled();
+      expect(readUpgradeInvite("acme", token)).toMatchObject({ email: "sarah@acme.dev", role: "admin" });
+    });
+
+    // Two tabs held A and B, B is newer; A's checkout is the one paid. Both
+    // are offered, so the seat just bought can go to A.
+    it("offers every paid-for held invitation so the person picks which to send", async () => {
+      const a = boundHeldInvite("sarah@acme.dev", "req-a");
+      boundHeldInvite("omar@acme.dev", "req-b");
+      navigationState.search = "tab=billing&result=success&session_id=cs_test_1";
+      upgraded();
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText(/invitation for omar@acme\.dev/)).toBeInTheDocument();
+      const sarah = screen.getByText(/invitation for sarah@acme\.dev/).closest("li")!;
+      await user.click(within(sarah).getByRole("button", { name: "Send invitation" }));
+      expect(navigationState.push).toHaveBeenCalledWith(membersResume(a));
+    });
+
+    it("discards a held invitation the person no longer wants", async () => {
+      const token = boundHeldInvite("sarah@acme.dev", "req-unverified");
+      upgraded();
+      const user = userEvent.setup();
+      renderWithI18n(<BillingTab />);
+
+      await user.click(screen.getByRole("button", { name: "Discard" }));
+
+      expect(readUpgradeInvite("acme", token)).toBeNull();
+      expect(navigationState.push).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Send invitation" })).not.toBeInTheDocument();
+    });
+
+    const heldCheckoutPollInterval = () => {
+      const summaryOptions = mocks.useQuery.mock.calls
+        .map(([options]) => options)
+        .findLast((options) => options.queryKey?.[options.queryKey.length - 1] === "summary");
+      return summaryOptions.refetchInterval({ state: { data: mocks.summary } });
+    };
+
+    it("stops polling a held checkout after two minutes and offers the invitation after a focus refresh", () => {
+      vi.useFakeTimers();
+      try {
+        const token = boundHeldInvite("sarah@acme.dev", "req-desktop");
+        const view = renderWithI18n(<BillingTab />);
+        expect(heldCheckoutPollInterval()).toBe(5_000);
+        expect(screen.queryByRole("button", { name: "Send invitation" })).not.toBeInTheDocument();
+
+        act(() => vi.advanceTimersByTime(120_000));
+        expect(heldCheckoutPollInterval()).toBe(false);
+        expect(readUpgradeInvite("acme", token)).not.toBeNull();
+
+        act(() => window.dispatchEvent(new Event("focus")));
+        expect(mocks.refetchSummary).toHaveBeenCalledWith({ cancelRefetch: false });
+        upgraded();
+        view.rerender(<BillingTab />);
+        expect(screen.getByRole("button", { name: "Send invitation" })).toBeInTheDocument();
+        expect(navigationState.push).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not restart fast polling when Billing opens with an older held checkout", () => {
+      vi.useFakeTimers();
+      try {
+        const token = boundHeldInvite("sarah@acme.dev", "req-old");
+        vi.advanceTimersByTime(25 * 60 * 60_000);
+        renderWithI18n(<BillingTab />);
+
+        expect(heldCheckoutPollInterval()).toBe(false);
+        expect(mocks.refetchSummary).toHaveBeenCalledOnce();
+        expect(readUpgradeInvite("acme", token)).not.toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("shows attachment storage against the plan's limit (MUL-9489)", () => {
+      mocks.storageUsage = { action: "observe", usedBytes: 23_400_000_000, limitBytes: 120_000_000_000, reached: null };
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("Attachment storage")).toBeInTheDocument();
+      expect(screen.getByText("Attachments in issues, comments, and chat.")).toBeInTheDocument();
+      expect(screen.getByText("23.4 GB / 120 GB")).toBeInTheDocument();
+    });
+
+    it("reports enforced full storage as reached, and hides storage without a limit", () => {
+      mocks.storageUsage = { action: "enforce", usedBytes: 1_000_000_000, limitBytes: 1_000_000_000, reached: true };
+      const { unmount } = renderWithI18n(<BillingTab />);
+      expect(screen.getByText("1 GB / 1 GB")).toBeInTheDocument();
+      expect(screen.getAllByText("Limit reached").length).toBeGreaterThan(0);
+      unmount();
+
+      mocks.storageUsage = { action: "off", usedBytes: null, limitBytes: null, reached: null };
+      renderWithI18n(<BillingTab />);
+      expect(screen.queryByText("Attachment storage")).not.toBeInTheDocument();
+    });
+
+    it("shows storage usage it could not read as unavailable, with a retry", async () => {
+      const user = userEvent.setup();
+      mocks.refetchStorage.mockReset();
+      mocks.storageUsage = { action: "observe", usedBytes: null, limitBytes: 1_000_000_000, reached: null };
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("Attachment storage")).toBeInTheDocument();
+      expect(screen.getByText("1 GB")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Retry attachment storage usage" }));
+      expect(mocks.refetchStorage).toHaveBeenCalledOnce();
+    });
+
+    // After Pro moves to Business (or seats are added) the summary carries
+    // the new limit at once, while the usage read can still hold the old one.
+    it("shows the plan's new storage limit as soon as the subscription changes", () => {
+      mocks.storageUsage = { action: "observe", usedBytes: 12_000_000_000, limitBytes: 30_000_000_000, reached: null };
+      mocks.entitlements.limits = { ...mocks.entitlements.limits, storageBytes: { mode: "limited", limit: 30_000_000_000 } };
+      const { rerender } = renderWithI18n(<BillingTab />);
+      expect(screen.getByText("12 GB / 30 GB")).toBeInTheDocument();
+      mocks.invalidateQueries.mockClear();
+
+      mocks.entitlements.limits = { ...mocks.entitlements.limits, storageBytes: { mode: "limited", limit: 300_000_000_000 } };
+      mocks.entitlements.version = 1;
+      rerender(<BillingTab />);
+
+      expect(screen.getByText("12 GB / 300 GB")).toBeInTheDocument();
+      expect(mocks.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workspace-storage-usage", expect.any(String)] });
+    });
+
+    it("shows this month's app calls against the plan's limit, for every person (MUL-10047)", () => {
+      const names = ["Ada", "Ben", "Cy", "Di", "Ed", "Flo"];
+      mocks.members = names.map((name) => ({ user_id: `user-${name}`, name }));
+      mocks.appCallUsage = {
+        action: "observe",
+        used: 230,
+        limit: 1500,
+        reached: null,
+        resetAt: "2030-02-01T00:00:00Z",
+        members: [
+          ...names.map((name, i) => ({ userId: `user-${name}`, calls: 60 - i * 10 })),
+          { userId: null, calls: 20 },
+        ],
+      };
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("App calls")).toBeInTheDocument();
+      expect(screen.getByText("230 / 1,500")).toBeInTheDocument();
+      const byPerson = screen.getByRole("list", { name: "App calls by person" });
+      expect(within(byPerson).getAllByRole("listitem")).toHaveLength(7);
+      for (const name of names) expect(within(byPerson).getByText(name)).toBeInTheDocument();
+      expect(within(byPerson).getByText("Automated runs")).toBeInTheDocument();
+    });
+
+    it("reports enforced app calls as reached, and hides them without a limit", () => {
+      mocks.appCallUsage = { action: "enforce", used: 100, limit: 100, reached: true, resetAt: null, members: [] };
+      const { unmount } = renderWithI18n(<BillingTab />);
+      expect(screen.getByText("100 / 100")).toBeInTheDocument();
+      expect(screen.getAllByText("Limit reached").length).toBeGreaterThan(0);
+      unmount();
+
+      mocks.appCallUsage = { action: "off", used: null, limit: null, reached: null, resetAt: null, members: [] };
+      renderWithI18n(<BillingTab />);
+      expect(screen.queryByText("App calls")).not.toBeInTheDocument();
+    });
+
+    it("shows members and pending invitations against the plan's limit", () => {
+      mocks.memberLimit = { action: "observe", limit: 5, members: 4, pendingInvitations: 2 };
+      renderWithI18n(<BillingTab />);
+
+      expect(screen.getByText("Members")).toBeInTheDocument();
+      expect(screen.getByText("6 / 5")).toBeInTheDocument();
+      expect(screen.getByText("Pending invitations: 2")).toBeInTheDocument();
+    });
   });
 
   it("reuses the Checkout idempotency key after an ambiguous failure", async () => {
@@ -686,11 +1088,53 @@ describe("BillingTab", () => {
 
     renderWithI18n(<BillingTab />);
 
-    expect(screen.getByText("Checkout canceled")).toBeInTheDocument();
+    expect(screen.getByText("Checkout cancelled")).toBeInTheDocument();
     expect(navigationState.replace).toHaveBeenCalledOnce();
     expect(navigationState.replace).toHaveBeenCalledWith(
       "/acme/settings?tab=billing&source=email",
     );
+  });
+
+  it("hands a return for another workspace to the billing return page", () => {
+    navigationState.search =
+      "tab=billing&workspace_id=22222222-2222-2222-2222-222222222222&result=autopilot_addon&session_id=cs_test_9";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.queryByRole("status", { name: "Add-on return" })).not.toBeInTheDocument();
+    expect(navigationState.replace).toHaveBeenCalledOnce();
+    expect(navigationState.replace).toHaveBeenCalledWith(
+      "/billing/return?workspace_id=22222222-2222-2222-2222-222222222222&result=autopilot_addon&session_id=cs_test_9",
+    );
+  });
+
+  it("consumes a return stamped with this workspace in place", () => {
+    navigationState.search = "tab=billing&workspace_id=workspace-1&result=cancel";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Checkout cancelled")).toBeInTheDocument();
+    expect(navigationState.replace).toHaveBeenCalledWith(
+      "/acme/settings?tab=billing&workspace_id=workspace-1",
+    );
+  });
+
+  it("hands an add-on return's Checkout Session to the return notice after clearing the URL", () => {
+    navigationState.search = "tab=billing&result=autopilot_addon&session_id=cs_test_7";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByRole("status", { name: "Add-on return" })).toHaveTextContent("cs_test_7");
+    expect(navigationState.replace).toHaveBeenCalledWith("/acme/settings?tab=billing");
+  });
+
+  it("says nothing was charged when an add-on Checkout is canceled", () => {
+    navigationState.search = "tab=billing&result=autopilot_addon_cancel";
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Payment cancelled")).toBeInTheDocument();
+    expect(screen.getByText("Nothing was charged.")).toBeInTheDocument();
   });
 
   it("polls after a success callback and surfaces a bounded sync timeout", () => {
@@ -781,6 +1225,11 @@ describe("BillingTab", () => {
       expect(screen.getByText("Pro is active")).toBeInTheDocument();
       expect(screen.getByText("Unlimited")).toBeInTheDocument();
       expect(screen.queryByText("5 / 7")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Runs a member starts with Run now/)).not.toBeInTheDocument();
+      // The paid plan is recorded: paid features and plan limits are re-read.
+      expect(mocks.invalidateQueries).toHaveBeenCalledWith({
+        queryKey: ["workspace-features", "workspace-1"],
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -1124,7 +1573,7 @@ describe("BillingTab", () => {
     ],
     [
       "seat_purchase_in_progress",
-      "Another seat purchase is being processed. Wait for it to finish; contact support if it remains here.",
+      "Another seat purchase is being processed. Wait a moment for it to finish, or contact support if it stays stuck.",
     ],
     [
       "plan_change_in_progress",
@@ -1154,6 +1603,74 @@ describe("BillingTab", () => {
     } else {
       expect(mocks.previewSeats).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("keeps the in-progress explanation when a newer quote returns after the refusal", async () => {
+    const user = userEvent.setup();
+    Object.assign(mocks.entitlements, {
+      plan: "pro",
+      status: "active",
+    });
+    mocks.summary.hasStripeCustomer = true;
+    setSeatCapacity();
+    const quote = (version: number, additionalSeats = 1) => ({
+      currentSeats: 5,
+      additionalSeats,
+      resultingSeats: 5 + additionalSeats,
+      purchaseVersion: version,
+      currency: "usd",
+      prorationAmount: 0,
+      nextInvoiceAmount: 6000,
+      quotedAt: "2030-01-01T00:00:00Z",
+    });
+    let resolveLateQuote: (value: ReturnType<typeof quote>) => void = () => {};
+    mocks.previewSeats
+      .mockResolvedValueOnce(quote(9))
+      .mockImplementationOnce(
+        () => new Promise((resolve) => { resolveLateQuote = resolve; }),
+      )
+      .mockResolvedValue(quote(10, 2));
+    let rejectPurchase: (error: unknown) => void = () => {};
+    mocks.purchaseSeats.mockImplementation(
+      () => new Promise((_, reject) => { rejectPurchase = reject; }),
+    );
+
+    const { rerender } = renderWithI18n(<BillingTab />);
+    await user.click(screen.getByRole("button", { name: "Add seats" }));
+    await user.click(await screen.findByRole("button", { name: "Add 1 seat" }));
+
+    // The plan change that wins the race lands while the purchase is pending:
+    // the summary moves to a new version and a new quote goes out.
+    setSeatCapacity({ version: 10 });
+    mocks.summary = { ...mocks.summary };
+    rerender(<BillingTab />);
+    await waitFor(() => expect(mocks.previewSeats).toHaveBeenCalledTimes(2), {
+      timeout: 3_000,
+    });
+
+    rejectPurchase(
+      new ApiError("conflict", 409, "Conflict", {
+        code: "plan_change_in_progress",
+      }),
+    );
+    const copy =
+      "A plan change is still being processed. Try again in a few minutes.";
+    expect(await screen.findByText(copy)).toBeInTheDocument();
+
+    await act(async () => {
+      resolveLateQuote(quote(10));
+    });
+    expect(screen.getByText(copy)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Add 1 seat" }),
+    ).not.toBeInTheDocument();
+
+    // Editing the seat count asks for a fresh quote.
+    await user.clear(screen.getByLabelText("Additional seats"));
+    await user.type(screen.getByLabelText("Additional seats"), "2");
+    expect(
+      await screen.findByRole("button", { name: "Add 2 seats" }, { timeout: 3_000 }),
+    ).toBeInTheDocument();
   });
 
   it("keeps the seat dialog open while purchase submission is pending", async () => {
@@ -1198,7 +1715,7 @@ describe("BillingTab", () => {
     await user.click(screen.getByRole("button", { name: "Add 1 seat" }));
     expect(
       await screen.findByText(
-        "The purchase response could not be read. Retry this quote; the same purchase request will be reused.",
+        "We couldn't confirm the purchase response. Retry safely — you won't be charged twice.",
       ),
     ).toBeInTheDocument();
     const firstKey = mocks.purchaseSeats.mock.calls[0]?.[0].idempotencyKey;
@@ -1324,6 +1841,90 @@ describe("BillingTab", () => {
     expect(screen.getByText("Limit reached")).toBeInTheDocument();
     expect(screen.getByText("7 / 7")).toBeInTheDocument();
     expect(screen.getByText("5 completed · 2 in progress")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Runs from schedules, webhooks, and agents count. Runs a member starts with Run now don't.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows this month's add-on runs and lets a manager buy more", async () => {
+    Object.assign(mocks.entitlements, { plan: "pro", status: "active" });
+    Object.assign(mocks.summary, {
+      autopilotAddon: {
+        purchasedRuns: 2000,
+        periodStart: "2030-01-01T00:00:00Z",
+        periodEnd: "2030-02-01T00:00:00Z",
+      },
+    });
+    Object.assign(mocks.summary.availableActions, {
+      checkout: false,
+      purchaseAutopilotRuns: true,
+    });
+    mocks.prices = {
+      ...mocks.prices!,
+      autopilotAddon: { currency: "usd", unitAmount: 1000, runsPerPack: 1000 },
+    };
+
+    const user = userEvent.setup();
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("Includes 2,000 add-on runs")).toBeInTheDocument();
+    expect(screen.getByText("2,000 bought this month")).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Buy · $10.00 / 1,000 runs" }),
+    );
+    expect(
+      await screen.findByRole("dialog", { name: "Buy more autopilot runs" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows add-on runs without a purchase button to a member", () => {
+    Object.assign(mocks.entitlements, { plan: "business", status: "active" });
+    Object.assign(mocks.summary, {
+      autopilotAddon: {
+        purchasedRuns: 0,
+        periodStart: "2030-01-01T00:00:00Z",
+        periodEnd: "2030-02-01T00:00:00Z",
+      },
+    });
+    Object.assign(mocks.summary.availableActions, {
+      checkout: false,
+      purchaseAutopilotRuns: false,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("None this month")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Buy/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides add-on runs on a cloud that predates them", () => {
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.queryByText("Add-on runs")).not.toBeInTheDocument();
+  });
+
+  it("shows observed usage over the limit without reporting it reached", () => {
+    Object.assign(mocks.usage, {
+      action: "observe",
+      used: 9,
+      reserved: 0,
+      total: 9,
+      limit: 7,
+      reached: null,
+    });
+
+    renderWithI18n(<BillingTab />);
+
+    expect(screen.getByText("9 / 7")).toBeInTheDocument();
+    expect(screen.getByText("Current usage")).toBeInTheDocument();
+    expect(screen.queryByText("Limit reached")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Usage is temporarily unavailable"),
+    ).not.toBeInTheDocument();
   });
 
   it("does not render missing limited usage as zero or unlimited", async () => {
@@ -1346,7 +1947,7 @@ describe("BillingTab", () => {
     expect(screen.queryByText(/0 \/ 7/)).not.toBeInTheDocument();
 
     await user.click(
-      screen.getByRole("button", { name: "Retry automation usage" }),
+      screen.getByRole("button", { name: "Retry autopilot usage" }),
     );
     expect(mocks.refetchUsage).toHaveBeenCalledOnce();
   });
@@ -1373,7 +1974,7 @@ describe("BillingTab", () => {
     ["incomplete_expired", "Subscription setup expired"],
     ["paused", "Subscription is paused"],
     ["unpaid", "Subscription is unpaid"],
-    ["canceled", "Subscription is canceled"],
+    ["canceled", "Subscription is cancelled"],
   ])("renders a recovery notice for %s", (status, title) => {
     mocks.entitlements.status = status;
 
@@ -1831,6 +2432,43 @@ describe("BillingTab", () => {
       });
       expect(
         await screen.findByText("This workspace is now on Pro."),
+      ).toBeInTheDocument();
+    });
+
+    it("tells a downgrading manager this month's limit when add-ons were bought", async () => {
+      const user = userEvent.setup();
+      setPaidPlan("business");
+      mocks.entitlements.limits = {
+        autopilotRuns: { mode: "limited", limit: 4000 },
+      };
+      Object.assign(mocks.summary, {
+        autopilotAddon: {
+          purchasedRuns: 1000,
+          periodStart: "2030-01-01T00:00:00Z",
+          periodEnd: "2030-02-01T00:00:00Z",
+        },
+      });
+      mocks.previewPlanChange.mockResolvedValue({
+        currentPlan: "business",
+        targetPlan: "pro",
+        interval: "month",
+        seats: 1,
+        subscriptionVersion: 8,
+        currency: "usd",
+        prorationAmount: -1200,
+        nextInvoiceAmount: 1500,
+        invoiceNow: false,
+        quotedAt: "2030-01-15T00:00:00Z",
+        autopilotRunsLimitAfter: 2000,
+      });
+      renderWithI18n(<BillingTab />);
+
+      await user.click(screen.getByRole("button", { name: "Switch to Pro" }));
+      const dialog = await screen.findByRole("dialog");
+      expect(
+        await within(dialog).findByText(
+          "This month's limit becomes 2,000 runs after the switch, including runs you bought. 5 runs are used this month.",
+        ),
       ).toBeInTheDocument();
     });
 
