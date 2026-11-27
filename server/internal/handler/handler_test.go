@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/analytics"
@@ -224,6 +225,16 @@ func setWorkspaceIssuePrefixForTest(t *testing.T, prefix string) {
 	})
 }
 
+// handlerTestRuntimeID returns a runtime of this TEST WORKSPACE. It is a
+// workspace-level runtime, not one paired with any particular agent, so it is
+// only correct for assertions that do not claim work.
+//
+// A claim (ClaimTaskByRuntime) dispatches by (runtime, agent): it looks for a
+// queued task whose agent belongs to that runtime. Picking an arbitrary runtime
+// and pairing it with a freshly created agent therefore claims nothing — and
+// because tests run in parallel against one workspace, "the oldest runtime" is
+// whatever another test created first. Claim tests must use
+// createHandlerTestAgentWithRuntime, which returns the pair together.
 func handlerTestRuntimeID(t *testing.T) string {
 	t.Helper()
 
@@ -234,6 +245,28 @@ func handlerTestRuntimeID(t *testing.T) string {
 	).Scan(&runtimeID)
 
 	return runtimeID
+}
+
+// createHandlerTestAgentWithRuntime creates an agent on a runtime of its OWN and
+// returns both ids, which is the only safe pairing for a claim: the claim looks
+// for tasks whose agent runs on the runtime the request names.
+func createHandlerTestAgentWithRuntime(t *testing.T, name string, mcpConfig []byte) (agentID, runtimeID string) {
+	t.Helper()
+	runtimeID = dbfx.Runtime(t, name+"-runtime-"+uuid.NewString()[:8])
+	agentID = dbfx.Agent(t, name, runtimeID, testutil.Cols{
+		"visibility":      "workspace",
+		"permission_mode": "public_to",
+		"instructions":    "",
+		"custom_env":      testutil.Raw("'{}'::jsonb"),
+		"custom_args":     testutil.Raw("'[]'::jsonb"),
+		"mcp_config":      mcpConfig,
+	})
+	dbfx.Exec(t, `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+		VALUES ($1, 'workspace', $2)
+		ON CONFLICT (agent_id, target_type, target_id) DO NOTHING
+	`, agentID, testWorkspaceID)
+	return agentID, runtimeID
 }
 
 func createHandlerTestAgent(t *testing.T, name string, mcpConfig []byte) string {

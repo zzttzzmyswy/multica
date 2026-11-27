@@ -1506,12 +1506,11 @@ func TestGetIssueUsageReportsUsageCoverage(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT id, runtime_id FROM agent
-		WHERE workspace_id = $1 AND runtime_id IS NOT NULL
-		LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it actually runs on, created together: a claim
+	// dispatches by (runtime, agent), so taking "some agent" and "some runtime"
+	// independently across a workspace other tests populate in parallel claims
+	// nothing at all.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 	issueID := dbfx.Issue(t, "issue usage coverage")
 	finished := testutil.Cols{
 		"issue_id":     issueID,
@@ -2481,12 +2480,10 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 		t.Skip("database not available")
 	}
 
-	// Local agent/runtime (belongs to testWorkspace).
-	var localAgentID, localRuntimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&localAgentID, &localRuntimeID)
+	// A local agent and the runtime it runs on, created together (belongs to
+	// testWorkspace). Paired on purpose: the request names the runtime, and the
+	// claim only finds tasks whose agent is on it.
+	localAgentID, localRuntimeID := createHandlerTestAgentWithRuntime(t, "MismatchLocalAgent", []byte("[]"))
 
 	// Foreign workspace with its own issue — what the misrouted task will
 	// resolve to.
