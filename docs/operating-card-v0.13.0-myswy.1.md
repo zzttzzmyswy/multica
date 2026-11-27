@@ -323,10 +323,22 @@ production data volume.
       clean, and a second `migrate up` reports no pending work.
 - [ ] the 59 renamed migrations are body-identical to upstream apart from
       cross-reference comments.
-- [ ] `go test ./cmd/migrate ./internal/migrations ./internal/storage ./internal/cli ./cmd/multica`,
-      `make test`, `go tool govulncheck ./...`, the four `direct-upload-*`
-      scripts, `install-myswy`, `myswy-release-guard`, `selfhost-config` and
-      `helm-config` all pass.
+- [ ] `go test -race ./cmd/migrate ./internal/migrations ./internal/storage ./internal/cli ./cmd/multica`,
+      `go tool govulncheck ./...`, the four `direct-upload-*` scripts,
+      `install-myswy`, `myswy-release-guard`, `selfhost-config` and
+      `helm-config` all pass, and each command's EXIT CODE is recorded.
+
+      Two notes on running these, both found by having to:
+
+      - `pnpm test:scripts` needs Node **22.18 or newer**. It imports `.ts`
+        directly, and default TypeScript type-stripping landed in 22.18; on
+        22.14 eight checks fail with `ERR_UNKNOWN_FILE_EXTENSION`. CI's
+        `node-version: 22` floats to the latest 22.x, which is why CI is green
+        and a locally pinned 22.14 is not.
+      - `go test -race ./internal/handler` can exceed Go's default 10-minute
+        per-package timeout on a loaded host, which surfaces as
+        `panic: test timed out` rather than a failing test. Pass `-timeout 40m`
+        on a busy machine; CI's runner is fast enough for the default.
 - [ ] multi-agent concurrent registration against an isolated server.
 - [ ] release assets and digests cross-checked against this commit.
 
