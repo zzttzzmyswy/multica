@@ -168,15 +168,51 @@ nor the runner's exit code answers this. A recorded version means the runner
    ```
 
    Any row here means the migration did not finish, whatever `max(version)` says.
-4. **`task_usage_hourly` has one row per hour key, not per squad.** This release
-   re-keys the rollup; a half-applied run can leave both shapes:
+4. **`task_usage_hourly`: compare the DATA, not just the indexes.** Two things
+   must be checked, and an index existing is neither of them.
+
+   **a. The keys are the real ones.** The unique key is EIGHT columns —
+   `bucket_hour, workspace_id, runtime_id, agent_id, project_id, squad_id,
+   provider, model` — and the hour key it sits on is the same without `squad_id`.
+   `provider` and `model` are part of it: several rows per hour are normal, one
+   per model and one per squad. A duplicate check that leaves those out reports a
+   violation on correct data.
 
    ```
-   SELECT count(*) FROM task_usage_hourly WHERE squad_id IS NOT NULL;
+   SELECT count(*) FROM (
+     SELECT 1 FROM task_usage_hourly
+      GROUP BY bucket_hour, workspace_id, runtime_id, agent_id,
+               project_id, squad_id, provider, model
+     HAVING count(*) > 1) d;      -- must be 0
    ```
 
-   Compare with what step 1 recorded. A number that moved in a way the
-   reconciliation cannot explain is a stop signal, not a number to round off.
+   `bash scripts/mys3116-schema-acceptance.sh` runs this and reads the index
+   definition from `pg_indexes` instead of restating it.
+
+   **b. The NUMBERS still add up.** A re-key changes how buckets are computed, so
+   the structures can be right while totals are wrong. Run:
+
+   ```
+   ADMIN_DSN="postgres://.../multica?sslmode=disable" \
+     bash scripts/mys3116-usage-rollup-check.sh
+   ```
+
+   It builds fixtures spanning two models, two runtimes and a squad bucket,
+   calls the real `rollup_task_usage_hourly_window`, and compares its output to
+   raw `task_usage` bucket by bucket. It also asserts the things a passing
+   structure check cannot see:
+
+   - a corrupted total is repaired by a recompute (if it is not, the rollup is
+     not running)
+   - a bucket whose raw usage was deleted disappears rather than staying stale
+   - a legacy pre-739 row (standalone and squad usage combined) is replaced as a
+     whole the first time its hour recomputes
+   - an hour OUTSIDE the recompute window keeps its combined total, because 759
+     backfills nothing
+
+   Compare the per-workspace totals with what step 1 recorded. A number that
+   moved in a way the reconciliation cannot explain is a stop signal, not a
+   number to round off.
 5. **The backup is still the fallback,** and nothing was written after it that
    you are not prepared to lose.
 6. **Business data is intact** — one issue read and one write, one upload
@@ -246,63 +282,47 @@ attributes runtimes to.
 
 ## Compatibility
 
-Every row below is the output of `scripts/mys3116-protocol-matrix.sh`, which
-drives the real binaries over real HTTP against a candidate server. A cell that
-was not measured says so; nothing is inferred from a neighbouring row.
+Each row names WHO produced the evidence, because two different executors are
+involved and their results are not interchangeable.
 
-| Combination | registration | heartbeat | claim | success report | retry (one terminal) | failure report |
-| --- | --- | --- | --- | --- | --- | --- |
-| `v0.11.1-myswy.1` daemon → `v0.13.0-myswy.1` server | measured, 200 | measured, `last_seen_at` advances | measured, 200 | measured, state `completed` | measured, one terminal row | measured, state `failed` |
-| `v0.13.0-myswy.1` daemon → `v0.13.0-myswy.1` server | measured, 200 | measured, `last_seen_at` advances | measured, 200 | measured, state `completed` | measured, one terminal row | measured, state `failed` |
-| `v0.13.0-myswy.1` daemon → `v0.11.1-myswy.1` server | **not run** — no previous-release server binary in this run. Not a supported target either: the new daemon calls Docs, blockers and comment-idempotency endpoints that the older server does not serve, so it would degrade rather than work | — | — | — | — | — |
+| Combination | registration + heartbeat (real binary) | claim / retry / terminal state (daemon binary) |
+| --- | --- | --- |
+| `v0.11.1-myswy.1` daemon → `v0.13.0-myswy.1` server | measured here: registers, `last_seen_at` advances past the 30s batch tick | **MYS-3119** owns this measurement |
+| `v0.13.0-myswy.1` daemon → `v0.13.0-myswy.1` server | measured here: same | **MYS-3119** owns this measurement |
+| `v0.13.0-myswy.1` daemon → `v0.11.1-myswy.1` server | not run | not run, and not a supported target: the new daemon calls Docs, blockers and comment-idempotency endpoints the older server does not serve |
 
-**What "measured" means for the support range.** The lifecycle cells drive the
-same endpoints the daemon itself sends (claim → complete/fail, with the request
-shapes in `server/internal/daemon/client.go`), and assert the SERVER's view: the
-task row's state and how many terminal rows exist. They do not run an agent CLI,
-so "the daemon claimed and reported" is measured while "an agent produced real
-work" is not; the latter needs a machine with an agent login.
+The two "not measured here" cells are deliberate: `scripts/mys3116-protocol-matrix.sh`
+drives the daemon HTTP API with curl, which proves the SERVER's contract, not what
+a daemon binary does on its own. The daemon-behaviour evidence — a binary claiming
+a task, backing off on a retry, producing exactly one terminal side effect — is
+delivered by [MYS-3119](mention://issue/01a21f10-cb1b-7729-ad3d-606ea432bd2f),
+which owns that executor. Do not read this card's server-contract results as
+covering it.
 
-**Rejections and degradations, stated.** The old daemon against the new server is
-supported and was measured. The new daemon against the OLD server was not run and
-is not supported — it would fail on the endpoints it calls that the older server
-does not serve, and this release does not claim a graceful degradation path for
-that direction. The release order (server first) exists for that reason.
+### Server HTTP contract (measured here, with curl)
 
-`v0.11.1-myswy.1` daemon → `v0.11.1-myswy.1` server is the previous release's own
-pairing and is not a gate for this one.
-
-Two different kinds of observation are recorded in that row, and they must not be
-read as one:
-
-**Connection and registration behaviour** (a bounded record, not a soak), from
-one isolated host with a warm server process:
+These are properties of the server the daemons talk to, and the release gate for
+the server side:
 
 ```
-registration:  150/150 x 200   (25 distinct identities x 6 rounds)
-distinct runtimes afterwards:  150   (one per identity, no duplicates)
-reconnect:     25/25 x 200, runtime count still 150
-heartbeat:     125/125 x 200   (25 runtimes x 5 rounds)
-duplicate identity (same daemon id started twice): one runtime per provider,
-                rows refreshed rather than added
-invalid credentials: 10/10 refused with 401
+claim -> 200; complete -> 200, state 'completed'
+replayed complete -> still exactly one terminal row
+fail -> 200, state 'failed'
+150 concurrent registrations (25 identities x 6 rounds) -> 150/150 x 200, 150 distinct runtimes
+25 reconnects -> 25/25 x 200, runtime count still 150
+same daemon id started twice -> rows refreshed per provider, not duplicated
+invalid token -> 401
+invitation limiter: 201 x 10, then 429 x 4 (trigger at request 11); after raising
+  RATE_LIMIT_INVITATION_ACTOR_10M -> 201 again (recovery)
+daemon registration: no 429 across 150 requests (this path has no limiter)
 ```
 
-This is not a capacity claim.
+This is one isolated host with a warm server process. It is not a capacity claim.
 
 **Rate limiting is a separate mechanism, measured separately.** The daemon
-registration path has no limiter in this release, which is why the 150-request
-burst above returned 150 x 200 and no 429. The invitation limiter was driven
-past its actor limit and then allowed to recover:
-
-```
-invitations (distinct recipients, same actor):
-  201 x 10, then 429 x 4        <- trigger observed at request 11
-  after raising RATE_LIMIT_INVITATION_ACTOR_10M: 201
-```
-
-Do not cite the registration numbers as evidence about limits, or the invitation
-numbers as evidence about daemon traffic.
+registration path has no limiter in this release, which is why the burst above
+returned no 429. Do not cite the registration numbers as evidence about limits,
+or the invitation numbers as evidence about daemon traffic.
 
 **Test scope.** The migration rehearsal uses databases built on an isolated
 PostgreSQL: one by running the previous release's own migration tree, one empty,

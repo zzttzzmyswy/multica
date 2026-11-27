@@ -295,11 +295,10 @@ func TestClaimTask_AutopilotRunOnlyForeignWorkspace_CancelsTask(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var localAgentID, localRuntimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&localAgentID, &localRuntimeID)
+	// Paired creation: a claim dispatches by (runtime, agent), so an agent and a
+	// runtime chosen by separate lookups claim nothing in a workspace other tests
+	// populate. The claim response then differs from what this test asserts.
+	localAgentID, localRuntimeID := createHandlerTestAgentWithRuntime(t, "ForeignAutopilotLocalAgent", []byte("[]"))
 
 	foreignWorkspaceID, foreignProjectID := foreignWorkspaceWithProject(t, "foreign-autopilot-ws", "FAW")
 
