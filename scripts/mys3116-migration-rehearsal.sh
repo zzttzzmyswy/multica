@@ -109,23 +109,93 @@ SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
 SQL
 }
 
-# ledger_ts_snapshot DB OUT: record version=applied_at for every row present now,
-# so after the upgrade each of those rows can be shown to still carry its
-# original timestamp.
+# ledger_ts_snapshot DB OUT: record every row present now, so after the upgrade
+# each of those rows can be shown to still carry its original timestamp. The
+# timestamp is printed with full precision and an explicit UTC zone: a ledger
+# comparison that silently truncates or re-renders a zone cannot tell a rewritten
+# row from an untouched one.
 ledger_ts_snapshot() {
-  psql "$(dsn_for "$1")" -tAqc \
-    "SELECT version||'='||applied_at::text FROM schema_migrations ORDER BY version" >"$2"
+  psql "$(dsn_for "$1")" -tAqc "
+    SELECT version || E'\t' || to_char(applied_at AT TIME ZONE 'UTC',
+                                      'YYYY-MM-DD HH24:MI:SS.US')
+      FROM schema_migrations ORDER BY version" >"$2" \
+    || { echo "ledger_ts_snapshot: could not read schema_migrations in $1" >&2; return 1; }
+  [ -s "$2" ] || { echo "ledger_ts_snapshot: snapshot $2 is empty" >&2; return 1; }
 }
 
-# ledger_ts_unchanged DB SNAPSHOT: every version in the snapshot still has the
-# same applied_at. A migration re-run that rewrote the ledger would show up here.
+# ledger_ts_unchanged DB SNAPSHOT: every version in the snapshot is still present
+# with the same applied_at, AND no version has disappeared from the ledger.
+#
+# Three separate comparisons, because a single join answers only the first and
+# silently ignores the rest:
+#   1. a snapshot row whose timestamp changed  -> rewritten ledger row
+#   2. a snapshot row with no ledger row left  -> deleted ledger row
+#   3. a ledger row with no snapshot row       -> an unexpected extra version
+# Comparing the two row SETS by exact (version, timestamp) text catches all
+# three at once; the join alone cannot, because a missing right-hand row simply
+# produces no result rather than a mismatch.
+#
+# Failures are reported, never swallowed: a query error must fail the check, so
+# there is no `|| echo 0` and no discarded stderr. An unreadable ledger is
+# exactly the state this function exists to detect.
 ledger_ts_unchanged() {
-  local mismatched
-  mismatched=$(psql "$(dsn_for "$1")" -tAqc "
-    SELECT count(*) FROM (VALUES $(sed "s/^/'/;s/=/','/;s/$/')/" "$2" | paste -sd,) AS snap(version, applied_at)
-    JOIN schema_migrations m ON m.version = snap.version
-    WHERE m.applied_at::text <> snap.applied_at" 2>/dev/null || echo "0")
-  [ "$mismatched" = "0" ]
+  local db=$1 snapshot=$2 current actual
+  local -a problems=()
+
+  [ -s "$snapshot" ] || { echo "ledger_ts_unchanged: snapshot $snapshot is empty" >&2; return 1; }
+
+  current="$(mktemp "$OUT_DIR/.ledger-now.XXXXXX")"
+  if ! psql "$(dsn_for "$db")" -tAqc "
+        SELECT version || E'\t' || to_char(applied_at AT TIME ZONE 'UTC',
+                                          'YYYY-MM-DD HH24:MI:SS.US')
+          FROM schema_migrations ORDER BY version" >"$current" 2>&1; then
+    echo "ledger_ts_unchanged: could not read schema_migrations in $db:" >&2
+    sed 's/^/    /' "$current" >&2
+    rm -f "$current"
+    return 1
+  fi
+
+  # Row counts first: a deleted row is invisible to the join below.
+  local want_n have_n
+  want_n=$(wc -l <"$snapshot")
+  have_n=$(wc -l <"$current")
+  if [ "$have_n" -lt "$want_n" ]; then
+    problems+=("ledger lost rows: $want_n before, $have_n after")
+  fi
+
+  # Exact line-set comparison. `comm` needs sorted input; both sides are already
+  # ordered by version, and a duplicate version cannot occur (PRIMARY KEY).
+  while IFS= read -r line; do
+    case "$line" in
+      '') continue ;;
+    esac
+    version=${line%%$'\t'*}
+    before=${line#*$'\t'}
+    actual="$(awk -F'\t' -v v="$version" '$1 == v { print $2; exit }' "$current")"
+    if [ -z "$actual" ]; then
+      problems+=("$version disappeared from schema_migrations")
+    elif [ "$actual" != "$before" ]; then
+      problems+=("$version applied_at changed: $before -> $actual")
+    fi
+  done <"$snapshot"
+
+  # Rows the upgrade ADDS are the point of running it, so the ledger legitimately
+  # grows; only a row that disappeared or changed is a problem. That is why the
+  # count comparison above is one-directional in intent: it catches a deletion,
+  # and the caller separately asserts how many rows the run was expected to add.
+  # An extra version is therefore NOT a failure here — asserting otherwise would
+  # fail every real upgrade, which is how this check first behaved.
+
+  rm -f "$current"
+
+  if [ "${#problems[@]}" -gt 0 ]; then
+    local p
+    for p in "${problems[@]}"; do
+      echo "ledger_ts_unchanged: $p" >&2
+    done
+    return 1
+  fi
+  return 0
 }
 
 SHIPPED_COUNT=$(ls "$REPO_ROOT/server/migrations"/*.up.sql | wc -l | tr -d ' ')

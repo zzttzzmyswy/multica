@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/imagemetadata"
+	"github.com/multica-ai/multica/server/internal/projectaccess"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -492,6 +494,43 @@ func (h *Handler) publishAttachmentUpload(
 		return publishedAttachmentUpload{}, false, false
 	}
 
+	// Storage limit (MUL-9489), at the same point in the sequence as the
+	// multipart path: every field validated, the object's real size known, and
+	// the write not yet made — so a refused upload publishes no attachment row.
+	//
+	// Checking here rather than at presign is what makes the two paths agree.
+	// Presign only knows the DECLARED size, and a declared size is not what gets
+	// stored; a client could declare 1 byte, PUT 100 MiB, and never reach a
+	// presign-time check. Complete is the first point where the store's own
+	// count is available, which is also the number Admit is given on the
+	// multipart path.
+	//
+	// The refusal shape is the multipart path's: 403 with storage_limit_reached,
+	// and the workspace's figures only for a caller allowed to read storage
+	// usage. A guest learns the code and nothing about the workspace's totals.
+	if err := h.storageQuota().Admit(r.Context(), locked.WorkspaceID, info.Size, service.StorageSourceUpload); err != nil {
+		// The figures are included only for a caller allowed to read storage
+		// usage. The multipart path reads the role from the membership it
+		// already loaded; here the role comes from one explicit lookup, and a
+		// lookup that FAILS withholds the figures. Failing closed matters: the
+		// alternative would hand a guest the workspace's totals precisely when
+		// the database is misbehaving, which is the case least likely to be
+		// noticed in review.
+		withFigures := false
+		member, memberErr := h.getWorkspaceMember(r.Context(), uuidToString(locked.ActorUserID), uuidToString(locked.WorkspaceID))
+		if memberErr == nil {
+			withFigures = !projectaccess.IsGuestRole(member.Role)
+		} else {
+			slog.Warn("storage refusal could not read the caller's role; withholding usage figures",
+				"error", memberErr)
+		}
+		if !writeStorageLimitReached(w, err, withFigures) {
+			slog.Error("storage limit check failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to complete upload")
+		}
+		return publishedAttachmentUpload{}, false, false
+	}
+
 	// Read the probe bytes from the EXACT version HEAD just measured. Passing
 	// the ETag is what binds the description to the object: the presigned URL
 	// stays usable, so a client can PUT a different same-length object between
@@ -950,7 +989,15 @@ func (h *Handler) resolveAttachmentUploadTarget(w http.ResponseWriter, r *http.R
 		if !h.requireProjectVisible(w, r, workspaceID, issue.ProjectID, http.StatusForbidden, "invalid issue_id") {
 			return uploadTarget{}, false
 		}
-		target.issueID = issue.ID
+		// A guest's upload is a draft for its next comment, not a change to the
+		// issue (MUL-9420), so it stays UNBOUND — visible only to the guest —
+		// until CreateComment links it. A member's upload binds to the issue at
+		// once. Same rule as UploadFile: without it a guest's direct upload
+		// would attach to the issue immediately and every reader of the issue
+		// could see a file its author had not posted yet.
+		if actorType, _ := h.resolveActor(r, userID, workspaceID); actorType != "member" || !h.isGuest(r, workspaceID, userID) {
+			target.issueID = issue.ID
+		}
 	}
 	if v := strings.TrimSpace(req.CommentID); v != "" {
 		commentUUID, ok := parseUUIDOrBadRequest(w, v, "comment_id")
@@ -964,6 +1011,17 @@ func (h *Handler) resolveAttachmentUploadTarget(w http.ResponseWriter, r *http.R
 			return uploadTarget{}, false
 		}
 		if !h.requireIssueIDVisible(w, r, workspaceID, comment.IssueID, http.StatusForbidden, "invalid comment_id") {
+			return uploadTarget{}, false
+		}
+		// A guest attaches files only to its OWN comments (MUL-9420): seeing a
+		// comment is not permission to add to it. Same rule as UploadFile, and
+		// it has to be here too — the direct path would otherwise let a guest
+		// publish an attachment onto another person's comment by presigning
+		// against it.
+		if uploaderType, uploaderID := h.resolveActor(r, userID, workspaceID); uploaderType == "member" &&
+			h.isGuest(r, workspaceID, userID) &&
+			(comment.AuthorType != "member" || uuidToString(comment.AuthorID) != uploaderID) {
+			writeError(w, http.StatusForbidden, "invalid comment_id")
 			return uploadTarget{}, false
 		}
 		target.commentID = comment.ID

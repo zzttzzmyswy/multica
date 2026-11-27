@@ -9,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -109,11 +111,12 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 	})
 	_, foreignProjectID := foreignWorkspaceWithProject(t, "foreign-issue-project-ws", "FIP")
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "issue pointing at a foreign project", testutil.Cols{
 		"project_id": foreignProjectID,
@@ -240,11 +243,12 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 		"position":      2,
 	})
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "issue with a mismatched project resource", testutil.Cols{
 		"project_id": projectID,
@@ -385,11 +389,12 @@ func TestBuildClaimedTaskResponse_SourceLoadFailure_PreservesTaskAndEmitsNoConte
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	projectID := dbfx.Project(t, "Source load failure project")
 	dbfx.Insert(t, "project_resource", testutil.Cols{
@@ -494,11 +499,12 @@ func TestRejectClaimSourceLoad_MissingRow_CancelsTask(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	taskID := dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": nil})
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'dispatched' WHERE id = $1`, taskID)

@@ -528,13 +528,20 @@ export function useRegenerateChatQuickActions() {
       // chat:quick_actions that resolves it — no ack reconciliation needed.
       // task_id is unknown here and unused for resolution (applyChatQuickActionsToCache
       // matches on message_id).
+      // Typed before the call, not as an inline literal: setQueryData's second
+      // parameter is `Updater<...>`, a union of the value and an updater
+      // FUNCTION. An inline literal is resolved against both branches, and
+      // TypeScript reports the object as "not assignable" because it also tries
+      // to treat it as a callback. A named value removes the ambiguity without
+      // changing what is stored.
+      const pending: ChatQuickActionsPendingState = {
+        message_id: messageId,
+        task_id: "",
+        expires_at: Date.now() + QUICK_ACTIONS_PENDING_TIMEOUT_MS,
+      };
       qc.setQueryData<ChatQuickActionsPendingState | null>(
         chatKeys.quickActionsPending(sessionId),
-        {
-          message_id: messageId,
-          task_id: "",
-          expires_at: Date.now() + QUICK_ACTIONS_PENDING_TIMEOUT_MS,
-        },
+        pending,
       );
       return { previous, sessionId };
     },

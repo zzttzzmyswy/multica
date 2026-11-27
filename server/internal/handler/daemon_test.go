@@ -1393,11 +1393,12 @@ func TestCancelTask_TaskBelongsToDifferentIssue_Returns404(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	// Issue X — the task's real parent.
 	var issueXID, taskID string
@@ -1441,11 +1442,12 @@ func TestCancelTask_SameIssue_Succeeds(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	var issueID, taskID string
 	dbfx.QueryRow(t, `
@@ -2136,11 +2138,12 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 	`, projectID, testWorkspaceID, `{"url":"`+projectRepoURL+`","ref":"`+projectRepoRef+`"}`)
 
 	// Agent + runtime + queued task in this project.
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "project repo override", testutil.Cols{
 		"project_id": projectID,
@@ -2202,11 +2205,12 @@ func TestClaimTask_ProjectDescriptionInjected(t *testing.T) {
 		"description": projectDescription,
 	})
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "project description", testutil.Cols{
 		"project_id": projectID,
@@ -2291,11 +2295,12 @@ func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
 
 	projectID := dbfx.Project(t, "Claim project without repos")
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "no project repos", testutil.Cols{
 		"project_id": projectID,

@@ -128,16 +128,34 @@ nor the runner's exit code answers this. A recorded version means the runner
    plus exactly the versions this release adds. The count is not enough — a count
    can be right while one name is wrong. Expect the 701–759 block appended and
    every earlier row byte-identical.
-2. **The DDL this release adds exists.** Several versions exist only for an
-   index, so check the objects, not the rows:
+2. **The DDL this release adds exists — checked by KIND, not by name.**
+
+   Run `bash scripts/mys3116-schema-acceptance.sh` with `ADMIN_DSN` pointed at
+   this database. It checks each change the way that change exists, and it is
+   the only form of this check that can fail correctly:
 
    ```
-   SELECT relname, relkind FROM pg_class
-    WHERE relname IN ('idx_attachment_workspace_size','member_search_access',
-                      'doc_comment','doc_collab_state','doc_revision',
-                      'remote_app_connection','comment_idempotency_receipt',
-                      'issue_blocker','squad_handoff_mode','app_tool_call_quota');
+   ADMIN_DSN="postgres://.../multica?sslmode=disable" \
+     bash scripts/mys3116-schema-acceptance.sh
    ```
+
+   **Do not substitute a `pg_class` name list.** An earlier version of this card
+   did, and it reported success while two of this release's changes were missing:
+
+   - `751_squad_handoff_mode` adds a **column**. A column has no `pg_class` row,
+     so `relname IN (...)` cannot see it, and its absence looks identical to its
+     presence.
+   - `752_app_tool_call_quota_period` creates a **table**, but the list named the
+     prefix `app_tool_call_quota`, and `relname IN (...)` matches whole names — so
+     the table was skipped too.
+
+   The script checks 751 through `information_schema.columns` (asserting type,
+   `NOT NULL` and the `'leader'` default, because a wrong default silently changes
+   every existing squad's handoff behaviour), 752 through `to_regclass`, the
+   indexes through `indisvalid`/`indisready` together, and 712/713 as a
+   *replacement* (the covering index present **and** `idx_attachment_workspace`
+   gone). Each failure names the object and prints expected-vs-actual; the full
+   list of failure conditions is written to the run's output directory.
 
 3. **Every index this release builds is present AND valid.** A concurrent build
    that was interrupted leaves an `indisvalid = false` relation that `IF NOT
@@ -228,23 +246,63 @@ attributes runtimes to.
 
 ## Compatibility
 
-| Combination | Status |
-| --- | --- |
-| `v0.13.0` daemon + `v0.13.0` server | the target |
-| `v0.11.1-myswy.1` daemon + `v0.13.0` server | **exercised** against a locally built candidate on the rehearsal host: registered, heartbeated, claimed a queued task and reported its terminal result. A real agent run was not completed (no agent CLI login on the rehearsal host), so treat "the old daemon runs real work against the new server" as unproven until one task is watched on the first machine you roll |
-| `v0.13.0` daemon + `v0.11.1-myswy.1` server | not a target and not exercised; the new daemon's Docs/blockers/idempotency endpoints are absent there, so upgrade the server first |
+Every row below is the output of `scripts/mys3116-protocol-matrix.sh`, which
+drives the real binaries over real HTTP against a candidate server. A cell that
+was not measured says so; nothing is inferred from a neighbouring row.
+
+| Combination | registration | heartbeat | claim | success report | retry (one terminal) | failure report |
+| --- | --- | --- | --- | --- | --- | --- |
+| `v0.11.1-myswy.1` daemon → `v0.13.0-myswy.1` server | measured, 200 | measured, `last_seen_at` advances | measured, 200 | measured, state `completed` | measured, one terminal row | measured, state `failed` |
+| `v0.13.0-myswy.1` daemon → `v0.13.0-myswy.1` server | measured, 200 | measured, `last_seen_at` advances | measured, 200 | measured, state `completed` | measured, one terminal row | measured, state `failed` |
+| `v0.13.0-myswy.1` daemon → `v0.11.1-myswy.1` server | **not run** — no previous-release server binary in this run. Not a supported target either: the new daemon calls Docs, blockers and comment-idempotency endpoints that the older server does not serve, so it would degrade rather than work | — | — | — | — | — |
+
+**What "measured" means for the support range.** The lifecycle cells drive the
+same endpoints the daemon itself sends (claim → complete/fail, with the request
+shapes in `server/internal/daemon/client.go`), and assert the SERVER's view: the
+task row's state and how many terminal rows exist. They do not run an agent CLI,
+so "the daemon claimed and reported" is measured while "an agent produced real
+work" is not; the latter needs a machine with an agent login.
+
+**Rejections and degradations, stated.** The old daemon against the new server is
+supported and was measured. The new daemon against the OLD server was not run and
+is not supported — it would fail on the endpoints it calls that the older server
+does not serve, and this release does not claim a graceful degradation path for
+that direction. The release order (server first) exists for that reason.
+
+`v0.11.1-myswy.1` daemon → `v0.11.1-myswy.1` server is the previous release's own
+pairing and is not a gate for this one.
 
 Two different kinds of observation are recorded in that row, and they must not be
 read as one:
 
-**Connection and registration behaviour** (a bounded record, not a soak): see the
-measurement appendix in this card's delivery evidence. It covers concurrent
-registration with distinct identities, reconnect, heartbeat, duplicate-identity
-handling and credential refusal on one isolated host. It is not a capacity claim
-and it is not a rate-limit measurement.
+**Connection and registration behaviour** (a bounded record, not a soak), from
+one isolated host with a warm server process:
 
-**Rate limiting is a separate mechanism.** Do not cite registration counts as
-evidence of limit behaviour, or limiter numbers as evidence about daemon traffic.
+```
+registration:  150/150 x 200   (25 distinct identities x 6 rounds)
+distinct runtimes afterwards:  150   (one per identity, no duplicates)
+reconnect:     25/25 x 200, runtime count still 150
+heartbeat:     125/125 x 200   (25 runtimes x 5 rounds)
+duplicate identity (same daemon id started twice): one runtime per provider,
+                rows refreshed rather than added
+invalid credentials: 10/10 refused with 401
+```
+
+This is not a capacity claim.
+
+**Rate limiting is a separate mechanism, measured separately.** The daemon
+registration path has no limiter in this release, which is why the 150-request
+burst above returned 150 x 200 and no 429. The invitation limiter was driven
+past its actor limit and then allowed to recover:
+
+```
+invitations (distinct recipients, same actor):
+  201 x 10, then 429 x 4        <- trigger observed at request 11
+  after raising RATE_LIMIT_INVITATION_ACTOR_10M: 201
+```
+
+Do not cite the registration numbers as evidence about limits, or the invitation
+numbers as evidence about daemon traffic.
 
 **Test scope.** The migration rehearsal uses databases built on an isolated
 PostgreSQL: one by running the previous release's own migration tree, one empty,

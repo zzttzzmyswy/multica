@@ -367,9 +367,16 @@ export async function applyChatQuickActionsToCache(
   // failed. A view consumes it to toast and clears it; the `at` nonce keeps a
   // repeat failure on the same turn from being deduped away.
   if (payload.failed === true) {
+    // Named for the same reason as the pending marker in chat/mutations.ts:
+    // setQueryData takes `Updater<...>`, a union with an updater function, and an
+    // inline literal makes TypeScript check the object against both branches.
+    const failure: ChatQuickActionsFailureState = {
+      message_id: payload.message_id,
+      at: Date.now(),
+    };
     qc.setQueryData<ChatQuickActionsFailureState | null>(
       chatKeys.quickActionsFailure(sessionId),
-      { message_id: payload.message_id, at: Date.now() },
+      failure,
     );
   }
 }
