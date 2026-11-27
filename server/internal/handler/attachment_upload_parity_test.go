@@ -711,3 +711,209 @@ func TestNoConfiguredLimitAdmitsOnBothPaths(t *testing.T) {
 		}
 	}
 }
+
+// --- publish-time revalidation of role and binding -------------------------
+//
+// The presign gate decides what a session may be bound to, but a session can
+// outlive the decision: presign and complete are separated by the client's PUT,
+// which can take minutes for a large file. The publish transaction therefore has
+// to re-apply the role-dependent rules, not just re-check that the targets still
+// exist. These tests demote or revoke BETWEEN presign and complete, which is the
+// only way to reach that window.
+
+// presignSession issues a session for the given target and returns its id, so a
+// test can mutate the world before completing it.
+func presignSessionID(t *testing.T, userID, workspaceID string, req presignUploadRequest) string {
+	t.Helper()
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/attachments/presign-upload", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-User-ID", userID)
+	r.Header.Set("X-Workspace-ID", workspaceID)
+	rec := httptest.NewRecorder()
+	testHandler.PresignAttachmentUpload(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("presign = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out presignUploadResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.AttachmentID
+}
+
+// A member whose issue-scoped session was created before they were demoted to
+// guest must not publish it against the issue: every issue reader would see a
+// draft its author had not posted.
+func TestDemotedMemberCannotPublishIssueDraft(t *testing.T) {
+	workspaceID, guestID, issueID := guestWithProjectWorkspace(t, 0)
+	store := installDirectUploadStorage(t)
+
+	// The caller is a MEMBER at presign time, so the session binds to the issue.
+	dbfx.Exec(t, `UPDATE member SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, guestID)
+
+	sessionID := presignSessionID(t, guestID, workspaceID, presignUploadRequest{
+		Filename:    "draft.png",
+		ContentType: "image/png",
+		SizeBytes:   5,
+		IssueID:     issueID,
+	})
+	store.putStagingObject(uploadStagingKeyForTest(t, sessionID), []byte("hello"), "image/png")
+
+	// Demote between presign and complete.
+	dbfx.Exec(t, `UPDATE member SET role = 'guest' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, guestID)
+
+	status, body := completeUploadCode(t, sessionID, guestID, workspaceID)
+	if status != http.StatusForbidden {
+		t.Fatalf("complete after demotion = %d %v, want 403", status, body)
+	}
+	if body["code"] != codeUploadTargetInvalid {
+		t.Fatalf("refusal code = %v, want %s", body["code"], codeUploadTargetInvalid)
+	}
+	var rows int
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM attachment WHERE workspace_id = $1 AND filename = 'draft.png'`,
+		workspaceID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("a refused post-demotion publish created %d attachment row(s)", rows)
+	}
+}
+
+// The same window for a comment: a member demoted to guest must not publish onto
+// somebody else's comment.
+func TestDemotedMemberCannotPublishToForeignComment(t *testing.T) {
+	workspaceID, userID, issueID := guestWithProjectWorkspace(t, 0)
+	store := installDirectUploadStorage(t)
+	commentID := dbfx.Comment(t, issueID, "someone else's comment", testutil.Cols{
+		"workspace_id": workspaceID,
+		"author_type":  "member",
+		"author_id":    testUserID,
+	})
+
+	dbfx.Exec(t, `UPDATE member SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+	sessionID := presignSessionID(t, userID, workspaceID, presignUploadRequest{
+		Filename:    "onto-comment.png",
+		ContentType: "image/png",
+		SizeBytes:   5,
+		CommentID:   commentID,
+	})
+	store.putStagingObject(uploadStagingKeyForTest(t, sessionID), []byte("hello"), "image/png")
+	dbfx.Exec(t, `UPDATE member SET role = 'guest' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+
+	status, body := completeUploadCode(t, sessionID, userID, workspaceID)
+	if status != http.StatusForbidden {
+		t.Fatalf("complete after demotion = %d %v, want 403", status, body)
+	}
+}
+
+// A member's own upload is unaffected by the new recheck: the rule must refuse
+// demotion, not guests in general.
+func TestMemberPublishAfterRoleCheckStillSucceeds(t *testing.T) {
+	workspaceID, userID, issueID := guestWithProjectWorkspace(t, 0)
+	store := installDirectUploadStorage(t)
+	dbfx.Exec(t, `UPDATE member SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+
+	sessionID := presignSessionID(t, userID, workspaceID, presignUploadRequest{
+		Filename:    "member-ok.png",
+		ContentType: "image/png",
+		SizeBytes:   5,
+		IssueID:     issueID,
+	})
+	store.putStagingObject(uploadStagingKeyForTest(t, sessionID), []byte("hello"), "image/png")
+
+	status, body := completeUploadCode(t, sessionID, userID, workspaceID)
+	if status >= 400 {
+		t.Fatalf("member publish = %d %v, want success", status, body)
+	}
+}
+
+// Revocation between presign and complete: the member row is gone entirely, so
+// the publish must be refused. This is the case the existing membership check
+// covers, asserted here so the new role logic cannot weaken it.
+func TestRevokedMemberCannotPublish(t *testing.T) {
+	workspaceID, userID, issueID := guestWithProjectWorkspace(t, 0)
+	store := installDirectUploadStorage(t)
+	dbfx.Exec(t, `UPDATE member SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+
+	sessionID := presignSessionID(t, userID, workspaceID, presignUploadRequest{
+		Filename:    "revoked.png",
+		ContentType: "image/png",
+		SizeBytes:   5,
+		IssueID:     issueID,
+	})
+	store.putStagingObject(uploadStagingKeyForTest(t, sessionID), []byte("hello"), "image/png")
+
+	dbfx.Exec(t, `DELETE FROM member WHERE workspace_id = $1 AND user_id = $2`, workspaceID, userID)
+
+	status, body := completeUploadCode(t, sessionID, userID, workspaceID)
+	if status != http.StatusForbidden {
+		t.Fatalf("complete after revocation = %d %v, want 403", status, body)
+	}
+	var rows int
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM attachment WHERE workspace_id = $1 AND filename = 'revoked.png'`,
+		workspaceID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("a refused post-revocation publish created %d attachment row(s)", rows)
+	}
+}
+
+// Replay idempotency: a repeat completion of an ALREADY PUBLISHED session returns
+// the same attachment rather than re-running the policy gates. A retry after a
+// lost response is the normal case, and it must not start failing because the
+// caller's role changed after the first success — the attachment exists, and
+// returning it is the documented contract.
+func TestReplayAfterSuccessReturnsSameAttachmentDespiteLaterDemotion(t *testing.T) {
+	workspaceID, userID, issueID := guestWithProjectWorkspace(t, 0)
+	store := installDirectUploadStorage(t)
+	dbfx.Exec(t, `UPDATE member SET role = 'member' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+
+	sessionID := presignSessionID(t, userID, workspaceID, presignUploadRequest{
+		Filename:    "replay.png",
+		ContentType: "image/png",
+		SizeBytes:   5,
+		IssueID:     issueID,
+	})
+	store.putStagingObject(uploadStagingKeyForTest(t, sessionID), []byte("hello"), "image/png")
+
+	status, first := completeUploadCode(t, sessionID, userID, workspaceID)
+	if status >= 400 {
+		t.Fatalf("first complete = %d %v", status, first)
+	}
+	firstID, _ := first["id"].(string)
+
+	// Demote after the attachment exists; the replay must still resolve it.
+	dbfx.Exec(t, `UPDATE member SET role = 'guest' WHERE workspace_id = $1 AND user_id = $2`,
+		workspaceID, userID)
+
+	status, replay := completeUploadCode(t, sessionID, userID, workspaceID)
+	if status >= 400 {
+		t.Fatalf("replay after demotion = %d %v, want the published attachment", status, replay)
+	}
+	if id, _ := replay["id"].(string); id != firstID {
+		t.Fatalf("replay returned attachment %q, want %q", id, firstID)
+	}
+	var rows int
+	if err := testPool.QueryRow(t.Context(),
+		`SELECT count(*) FROM attachment WHERE workspace_id = $1 AND filename = 'replay.png'`,
+		workspaceID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("replay produced %d attachment rows, want 1", rows)
+	}
+}

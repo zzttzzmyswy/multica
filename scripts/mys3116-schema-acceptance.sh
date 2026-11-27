@@ -133,21 +133,55 @@ expect_eq "the sampling of versions this release adds is all recorded" "0" \
              '759_task_usage_hourly_rollup_hour_key']) v
           WHERE NOT EXISTS (SELECT 1 FROM schema_migrations m WHERE m.version = v)")"
 
-step "Usage attribution and aggregation (task_usage_hourly)"
-# 735-742 and 755 re-key the hourly rollup. The property is one row per
-# (workspace, hour key) rather than per squad, so a half-applied run that leaves
-# both shapes must fail here.
-expect_eq "task_usage_hourly has the hour key column 755 introduces" "bucket_hour" \
-  "$(q "SELECT column_name FROM information_schema.columns
-          WHERE table_name = 'task_usage_hourly'
-            AND column_name IN ('bucket_hour','hour_key','rollup_hour')
-          ORDER BY column_name LIMIT 1")"
+step "Usage rollup: the REAL keys, not an approximation"
 
-expect_eq "no duplicate (workspace, bucket_hour, squad key) rows" "0" \
+# Two distinct keys matter here, and they are NOT the same width:
+#
+#   hour key      bucket_hour, workspace_id, runtime_id, agent_id,
+#                 project_id, provider, model           (7 columns, no squad_id)
+#   unique key    the hour key + squad_id              (8 columns)
+#
+# derived from migrations 740 (uq_..._squad_key_idx), 741 (the same on the
+# _dirty table), 743 (recompute per squad key) and 759 (recompute per HOUR key,
+# widening every dirty key and rebuilding all squad + standalone buckets under
+# it from raw task_usage).
+#
+# An earlier version of this script grouped by (workspace, bucket_hour, squad)
+# only. That is not the key: two rows differing in model are LEGITIMATE — the
+# 8-column unique index exists precisely to permit them — so the check reported a
+# duplicate on correct data. It now asserts the key the index actually enforces.
+expect_eq "task_usage_hourly has the bucket_hour column" "bucket_hour" \
+  "$(q "SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'task_usage_hourly' AND column_name = 'bucket_hour'")"
+
+# The index definition is the authority; read it rather than restating it.
+expect_eq "740's unique index covers the full 8-column key" \
+  "CREATE UNIQUE INDEX uq_task_usage_hourly_squad_key_idx ON public.task_usage_hourly USING btree (bucket_hour, workspace_id, runtime_id, agent_id, project_id, squad_id, provider, model) NULLS NOT DISTINCT" \
+  "$(q "SELECT indexdef FROM pg_indexes
+          WHERE indexname = 'uq_task_usage_hourly_squad_key_idx'")"
+
+expect_eq "741's unique index covers the same key on the dirty table" \
+  "CREATE UNIQUE INDEX uq_task_usage_hourly_dirty_squad_key_idx ON public.task_usage_hourly_dirty USING btree (bucket_hour, workspace_id, runtime_id, agent_id, project_id, squad_id, provider, model) NULLS NOT DISTINCT" \
+  "$(q "SELECT indexdef FROM pg_indexes
+          WHERE indexname = 'uq_task_usage_hourly_dirty_squad_key_idx'")"
+
+# A duplicate under the REAL key is a genuine violation: the upsert in 759 targets
+# exactly these columns, so a duplicate means the rollup wrote under a different
+# shape than the one it conflicts on.
+expect_eq "no duplicate rows under the full 8-column unique key" "0" \
   "$(q "SELECT count(*) FROM (
            SELECT 1 FROM task_usage_hourly
-            GROUP BY workspace_id, bucket_hour, squad_id
+            GROUP BY bucket_hour, workspace_id, runtime_id, agent_id,
+                     project_id, squad_id, provider, model
            HAVING count(*) > 1) d")"
+
+# The hour key must NOT be treated as unique on its own: several rows per hour
+# key are the normal shape (one per squad, one standalone, one per model).
+expect_eq "the hour key is not accidentally unique (multi-model rows are legal)" "0" \
+  "$(q "SELECT count(*) FROM pg_indexes
+          WHERE tablename = 'task_usage_hourly'
+            AND indexdef LIKE 'CREATE UNIQUE INDEX%'
+            AND indexdef NOT LIKE '%squad_id%'")"
 
 step "Business invariants that a schema change could break"
 expect_eq "an attachment's bytes are still summed from its rows" "1" \

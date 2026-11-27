@@ -369,7 +369,7 @@ func (h *Handler) CompleteAttachmentUpload(w http.ResponseWriter, r *http.Reques
 	// publish into it, and must not be able to use a replay to read the
 	// attachment it already published. The saved actor check above is not
 	// enough on its own: it only proves the same caller came back.
-	if !h.revalidateAttachmentUploadTarget(w, r, h.Queries, session) {
+	if !h.revalidateAttachmentUploadTarget(w, r, h.Queries, session, false) {
 		return
 	}
 
@@ -462,7 +462,7 @@ func (h *Handler) publishAttachmentUpload(
 	// attachment rather than leave a row pointing at a gone or now-invisible
 	// issue/comment/chat. This runs under the session lock, so the decision
 	// cannot be raced by another completion.
-	if !h.revalidateAttachmentUploadTarget(w, r, qtx, locked) {
+	if !h.revalidateAttachmentUploadTarget(w, r, qtx, locked, true) {
 		return publishedAttachmentUpload{}, false, false
 	}
 	if sessionExpired(locked) {
@@ -838,7 +838,19 @@ func (h *Handler) requireAttachmentAccessForRequest(w http.ResponseWriter, r *ht
 // not what they may still reach. Every gate below consults live membership,
 // project visibility, private-agent access or the task token, exactly as the
 // corresponding route would.
-func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *http.Request, qtx *db.Queries, session db.AttachmentUploadSession) bool {
+// revalidateAttachmentUploadTarget re-checks a session against the caller's
+// CURRENT access.
+//
+// Two families of check live here, and they differ in WHEN they apply:
+//
+//   - ACCESS (membership, project visibility, chat/agent reachability, task
+//     scope): always, including on replay. A member revoked after publishing must
+//     not be able to use a replay to read the attachment back.
+//   - BINDING (the guest draft and footnote rules): only when `publishing` is
+//     true, because they decide what a session may CREATE. Once the attachment
+//     exists, a replay returns it; re-deciding the binding would make a legitimate
+//     retry fail merely because the caller's role changed after the fact.
+func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *http.Request, qtx *db.Queries, session db.AttachmentUploadSession, publishing bool) bool {
 	workspaceID := uuidToString(session.WorkspaceID)
 	userID := requestUserID(r)
 	if userID == "" {
@@ -846,13 +858,20 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		return false
 	}
 	// A session can outlive a membership change; membership is the first thing
-	// every path below assumes.
-	if _, err := h.getWorkspaceMember(r.Context(), userID, workspaceID); err != nil {
+	// every path below assumes. Its ROLE matters too, not just its existence:
+	// a member demoted to guest between presign and complete must not keep the
+	// binding a member is allowed to create.
+	member, err := h.getWorkspaceMember(r.Context(), userID, workspaceID)
+	if err != nil {
 		writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 			"you no longer have access to this workspace")
 		return false
 	}
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	// The role read HERE is the authority for the guest rules, not the one from
+	// presign: a member demoted to guest must lose the member-only bindings, and
+	// a session created before that demotion still carries them.
+	nowGuest := actorType == "member" && projectaccess.IsGuestRole(member.Role)
 
 	if session.IssueID.Valid {
 		issue, err := qtx.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
@@ -870,6 +889,16 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 			"the issue this upload targeted is no longer available") {
 			return false
 		}
+		// Guest draft rule, re-applied against the CURRENT role. The session was
+		// bound at presign; if the caller is a guest now, publishing it against
+		// the issue would expose a draft every issue reader can see. Refusing is
+		// the only correct answer here: the row cannot be "unbound" at this point
+		// without changing what the client asked for.
+		if publishing && nowGuest {
+			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
+				"a guest's upload cannot be published against an issue; post it as a comment draft")
+			return false
+		}
 	}
 	if session.CommentID.Valid {
 		comment, err := qtx.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
@@ -885,6 +914,14 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		// existence let a revoked member publish into a private comment.
 		if !h.requireIssueIDVisible(w, r, workspaceID, comment.IssueID, http.StatusConflict,
 			"the comment this upload targeted is no longer available") {
+			return false
+		}
+		// Guest comment-ownership, re-applied against the CURRENT role. A member
+		// demoted to guest mid-upload could otherwise publish onto a comment that
+		// was not theirs, which the presign gate refuses for a guest.
+		if publishing && nowGuest && (comment.AuthorType != "member" || uuidToString(comment.AuthorID) != actorID) {
+			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
+				"a guest may only attach files to its own comments")
 			return false
 		}
 	}
@@ -989,14 +1026,12 @@ func (h *Handler) resolveAttachmentUploadTarget(w http.ResponseWriter, r *http.R
 		if !h.requireProjectVisible(w, r, workspaceID, issue.ProjectID, http.StatusForbidden, "invalid issue_id") {
 			return uploadTarget{}, false
 		}
-		// A guest's upload is a draft for its next comment, not a change to the
-		// issue (MUL-9420), so it stays UNBOUND — visible only to the guest —
-		// until CreateComment links it. A member's upload binds to the issue at
-		// once. Same rule as UploadFile: without it a guest's direct upload
-		// would attach to the issue immediately and every reader of the issue
-		// could see a file its author had not posted yet.
-		if actorType, _ := h.resolveActor(r, userID, workspaceID); actorType != "member" || !h.isGuest(r, workspaceID, userID) {
+		// Guest binding rule, shared with the multipart path and re-applied at
+		// publish time (see upload_guest_rules.go).
+		if actorType, actorID := h.resolveActor(r, userID, workspaceID); h.guestIssueBindingAllowed(r, workspaceID, userID, actorType) {
 			target.issueID = issue.ID
+		} else {
+			_ = actorID
 		}
 	}
 	if v := strings.TrimSpace(req.CommentID); v != "" {
@@ -1013,14 +1048,9 @@ func (h *Handler) resolveAttachmentUploadTarget(w http.ResponseWriter, r *http.R
 		if !h.requireIssueIDVisible(w, r, workspaceID, comment.IssueID, http.StatusForbidden, "invalid comment_id") {
 			return uploadTarget{}, false
 		}
-		// A guest attaches files only to its OWN comments (MUL-9420): seeing a
-		// comment is not permission to add to it. Same rule as UploadFile, and
-		// it has to be here too — the direct path would otherwise let a guest
-		// publish an attachment onto another person's comment by presigning
-		// against it.
-		if uploaderType, uploaderID := h.resolveActor(r, userID, workspaceID); uploaderType == "member" &&
-			h.isGuest(r, workspaceID, userID) &&
-			(comment.AuthorType != "member" || uuidToString(comment.AuthorID) != uploaderID) {
+		// Guest comment-ownership rule, shared with the multipart path and
+		// re-applied at publish time.
+		if actorType, actorID := h.resolveActor(r, userID, workspaceID); !h.guestCommentBindingAllowed(r, workspaceID, userID, actorType, actorID, comment) {
 			writeError(w, http.StatusForbidden, "invalid comment_id")
 			return uploadTarget{}, false
 		}
