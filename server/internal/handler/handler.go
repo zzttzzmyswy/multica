@@ -920,6 +920,10 @@ func requestUserID(r *http.Request) string {
 //
 // Returns ("agent", agentID) on success, ("member", userID) otherwise.
 func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
+	return accessQueries{h.Queries}.resolveActor(r, userID, workspaceID)
+}
+
+func (h accessQueries) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		// Server-set header — the auth middleware stripped whatever the
 		// client sent and re-stamped X-Agent-ID from the token row. Trust
@@ -1040,6 +1044,10 @@ func countOwners(members []db.Member) int {
 }
 
 func (h *Handler) getWorkspaceMember(ctx context.Context, userID, workspaceID string) (db.Member, error) {
+	return accessQueries{h.Queries}.getWorkspaceMember(ctx, userID, workspaceID)
+}
+
+func (h accessQueries) getWorkspaceMember(ctx context.Context, userID, workspaceID string) (db.Member, error) {
 	userUUID, err := util.ParseUUID(userID)
 	if err != nil {
 		return db.Member{}, err

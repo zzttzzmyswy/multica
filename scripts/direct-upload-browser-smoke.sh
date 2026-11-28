@@ -38,6 +38,7 @@
 # Requirements: go, docker, curl, python3, node, pnpm, and installed workspace
 # dependencies (pnpm install). The S3 server image is pulled on first run; set
 # SMOKE_S3_IMAGE to use another S3-compatible image.
+# Set SMOKE_PG_PORT to the published loopback port of SMOKE_PG_CONTAINER.
 set -uo pipefail
 
 # Overridable so the safety test can run this script's preflight from a copy
@@ -307,12 +308,12 @@ ok "created bucket $S3_BUCKET with a CORS rule for $WEB_ORIGIN"
 
 step "Backend against the local bucket"
 cd "$REPO_ROOT/server" || die "server directory missing"
-DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}?sslmode=disable" \
+DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${SMOKE_PG_PORT:-5432}/${DB_NAME}?sslmode=disable" \
   go run ./cmd/migrate up >"$LOG_DIR/migrate.log" 2>&1 \
   || die "migrations failed (see $LOG_DIR/migrate.log)"
 ok "migrations applied"
 
-export DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}?sslmode=disable"
+export DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${SMOKE_PG_PORT:-5432}/${DB_NAME}?sslmode=disable"
 export PORT="$API_PORT"
 export APP_ENV=development
 export JWT_SECRET="browser-upload-smoke-secret"

@@ -152,6 +152,10 @@ func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actor
 //   - a regular member passes for a public_to agent only when they hit a
 //     workspace or member target; private agents stay owner+admin only.
 func (h *Handler) canAccessPrivateAgent(ctx context.Context, agent db.Agent, actorType, actorID, workspaceID string) bool {
+	return accessQueries{h.Queries}.canAccessPrivateAgent(ctx, agent, actorType, actorID, workspaceID)
+}
+
+func (h accessQueries) canAccessPrivateAgent(ctx context.Context, agent db.Agent, actorType, actorID, workspaceID string) bool {
 	if actorType == "agent" {
 		return true
 	}

@@ -95,36 +95,47 @@ type StorageUsage struct {
 // just upgraded is not refused on a cached one. Under observe it admits and
 // records the attempt. Every failure to decide admits.
 func (q StorageQuota) Admit(ctx context.Context, workspaceID pgtype.UUID, bytes int64, source string) error {
+	record, err := q.EvaluateAdmission(ctx, workspaceID, bytes, source)
+	if record != nil {
+		record()
+	}
+	return err
+}
+
+// EvaluateAdmission reads the soft quota and returns the decision and its optional
+// accounting callback. A publisher that serializes retries records only the
+// decision it actually uses, after releasing its database transaction.
+func (q StorageQuota) EvaluateAdmission(ctx context.Context, workspaceID pgtype.UUID, bytes int64, source string) (func(), error) {
 	decision, ok := q.gate(ctx, workspaceID)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	used, ok := q.sum(ctx, workspaceID, source)
 	if !ok {
-		q.recordDecision(decision.Gate.Action, source, "fail_open")
-		return nil
+		return func() { q.recordDecision(decision.Gate.Action, source, "fail_open") }, nil
 	}
 	attempted := used + max(bytes, 0)
 	if attempted <= gateLimit(decision) {
-		q.recordDecision(decision.Gate.Action, source, "admitted")
-		return nil
+		return func() { q.recordDecision(decision.Gate.Action, source, "admitted") }, nil
 	}
 	if decision.Gate.Action == entitlement.ActionEnforce {
 		if refresher, isRefresher := q.Entitlements.(entitlement.Refresher); isRefresher {
 			decision = refresher.RefreshGate(ctx, uuid.UUID(workspaceID.Bytes), entitlement.GateStorageBytes)
 			if !storageGateActive(decision) || attempted <= gateLimit(decision) {
-				q.recordDecision(decision.Gate.Action, source, "admitted")
-				return nil
+				return func() { q.recordDecision(decision.Gate.Action, source, "admitted") }, nil
 			}
 		}
 	}
-	q.recordOverage(ctx, workspaceID, decision, attempted)
+	result := "observed"
+	var refusal error
 	if decision.Gate.Action == entitlement.ActionEnforce {
-		q.recordDecision(decision.Gate.Action, source, "rejected")
-		return &StorageLimitReachedError{Used: used, Limit: gateLimit(decision)}
+		result = "rejected"
+		refusal = &StorageLimitReachedError{Used: used, Limit: gateLimit(decision)}
 	}
-	q.recordDecision(decision.Gate.Action, source, "observed")
-	return nil
+	return func() {
+		q.recordOverage(ctx, workspaceID, decision, attempted)
+		q.recordDecision(decision.Gate.Action, source, result)
+	}, refusal
 }
 
 // RecordStored is for bytes already written without a check: files that

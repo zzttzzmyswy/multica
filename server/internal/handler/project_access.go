@@ -15,10 +15,19 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// accessQueries evaluates request permissions using one pool or transaction.
+type accessQueries struct {
+	*db.Queries
+}
+
 // hiddenProjects returns the private projects (MUL-8472) this request may not
 // see. A member request is bounded by the member; an agent request by the
 // run's originator and the agent's owner together (projectaccess.RunPrincipals).
 func (h *Handler) hiddenProjects(r *http.Request, workspaceID string) (projectaccess.Hidden, error) {
+	return accessQueries{h.Queries}.hiddenProjects(r, workspaceID)
+}
+
+func (h accessQueries) hiddenProjects(r *http.Request, workspaceID string) (projectaccess.Hidden, error) {
 	ctx := r.Context()
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
@@ -39,7 +48,7 @@ func (h *Handler) hiddenProjects(r *http.Request, workspaceID string) (projectac
 	return projectaccess.ForPrincipals(ctx, h.Queries, wsUUID, userUUID)
 }
 
-func (h *Handler) hiddenProjectsForAgentRun(ctx context.Context, workspaceID pgtype.UUID, agentID, taskID string) (projectaccess.Hidden, error) {
+func (h accessQueries) hiddenProjectsForAgentRun(ctx context.Context, workspaceID pgtype.UUID, agentID, taskID string) (projectaccess.Hidden, error) {
 	// Most workspaces have no private project; skip the run lookups there.
 	if private, err := h.Queries.ListPrivateProjectIDs(ctx, workspaceID); err != nil || len(private) == 0 {
 		return projectaccess.Hidden{}, err
@@ -69,6 +78,10 @@ func (h *Handler) hiddenProjectsForAgentRun(ctx context.Context, workspaceID pgt
 // requestHiddenProjects is hiddenProjects for handlers: it writes a 500 and
 // returns ok=false when access cannot be resolved, so callers fail closed.
 func (h *Handler) requestHiddenProjects(w http.ResponseWriter, r *http.Request, workspaceID string) (projectaccess.Hidden, bool) {
+	return accessQueries{h.Queries}.requestHiddenProjects(w, r, workspaceID)
+}
+
+func (h accessQueries) requestHiddenProjects(w http.ResponseWriter, r *http.Request, workspaceID string) (projectaccess.Hidden, bool) {
 	hidden, err := h.hiddenProjects(r, workspaceID)
 	if err != nil {
 		if writeQueryCancellation(w, r, err) {
@@ -86,6 +99,10 @@ func (h *Handler) requestHiddenProjects(w http.ResponseWriter, r *http.Request, 
 // message they already use for a missing object: a hidden object must be
 // indistinguishable from one that does not exist, so this never answers 403.
 func (h *Handler) requireProjectVisible(w http.ResponseWriter, r *http.Request, workspaceID string, projectID pgtype.UUID, status int, notFoundMsg string) bool {
+	return accessQueries{h.Queries}.requireProjectVisible(w, r, workspaceID, projectID, status, notFoundMsg)
+}
+
+func (h accessQueries) requireProjectVisible(w http.ResponseWriter, r *http.Request, workspaceID string, projectID pgtype.UUID, status int, notFoundMsg string) bool {
 	// Only a guest is kept from objects outside any project.
 	if m, ok := ctxMember(r.Context()); !projectID.Valid && ok && !projectaccess.IsGuestRole(m.Role) {
 		return true
@@ -104,6 +121,10 @@ func (h *Handler) requireProjectVisible(w http.ResponseWriter, r *http.Request, 
 // requireIssueIDVisible is requireProjectVisible for objects that carry only
 // an issue id (comments, attachments, reactions).
 func (h *Handler) requireIssueIDVisible(w http.ResponseWriter, r *http.Request, workspaceID string, issueID pgtype.UUID, status int, notFoundMsg string) bool {
+	return accessQueries{h.Queries}.requireIssueIDVisible(w, r, workspaceID, issueID, status, notFoundMsg)
+}
+
+func (h accessQueries) requireIssueIDVisible(w http.ResponseWriter, r *http.Request, workspaceID string, issueID pgtype.UUID, status int, notFoundMsg string) bool {
 	if !issueID.Valid {
 		return true
 	}

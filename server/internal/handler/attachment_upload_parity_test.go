@@ -2,11 +2,15 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"github.com/jackc/pgx/v5/pgxpool"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -277,6 +281,10 @@ func TestRefusedUploadStoresNoAttachmentOnEitherPath(t *testing.T) {
 			}
 			if rows != 0 {
 				t.Fatalf("%s path left %d attachment row(s) for a refused upload", pathName, rows)
+			}
+
+			if overage := storageOverageOf(t, workspaceID); overage.enforced != 1 || overage.observed != 0 {
+				t.Fatalf("%s path did not retain exactly one refusal: %+v", pathName, overage)
 			}
 
 			// And the usage the next upload is measured against is unchanged.
@@ -607,6 +615,20 @@ func TestConcurrentCompletePublishesOneAttachment(t *testing.T) {
 	store.putStagingObject(uploadStagingKeyForTest(t, presigned.AttachmentID),
 		bytes.Repeat([]byte("x"), 8), "image/png")
 
+	// A transaction owns the pool's only connection. Permission and quota
+	// reads during a normal completion must still make forward progress.
+	config := testPool.Config()
+	config.MinConns = 0
+	config.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	h := &Handler{Queries: db.New(pool), TxStarter: pool, Storage: store,
+		Entitlements: useStorageLimit(t, workspaceID, entitlement.ActionObserve, 1)}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	const racers = 4
 	type result struct {
 		status int
@@ -617,7 +639,13 @@ func TestConcurrentCompletePublishesOneAttachment(t *testing.T) {
 	for i := 0; i < racers; i++ {
 		go func() {
 			<-start
-			status, body := completeUploadCode(t, presigned.AttachmentID, userID, workspaceID)
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/attachments/"+presigned.AttachmentID+"/complete-upload", nil)
+			req.Header.Set("X-User-ID", userID)
+			req.Header.Set("X-Workspace-ID", workspaceID)
+			req = testutil.WithURLParams(req, "id", presigned.AttachmentID)
+			rec := httptest.NewRecorder()
+			h.CompleteAttachmentUpload(rec, req)
+			status, body := rec.Code, decodeJSONBody(rec)
 			id, _ := body["id"].(string)
 			results <- result{status: status, id: id}
 		}()
@@ -634,6 +662,9 @@ func TestConcurrentCompletePublishesOneAttachment(t *testing.T) {
 			t.Fatalf("concurrent complete returned no attachment id")
 		}
 		seen[r.id] = true
+	}
+	if overage := storageOverageOf(t, workspaceID); overage.observed != 1 || overage.enforced != 0 {
+		t.Fatalf("expected one observed overage across retries, got %+v", overage)
 	}
 	if len(seen) != 1 {
 		t.Fatalf("concurrent completes returned %d distinct attachment ids %v, want 1", len(seen), seen)

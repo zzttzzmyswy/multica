@@ -189,30 +189,31 @@ nor the runner's exit code answers this. A recorded version means the runner
    `bash scripts/mys3116-schema-acceptance.sh` runs this and reads the index
    definition from `pg_indexes` instead of restating it.
 
-   **b. The NUMBERS still add up.** A re-key changes how buckets are computed, so
-   the structures can be right while totals are wrong. Run:
+   **b. Compare the restored data in a read-only snapshot.** Use the isolated
+   restored database after the rollup has caught up. The command reports row
+   counts across all workspaces and exits nonzero on a mismatch or query error.
 
+   ```sh
+   ADMIN_DSN="$RESTORED_DSN" bash scripts/mys3116-usage-rollup-check.sh --read-only
    ```
-   ADMIN_DSN="postgres://.../multica?sslmode=disable" \
-     bash scripts/mys3116-usage-rollup-check.sh
+
+   The comparison includes the eight key columns, token and cost totals, uncosted
+   tokens, distinct tasks and event counts. An untouched pre-739 row retains
+   its combined squad and standalone totals. Its seven-column key is compared
+   as a whole until the first recompute. A missing or extra bucket, or a
+   different total, requires investigation against the pre-upgrade snapshot.
+   Check pending dirty keys, the rollup watermark and raw-data retention before
+   interpreting a discrepancy. Preserve the restored snapshot for investigation.
+
+   To test the recompute function itself, use a disposable PostgreSQL instance
+   with permission to create databases. The command creates a fresh database,
+   migrates it from the checkout, exercises two workspaces, project and squad
+   attribution, multiple models and runtimes, and removes that database on exit.
+
+   ```sh
+   ADMIN_DSN="$TEST_CLUSTER_DSN" bash scripts/mys3116-usage-rollup-check.sh --fixture
    ```
 
-   It builds fixtures spanning two models, two runtimes and a squad bucket,
-   calls the real `rollup_task_usage_hourly_window`, and compares its output to
-   raw `task_usage` bucket by bucket. It also asserts the things a passing
-   structure check cannot see:
-
-   - a corrupted total is repaired by a recompute (if it is not, the rollup is
-     not running)
-   - a bucket whose raw usage was deleted disappears rather than staying stale
-   - a legacy pre-739 row (standalone and squad usage combined) is replaced as a
-     whole the first time its hour recomputes
-   - an hour OUTSIDE the recompute window keeps its combined total, because 759
-     backfills nothing
-
-   Compare the per-workspace totals with what step 1 recorded. A number that
-   moved in a way the reconciliation cannot explain is a stop signal, not a
-   number to round off.
 5. **The backup is still the fallback,** and nothing was written after it that
    you are not prepared to lose.
 6. **Business data is intact** — one issue read and one write, one upload
@@ -282,22 +283,21 @@ attributes runtimes to.
 
 ## Compatibility
 
-Each row names WHO produced the evidence, because two different executors are
-involved and their results are not interchangeable.
+The independent daemon tests used a controlled task executor. MYS-3119 ran
+160 checks on candidate `d7047674`. MYS-3114 reran the same matrix on
+`f975aadf` with 160 passes. Final-candidate results belong in MYS-3114.
+[MYS-3119 evidence](mention://issue/01a21f10-cb1b-7729-ad3d-606ea432bd2f) ·
+[Release acceptance](mention://issue/01a21d87-f26f-7332-b0a5-70fb69ee4d5f)
 
-| Combination | registration + heartbeat (real binary) | claim / retry / terminal state (daemon binary) |
+| Daemon | Server | Measured coverage |
 | --- | --- | --- |
-| `v0.11.1-myswy.1` daemon → `v0.13.0-myswy.1` server | measured here: registers, `last_seen_at` advances past the 30s batch tick | **MYS-3119** owns this measurement |
-| `v0.13.0-myswy.1` daemon → `v0.13.0-myswy.1` server | measured here: same | **MYS-3119** owns this measurement |
-| `v0.13.0-myswy.1` daemon → `v0.11.1-myswy.1` server | not run | not run, and not a supported target: the new daemon calls Docs, blockers and comment-idempotency endpoints the older server does not serve |
+| `v0.11.1-myswy.1` | Candidate | Registration, heartbeat renewal, claim, success, failure, automatic retries and terminal activity counts |
+| Candidate | Candidate | Same lifecycle coverage, plus rate-limit snapshot recovery |
+| Candidate | `v0.11.1-myswy.1` | Registration, heartbeat renewal, claim, completion and rate-limit snapshot readback |
 
-The two "not measured here" cells are deliberate: `scripts/mys3116-protocol-matrix.sh`
-drives the daemon HTTP API with curl, which proves the SERVER's contract, not what
-a daemon binary does on its own. The daemon-behaviour evidence — a binary claiming
-a task, backing off on a retry, producing exactly one terminal side effect — is
-delivered by [MYS-3119](mention://issue/01a21f10-cb1b-7729-ad3d-606ea432bd2f),
-which owns that executor. Do not read this card's server-contract results as
-covering it.
+Upgrade the server first. The reverse-direction test covers only the listed
+operations. New Docs, blockers and comment-idempotency endpoints require the
+candidate server.
 
 ### Server HTTP contract (measured here, with curl)
 
@@ -348,17 +348,12 @@ production data volume.
       `install-myswy`, `myswy-release-guard`, `selfhost-config` and
       `helm-config` all pass, and each command's EXIT CODE is recorded.
 
-      Two notes on running these, both found by having to:
-
-      - `pnpm test:scripts` needs Node **22.18 or newer**. It imports `.ts`
-        directly, and default TypeScript type-stripping landed in 22.18; on
-        22.14 eight checks fail with `ERR_UNKNOWN_FILE_EXTENSION`. CI's
-        `node-version: 22` floats to the latest 22.x, which is why CI is green
-        and a locally pinned 22.14 is not.
-      - `go test -race ./internal/handler` can exceed Go's default 10-minute
-        per-package timeout on a loaded host, which surfaces as
-        `panic: test timed out` rather than a failing test. Pass `-timeout 40m`
-        on a busy machine; CI's runner is fast enough for the default.
+      Use the repository's Node 22 toolchain with a patch release that supports
+      TypeScript type stripping (22.18 or later). Run the complete Go/race suite
+      with a dedicated PostgreSQL 17 database and Redis via
+      `GOFLAGS="-count=1 -p=2 -timeout=40m" make test ENV_FILE=<isolated-env>`.
+      The concurrent completion regression uses a one-connection pool and a
+      separate ten-second request deadline.
 - [ ] multi-agent concurrent registration against an isolated server.
 - [ ] release assets and digests cross-checked against this commit.
 

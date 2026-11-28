@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/imagemetadata"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/projectaccess"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
@@ -369,7 +370,7 @@ func (h *Handler) CompleteAttachmentUpload(w http.ResponseWriter, r *http.Reques
 	// publish into it, and must not be able to use a replay to read the
 	// attachment it already published. The saved actor check above is not
 	// enough on its own: it only proves the same caller came back.
-	if !h.revalidateAttachmentUploadTarget(w, r, h.Queries, session, false) {
+	if _, ok := (accessQueries{h.Queries}).revalidateAttachmentUploadTarget(w, r, session, false); !ok {
 		return
 	}
 
@@ -430,6 +431,18 @@ func (h *Handler) publishAttachmentUpload(
 	storageCtx, cancelStorage := context.WithTimeout(r.Context(), attachmentUploadStorageTimeout)
 	defer cancelStorage()
 
+	// The quota is a soft limit. Read it before reserving a pool connection.
+	// Apply the result only to a pending upload whose stored size matches.
+	// Recording after the transaction releases its connection also preserves
+	// enforced attempts when the publication rolls back.
+	recordDecision, quotaErr := h.storageQuota().EvaluateAdmission(r.Context(), session.WorkspaceID, session.ExpectedSize, service.StorageSourceUpload)
+	var afterRelease func()
+	defer func() {
+		if afterRelease != nil {
+			afterRelease()
+		}
+	}()
+
 	tx, err := h.beginWakeupWrite(r.Context())
 	if err != nil {
 		slog.Error("failed to begin attachment upload transaction", "error", err)
@@ -462,7 +475,8 @@ func (h *Handler) publishAttachmentUpload(
 	// attachment rather than leave a row pointing at a gone or now-invisible
 	// issue/comment/chat. This runs under the session lock, so the decision
 	// cannot be raced by another completion.
-	if !h.revalidateAttachmentUploadTarget(w, r, qtx, locked, true) {
+	member, ok := (accessQueries{qtx}).revalidateAttachmentUploadTarget(w, r, locked, true)
+	if !ok {
 		return publishedAttachmentUpload{}, false, false
 	}
 	if sessionExpired(locked) {
@@ -494,38 +508,10 @@ func (h *Handler) publishAttachmentUpload(
 		return publishedAttachmentUpload{}, false, false
 	}
 
-	// Storage limit (MUL-9489), at the same point in the sequence as the
-	// multipart path: every field validated, the object's real size known, and
-	// the write not yet made — so a refused upload publishes no attachment row.
-	//
-	// Checking here rather than at presign is what makes the two paths agree.
-	// Presign only knows the DECLARED size, and a declared size is not what gets
-	// stored; a client could declare 1 byte, PUT 100 MiB, and never reach a
-	// presign-time check. Complete is the first point where the store's own
-	// count is available, which is also the number Admit is given on the
-	// multipart path.
-	//
-	// The refusal shape is the multipart path's: 403 with storage_limit_reached,
-	// and the workspace's figures only for a caller allowed to read storage
-	// usage. A guest learns the code and nothing about the workspace's totals.
-	if err := h.storageQuota().Admit(r.Context(), locked.WorkspaceID, info.Size, service.StorageSourceUpload); err != nil {
-		// The figures are included only for a caller allowed to read storage
-		// usage. The multipart path reads the role from the membership it
-		// already loaded; here the role comes from one explicit lookup, and a
-		// lookup that FAILS withholds the figures. Failing closed matters: the
-		// alternative would hand a guest the workspace's totals precisely when
-		// the database is misbehaving, which is the case least likely to be
-		// noticed in review.
-		withFigures := false
-		member, memberErr := h.getWorkspaceMember(r.Context(), uuidToString(locked.ActorUserID), uuidToString(locked.WorkspaceID))
-		if memberErr == nil {
-			withFigures = !projectaccess.IsGuestRole(member.Role)
-		} else {
-			slog.Warn("storage refusal could not read the caller's role; withholding usage figures",
-				"error", memberErr)
-		}
-		if !writeStorageLimitReached(w, err, withFigures) {
-			slog.Error("storage limit check failed", "error", err)
+	afterRelease = recordDecision
+	if quotaErr != nil {
+		if !writeStorageLimitReached(w, quotaErr, !projectaccess.IsGuestRole(member.Role)) {
+			slog.Error("storage limit check failed", "error", quotaErr)
 			writeError(w, http.StatusInternalServerError, "failed to complete upload")
 		}
 		return publishedAttachmentUpload{}, false, false
@@ -751,11 +737,13 @@ func (h *Handler) requireAttachmentAccessForRequest(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusUnauthorized, "user not authenticated")
 		return false
 	}
-	if _, err := h.getWorkspaceMember(r.Context(), userID, workspaceID); err != nil {
+	member, err := h.getWorkspaceMember(r.Context(), userID, workspaceID)
+	if err != nil {
 		writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 			"you no longer have access to this workspace")
 		return false
 	}
+	r = r.WithContext(middleware.SetMemberContext(r.Context(), workspaceID, member))
 	// Project visibility covers issue-bound and comment-bound attachments,
 	// including one adopted into a private project after it was published. This
 	// is the same helper the attachment read routes use, so the two cannot
@@ -828,34 +816,15 @@ func (h *Handler) requireAttachmentAccessForRequest(w http.ResponseWriter, r *ht
 	return true
 }
 
-// revalidateAttachmentUploadTarget re-proves, from the CURRENT database state,
-// that this caller may still act on the session's target. It is the same set of
-// gates presign applies, so revocation between presign and complete is refused
-// for both the first publication and an idempotent replay.
-//
-// It deliberately re-derives the caller from the request rather than trusting
-// the session's stored actor: the stored actor proves who STARTED the upload,
-// not what they may still reach. Every gate below consults live membership,
-// project visibility, private-agent access or the task token, exactly as the
-// corresponding route would.
-// revalidateAttachmentUploadTarget re-checks a session against the caller's
-// CURRENT access.
-//
-// Two families of check live here, and they differ in WHEN they apply:
-//
-//   - ACCESS (membership, project visibility, chat/agent reachability, task
-//     scope): always, including on replay. A member revoked after publishing must
-//     not be able to use a replay to read the attachment back.
-//   - BINDING (the guest draft and footnote rules): only when `publishing` is
-//     true, because they decide what a session may CREATE. Once the attachment
-//     exists, a replay returns it; re-deciding the binding would make a legitimate
-//     retry fail merely because the caller's role changed after the fact.
-func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *http.Request, qtx *db.Queries, session db.AttachmentUploadSession, publishing bool) bool {
+// Recheck current access for every completion. Only a first publication
+// creates a binding, so a replay checks visibility without reapplying the
+// guest rules for new drafts and comment attachments.
+func (h accessQueries) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *http.Request, session db.AttachmentUploadSession, publishing bool) (db.Member, bool) {
 	workspaceID := uuidToString(session.WorkspaceID)
 	userID := requestUserID(r)
 	if userID == "" {
 		writeError(w, http.StatusUnauthorized, "user not authenticated")
-		return false
+		return db.Member{}, false
 	}
 	// A session can outlive a membership change; membership is the first thing
 	// every path below assumes. Its ROLE matters too, not just its existence:
@@ -865,8 +834,9 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 	if err != nil {
 		writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 			"you no longer have access to this workspace")
-		return false
+		return db.Member{}, false
 	}
+	r = r.WithContext(middleware.SetMemberContext(r.Context(), workspaceID, member))
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 	// The role read HERE is the authority for the guest rules, not the one from
 	// presign: a member demoted to guest must lose the member-only bindings, and
@@ -874,20 +844,20 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 	nowGuest := actorType == "member" && projectaccess.IsGuestRole(member.Role)
 
 	if session.IssueID.Valid {
-		issue, err := qtx.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+		issue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
 			ID:          session.IssueID,
 			WorkspaceID: session.WorkspaceID,
 		})
 		if err != nil {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the issue this upload targeted no longer exists")
-			return false
+			return db.Member{}, false
 		}
 		// The project gate is the one a member loses when they are removed from
 		// a private project, so it must run on publication and on replay.
 		if !h.requireProjectVisible(w, r, workspaceID, issue.ProjectID, http.StatusConflict,
 			"the issue this upload targeted is no longer available") {
-			return false
+			return db.Member{}, false
 		}
 		// Guest draft rule, re-applied against the CURRENT role. The session was
 		// bound at presign; if the caller is a guest now, publishing it against
@@ -897,24 +867,24 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		if publishing && nowGuest {
 			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 				"a guest's upload cannot be published against an issue; post it as a comment draft")
-			return false
+			return db.Member{}, false
 		}
 	}
 	if session.CommentID.Valid {
-		comment, err := qtx.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
+		comment, err := h.Queries.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
 			ID:          session.CommentID,
 			WorkspaceID: session.WorkspaceID,
 		})
 		if err != nil || comment.DeletedAt.Valid {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the comment this upload targeted no longer exists")
-			return false
+			return db.Member{}, false
 		}
 		// A comment inherits its issue's project visibility. Checking only
 		// existence let a revoked member publish into a private comment.
 		if !h.requireIssueIDVisible(w, r, workspaceID, comment.IssueID, http.StatusConflict,
 			"the comment this upload targeted is no longer available") {
-			return false
+			return db.Member{}, false
 		}
 		// Guest comment-ownership, re-applied against the CURRENT role. A member
 		// demoted to guest mid-upload could otherwise publish onto a comment that
@@ -922,7 +892,7 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		if publishing && nowGuest && (comment.AuthorType != "member" || uuidToString(comment.AuthorID) != actorID) {
 			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 				"a guest may only attach files to its own comments")
-			return false
+			return db.Member{}, false
 		}
 	}
 	if session.ChatSessionID.Valid {
@@ -930,33 +900,33 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		// Chat AND the caller must still be able to reach its agent. A cached
 		// session id cannot be used to resurrect a command-only chat, and losing
 		// access to a private agent withdraws the ability to upload into it.
-		chatSession, err := qtx.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
+		chatSession, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
 			ID:          session.ChatSessionID,
 			WorkspaceID: session.WorkspaceID,
 		})
 		if err != nil {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the chat session this upload targeted no longer exists")
-			return false
+			return db.Member{}, false
 		}
-		if _, err := qtx.GetPublicChatSessionInWorkspace(r.Context(), db.GetPublicChatSessionInWorkspaceParams{
+		if _, err := h.Queries.GetPublicChatSessionInWorkspace(r.Context(), db.GetPublicChatSessionInWorkspaceParams{
 			ID:          session.ChatSessionID,
 			WorkspaceID: session.WorkspaceID,
 		}); err != nil {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the chat session this upload targeted is no longer available")
-			return false
+			return db.Member{}, false
 		}
-		agent, err := qtx.GetAgent(r.Context(), chatSession.AgentID)
+		agent, err := h.Queries.GetAgent(r.Context(), chatSession.AgentID)
 		if err != nil {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the agent for this upload's chat session no longer exists")
-			return false
+			return db.Member{}, false
 		}
 		if !h.canAccessPrivateAgent(r.Context(), agent, actorType, actorID, workspaceID) {
 			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 				"you no longer have access to this chat session's agent")
-			return false
+			return db.Member{}, false
 		}
 	}
 	if session.TaskID.Valid {
@@ -967,29 +937,29 @@ func (h *Handler) revalidateAttachmentUploadTarget(w http.ResponseWriter, r *htt
 		if r.Header.Get("X-Actor-Source") != "task_token" {
 			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 				"task uploads may only be completed from within the same agent task")
-			return false
+			return db.Member{}, false
 		}
 		if boundTaskID := strings.TrimSpace(r.Header.Get("X-Task-ID")); !strings.EqualFold(boundTaskID, uuidToString(session.TaskID)) {
 			writeErrorCode(w, http.StatusForbidden, codeUploadTargetInvalid,
 				"this task token does not match the upload's task")
-			return false
+			return db.Member{}, false
 		}
-		task, err := qtx.GetAgentTaskInWorkspace(r.Context(), db.GetAgentTaskInWorkspaceParams{
+		task, err := h.Queries.GetAgentTaskInWorkspace(r.Context(), db.GetAgentTaskInWorkspaceParams{
 			ID:          session.TaskID,
 			WorkspaceID: session.WorkspaceID,
 		})
 		if err != nil || uuidToString(task.AgentID) != uuidToString(session.ActorID) || actorType != "agent" || actorID != uuidToString(session.ActorID) {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the task this upload targeted is no longer available")
-			return false
+			return db.Member{}, false
 		}
 		if task.Status == "completed" || task.Status == "failed" || task.Status == "cancelled" {
 			writeErrorCode(w, http.StatusConflict, codeUploadTargetInvalid,
 				"the task this upload targeted has already finished")
-			return false
+			return db.Member{}, false
 		}
 	}
-	return true
+	return member, true
 }
 
 // resolveAttachmentUploadTarget validates the requested binding and its access
