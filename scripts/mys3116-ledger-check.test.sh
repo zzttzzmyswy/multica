@@ -40,9 +40,14 @@ psql_admin() { psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -tAqc "$1"; }
 dsn_for() { printf '%s' "${ADMIN_DSN%/*}/$1"; }
 db() { psql "$(dsn_for "$DB")" -tAqc "$1"; }
 
+owned_db=false
 cleanup() {
-  psql_admin "DROP DATABASE IF EXISTS \"$DB\"" >/dev/null 2>&1
+  local status=$?
+  if "$owned_db"; then
+    dropdb --maintenance-db="$ADMIN_DSN" "$DB" || status=1
+  fi
   rm -rf "$WORK"
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -73,6 +78,7 @@ dsn_for() { printf '%s' "${ADMIN_DSN%/*}/$1"; }
 
 step "Synthetic ledger"
 psql_admin "CREATE DATABASE \"$DB\"" >/dev/null || { echo "could not create $DB" >&2; exit 1; }
+owned_db=true
 db "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL)"
 db "INSERT INTO schema_migrations (version, applied_at) VALUES
       ('657_attachment_upload_session',            '2026-01-01 00:00:00.123456+00'),

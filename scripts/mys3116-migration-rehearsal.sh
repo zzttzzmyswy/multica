@@ -20,7 +20,9 @@ ADMIN_DSN="${ADMIN_DSN:?set ADMIN_DSN to an isolated superuser DSN}"
 BASE_TAG="${BASE_TAG:?set BASE_TAG to the previous release tag, e.g. v0.11.1-myswy.1}"
 OLD_TAG="${OLD_TAG:-v0.9.0-myswy.2}"
 HEAD_VERSION="${HEAD_VERSION:?set HEAD_VERSION to the highest migration number of this build}"
-OUT_DIR="${OUT_DIR:-/tmp/fork-sync-rehearsal}"
+OUT_DIR="${OUT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/fork-sync-rehearsal.XXXXXX")}"
+RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+owned_databases=()
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/rehearsal.log"
@@ -31,10 +33,19 @@ fail() { say "FAIL: $*"; exit 1; }
 psql_admin() { psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -tAqc "$1"; }
 dsn_for() { printf '%s' "${ADMIN_DSN%/*}/$1"; }
 
+cleanup() {
+  local status=$? name
+  for name in "${owned_databases[@]}"; do
+    dropdb --maintenance-db="$ADMIN_DSN" "$name" || status=1
+  done
+  exit "$status"
+}
+trap cleanup EXIT
+
 fresh_db() {
   local name=$1
-  psql_admin "DROP DATABASE IF EXISTS $name" >/dev/null
-  psql_admin "CREATE DATABASE $name" >/dev/null
+  createdb --maintenance-db="$ADMIN_DSN" --template=template0 "$name"
+  owned_databases+=("$name")
   psql "$(dsn_for "$name")" -v ON_ERROR_STOP=1 -q >>"$LOG" 2>&1 <<'SQL'
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -204,7 +215,7 @@ RESULTS="$OUT_DIR/results.tsv"
 : >"$RESULTS"
 
 rehearse() {
-  local label=$1 base_tree=$2 db="sync_$1"
+  local label=$1 base_tree=$2 db="sync_${1}_$RUN_ID"
   say ""
   say "=== case $label"
   fresh_db "$db"

@@ -29,8 +29,8 @@ SQL
 import os, sys
 from urllib.parse import urlsplit, urlunsplit, parse_qsl
 uri = urlsplit(os.environ["ADMIN_DSN"])
-if uri.scheme not in ("postgres", "postgresql") or any(k == "dbname" for k, _ in parse_qsl(uri.query)):
-    sys.exit("expected a PostgreSQL URI without a dbname query override")
+if uri.scheme not in ("postgres", "postgresql") or any(k in {"database", "dbname"} for k, _ in parse_qsl(uri.query)):
+    sys.exit("expected a PostgreSQL URI without a database name override")
 print(urlunsplit(uri._replace(path="/" + sys.argv[1])))
 PY
 )
