@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,7 +24,23 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
+// testSeq numbers rows within ONE process. It is a readability aid, not a
+// uniqueness guarantee: it restarts at 0 in every run, so a workspace reused by
+// a second run (or by `-count=N`) would collide on a value-derived email. The
+// per-test unique part comes from runNonce below.
 var testSeq atomic.Int64
+
+// runNonce is unique per process, so a database that survives across runs cannot
+// see the same generated email twice. Combined with testSeq it gives the
+// readable "sharelink-test-<n>" shape while staying collision-free.
+var runNonce = func() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		// Falling back to the clock keeps the property even without entropy.
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}()
 
 type shareJoinCapacityStub struct {
 	mu              sync.Mutex
@@ -115,8 +133,8 @@ func createTestUserAndMember(t *testing.T, role string) string {
 	var userID string
 	if err := testPool.QueryRow(ctx,
 		`INSERT INTO "user" (name, email) VALUES ($1, $2) RETURNING id`,
-		fmt.Sprintf("sharelink-test-%d", seq),
-		fmt.Sprintf("sharelink-test-%d@multica.ai", seq),
+		fmt.Sprintf("sharelink-test-%d-%s", seq, runNonce),
+		fmt.Sprintf("sharelink-test-%d-%s@multica.ai", seq, runNonce),
 	).Scan(&userID); err != nil {
 		t.Fatalf("create share-link test user: %v", err)
 	}

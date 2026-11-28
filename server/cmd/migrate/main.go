@@ -416,6 +416,30 @@ var concurrentIndexCleanups = map[string]string{
 	"482_agent_task_queue_telemetry_started_index":              "idx_agent_task_queue_telemetry_started",
 	"484_issue_triage_state_index":                              "idx_issue_triage_state",
 	"537_issue_duplicate_of_index":                              "idx_issue_duplicate_of",
+	"757_agent_task_queue_doc_idx":                              "idx_agent_task_queue_doc",
+	"753_app_tool_call_quota_period_scope_idx":                  "uq_app_tool_call_quota_period_scope",
+	"755_app_tool_call_workspace_metered_idx":                   "idx_app_tool_call_workspace_metered",
+	"740_task_usage_hourly_squad_uq_idx":                        "uq_task_usage_hourly_squad_key_idx",
+	"741_task_usage_hourly_dirty_squad_uq_idx":                  "uq_task_usage_hourly_dirty_squad_key_idx",
+	"742_task_usage_hourly_workspace_squad_idx":                 "idx_task_usage_hourly_workspace_squad_time",
+	"748_issue_blocker_unique":                                  "issue_blocker_unique",
+	"749_issue_blocker_reverse":                                 "issue_blocker_reverse",
+	"737_comment_idempotency_receipt_key":                       "uq_comment_idempotency_receipt_key",
+	"738_comment_idempotency_receipt_created":                   "idx_comment_idempotency_receipt_created",
+	"733_remote_app_connection_workspace_idx":                   "uq_remote_app_connection_owner_ws",
+	"724_remote_app_oauth_client_idx":                           "uq_remote_app_oauth_client_app_redirect",
+	"725_remote_app_connection_owner_idx":                       "uq_remote_app_connection_owner",
+	"702_autopilot_run_idempotency_key_idx":                     "uq_autopilot_run_idempotency_key",
+	"705_member_search_access_pkey_index":                       "member_search_access_pkey_idx",
+	"708_doc_comment_pkey_index":                                "doc_comment_pkey_idx",
+	"710_doc_comment_doc_idx":                                   "doc_comment_doc_idx",
+	"711_doc_comment_workspace_idx":                             "doc_comment_workspace_idx",
+	"712_attachment_workspace_size_idx":                         "idx_attachment_workspace_size",
+	"716_dashboard_range_view_scope_idx":                        "uq_dashboard_range_view_scope",
+	"718_doc_collab_state_pkey_index":                           "doc_collab_state_pkey_idx",
+	"720_doc_revision_pkey_index":                               "doc_revision_pkey_idx",
+	"728_issue_description_collab_state_pkey_index":             "issue_description_collab_state_pkey_idx",
+	"730_issue_description_revision_pkey_index":                 "issue_description_revision_pkey_idx",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction
@@ -447,6 +471,10 @@ var concurrentDownIndexCleanups = map[string]string{
 	"463_drop_issue_description_bigm_index":                 "idx_issue_description_bigm",
 	"464_drop_issue_description_trgm_index":                 "idx_issue_description_trgm",
 	"473_drop_agent_task_queue_chat_with_session_index":     "idx_agent_task_queue_chat_with_session_created_at",
+	"744_task_usage_hourly_drop_legacy_key":                 "uq_task_usage_hourly_key",
+	"745_task_usage_hourly_dirty_drop_legacy_key":           "uq_task_usage_hourly_dirty_key",
+	"734_drop_remote_app_connection_owner_idx":              "uq_remote_app_connection_owner",
+	"713_drop_attachment_workspace_index":                   "idx_attachment_workspace",
 }
 
 var preMigrationHooks = func() map[string]preMigrationHook {
@@ -492,9 +520,12 @@ type rowQuerier interface {
 }
 
 // upstreamLineageVersions names, for each number this distribution reuses, the
-// filename the upstream line records there. It is used only to explain the
-// refusal: detection itself is the allowlist in ledgerLineage.check, so a
-// foreign ledger is caught even when its version is not listed here.
+// filename the upstream line records there. The fork released its upload feature
+// as 657-660 and has shifted every later upstream block up by four, so this
+// covers 657-755: 657-700 from the first sync and 701-759 from the second. It is
+// used only to explain the refusal: detection itself is the allowlist in
+// ledgerLineage.check, so a foreign ledger is caught even when its version is not
+// listed here.
 var upstreamLineageVersions = map[string]string{
 	"657_inbox_item_snoozed_until":              "657_attachment_upload_session",
 	"658_project_archive":                       "658_attachment_upload_session_staging_key",
@@ -524,18 +555,77 @@ var upstreamLineageVersions = map[string]string{
 	"682_project_folder_name_idx":               "682_chat_wakeup_requester_idx",
 	"683_entitlement_feature_attempt":           "683_entitlement_limit_overage",
 	"684_entitlement_feature_attempt_scope_idx": "684_entitlement_limit_overage_scope_idx",
-	"685_docs":                        "685_project_folder",
-	"686_doc_folder_pkey_index":       "686_project_folder_name_idx",
-	"687_doc_folder_pkey":             "687_entitlement_feature_attempt",
-	"688_doc_pkey_index":              "688_entitlement_feature_attempt_scope_idx",
-	"689_doc_pkey":                    "689_docs",
-	"690_doc_version_pkey_index":      "690_doc_folder_pkey_index",
-	"691_doc_version_pkey":            "691_doc_folder_pkey",
-	"692_doc_folder_workspace_idx":    "692_doc_pkey_index",
-	"693_doc_workspace_idx":           "693_doc_pkey",
-	"694_doc_version_workspace_idx":   "694_doc_version_pkey_index",
-	"695_inbox_item_returned_at":      "695_doc_version_pkey",
-	"696_inbox_item_active_shown_idx": "696_doc_folder_workspace_idx",
+	"685_docs":                                      "685_project_folder",
+	"686_doc_folder_pkey_index":                     "686_project_folder_name_idx",
+	"687_doc_folder_pkey":                           "687_entitlement_feature_attempt",
+	"688_doc_pkey_index":                            "688_entitlement_feature_attempt_scope_idx",
+	"689_doc_pkey":                                  "689_docs",
+	"690_doc_version_pkey_index":                    "690_doc_folder_pkey_index",
+	"691_doc_version_pkey":                          "691_doc_folder_pkey",
+	"692_doc_folder_workspace_idx":                  "692_doc_pkey_index",
+	"693_doc_workspace_idx":                         "693_doc_pkey",
+	"694_doc_version_workspace_idx":                 "694_doc_version_pkey_index",
+	"695_inbox_item_returned_at":                    "695_doc_version_pkey",
+	"696_inbox_item_active_shown_idx":               "696_doc_folder_workspace_idx",
+	"697_autopilot_run_idempotency_key":             "697_doc_workspace_idx",
+	"698_autopilot_run_idempotency_key_idx":         "698_doc_version_workspace_idx",
+	"699_member_guest_role":                         "699_inbox_item_returned_at",
+	"700_member_search_access":                      "700_inbox_item_active_shown_idx",
+	"701_member_search_access_pkey_index":           "701_autopilot_run_idempotency_key",
+	"702_member_search_access_pkey":                 "702_autopilot_run_idempotency_key_idx",
+	"703_doc_comment":                               "703_member_guest_role",
+	"704_doc_comment_pkey_index":                    "704_member_search_access",
+	"705_doc_comment_pkey":                          "705_member_search_access_pkey_index",
+	"706_doc_comment_doc_idx":                       "706_member_search_access_pkey",
+	"707_doc_comment_workspace_idx":                 "707_doc_comment",
+	"708_attachment_workspace_size_idx":             "708_doc_comment_pkey_index",
+	"709_drop_attachment_workspace_index":           "709_doc_comment_pkey",
+	"710_autopilot_quota_limit_notice":              "710_doc_comment_doc_idx",
+	"711_dashboard_range_view":                      "711_doc_comment_workspace_idx",
+	"712_dashboard_range_view_scope_idx":            "712_attachment_workspace_size_idx",
+	"713_doc_collab":                                "713_drop_attachment_workspace_index",
+	"714_doc_collab_state_pkey_index":               "714_autopilot_quota_limit_notice",
+	"715_doc_collab_state_pkey":                     "715_dashboard_range_view",
+	"716_doc_revision_pkey_index":                   "716_dashboard_range_view_scope_idx",
+	"717_doc_revision_pkey":                         "717_doc_collab",
+	"718_auto_archive_prompt":                       "718_doc_collab_state_pkey_index",
+	"719_remote_app_connection":                     "719_doc_collab_state_pkey",
+	"720_remote_app_oauth_client_idx":               "720_doc_revision_pkey_index",
+	"721_remote_app_connection_owner_idx":           "721_doc_revision_pkey",
+	"722_auto_archive_agent_trigger_prompt":         "722_auto_archive_prompt",
+	"723_issue_description_collab":                  "723_remote_app_connection",
+	"724_issue_description_collab_state_pkey_index": "724_remote_app_oauth_client_idx",
+	"725_issue_description_collab_state_pkey":       "725_remote_app_connection_owner_idx",
+	"726_issue_description_revision_pkey_index":     "726_auto_archive_agent_trigger_prompt",
+	"727_issue_description_revision_pkey":           "727_issue_description_collab",
+	"728_app_account_requests":                      "728_issue_description_collab_state_pkey_index",
+	"729_remote_app_connection_workspace_idx":       "729_issue_description_collab_state_pkey",
+	"730_drop_remote_app_connection_owner_idx":      "730_issue_description_revision_pkey_index",
+	"731_skill_revision":                            "731_issue_description_revision_pkey",
+	"732_comment_idempotency_receipt":               "732_app_account_requests",
+	"733_comment_idempotency_receipt_key":           "733_remote_app_connection_workspace_idx",
+	"734_comment_idempotency_receipt_created":       "734_drop_remote_app_connection_owner_idx",
+	"735_task_usage_hourly_squad_col":               "735_skill_revision",
+	"736_task_usage_hourly_squad_uq_idx":            "736_comment_idempotency_receipt",
+	"737_task_usage_hourly_dirty_squad_uq_idx":      "737_comment_idempotency_receipt_key",
+	"738_task_usage_hourly_workspace_squad_idx":     "738_comment_idempotency_receipt_created",
+	"739_task_usage_hourly_squad_pipeline":          "739_task_usage_hourly_squad_col",
+	"740_task_usage_hourly_drop_legacy_key":         "740_task_usage_hourly_squad_uq_idx",
+	"741_task_usage_hourly_dirty_drop_legacy_key":   "741_task_usage_hourly_dirty_squad_uq_idx",
+	"742_task_usage_hourly_squad_rollback_merge":    "742_task_usage_hourly_workspace_squad_idx",
+	"743_issue_blocker":                             "743_task_usage_hourly_squad_pipeline",
+	"744_issue_blocker_unique":                      "744_task_usage_hourly_drop_legacy_key",
+	"745_issue_blocker_reverse":                     "745_task_usage_hourly_dirty_drop_legacy_key",
+	"746_issue_blocker_rules":                       "746_task_usage_hourly_squad_rollback_merge",
+	"747_squad_handoff_mode":                        "747_issue_blocker",
+	"748_app_tool_call_quota_period":                "748_issue_blocker_unique",
+	"749_app_tool_call_quota_period_scope_idx":      "749_issue_blocker_reverse",
+	"750_app_tool_call_quota_columns":               "750_issue_blocker_rules",
+	"751_app_tool_call_workspace_metered_idx":       "751_squad_handoff_mode",
+	"752_doc_comment_agent_runs":                    "752_app_tool_call_quota_period",
+	"753_agent_task_queue_doc_idx":                  "753_app_tool_call_quota_period_scope_idx",
+	"754_issue_stage_blockers_skip_top_level":       "754_app_tool_call_quota_columns",
+	"755_task_usage_hourly_rollup_hour_key":         "755_app_tool_call_workspace_metered_idx",
 }
 
 // historicalCandidateUploadVersions is the upload feature's numbering on the
@@ -728,7 +818,7 @@ func (l *ledgerLineage) check(ctx context.Context, q ledgerQuerier, table string
 	}
 	if len(foreign) > 0 {
 		sort.Strings(foreign)
-		return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this build numbers those same files 661_inbox_item_snoozed_until..700_inbox_item_active_shown_idx and keeps its own upload feature at 657-660, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
+		return fmt.Errorf("refusing to migrate a database whose schema_migrations was written by the upstream migration line, not this distribution: %s; this build numbers those same files 661_inbox_item_snoozed_until..759_task_usage_hourly_rollup_hour_key (+4 through two syncs) and keeps its own upload feature at 657-660, so upgrading in place would apply different DDL under the same versions. Restore a backup taken from this distribution, or rebuild the database from scratch",
 			strings.Join(foreign, ", "))
 	}
 	sort.Strings(unknown)

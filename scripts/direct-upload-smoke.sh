@@ -44,6 +44,7 @@
 #
 # Requirements: go, docker, curl, python3, awk. The S3 server image is pulled on
 # first run; set SMOKE_S3_IMAGE to use another S3-compatible image.
+# Set SMOKE_PG_PORT to the published loopback port of SMOKE_PG_CONTAINER.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -240,7 +241,7 @@ ok "using PostgreSQL server: $PG_CONTAINER"
 
 POSTGRES_USER="$(docker exec "$PG_CONTAINER" printenv POSTGRES_USER 2>/dev/null || echo multica)"
 POSTGRES_PASSWORD="$(docker exec "$PG_CONTAINER" printenv POSTGRES_PASSWORD 2>/dev/null || echo multica)"
-DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}?sslmode=disable"
+DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${SMOKE_PG_PORT:-5432}/${DB_NAME}?sslmode=disable"
 
 # Never overwrite: an existing database of this name is a hard error, not
 # something to drop and recreate. The name is unique per run, so a collision

@@ -189,20 +189,30 @@ Sync from a **formal upstream release tag**, not from upstream `main`: the
 distribution's version number names the upstream version it is based on, and
 `main` moves between releases. Then:
 
-1. **Migrations — check which branch you are on.** Renumbering applies **only**
-   to the undeployed upstream candidate, which is built fresh from an upstream
-   base and has never been applied anywhere: there, number the upload migrations
-   after upstream's highest and update `concurrentIndexCleanups` in
-   `server/cmd/migrate/main.go` in the same commit
-   (`TestEveryConcurrentUpBuildHasCleanup` fails otherwise).
+1. **Migrations — renumber the INCOMING block, never a shipped one.** Two
+   different renumbers exist and only one is legal on this line:
 
-   **Do not renumber on the fork's own line.** The fork's upload migrations are
-   recorded in `schema_migrations` on every deployed database under the numbers
-   they were applied with; moving them would re-run or skip an applied migration.
-   Reconciling the fork's deployed numbers with a future upstream that claims the
-   same ones is an unsolved problem, not a renumbering step — see the migration
-   section of `docs/upload-patch-contract.md`, which records it as a gate that
-   needs its own design and a rehearsal on a restored copy.
+   - **Incoming upstream block: renumber, and only here.** Upstream numbers its
+     migrations without knowing about the fork's frozen 657–660, so its block
+     collides. Shift the whole incoming block up by the offset that clears the
+     fork's highest shipped number (657–696 → 661–700, then 697–755 → 701–759),
+     change only the prefixes and the `migration NNN` cross-references, and
+     register the concurrent-index cleanup hooks under the new numbers in
+     `server/cmd/migrate/main.go`. Add the block's number→name pairs to
+     `upstreamLineageVersions` so a foreign ledger gets a named refusal. The
+     renumber regression tests in `server/cmd/migrate/migrate_sync_renumber_test.go`
+     and `migrate_sync_bodies_test.go` fail if a file keeps its old number, gets
+     the wrong suffix, or has a body that is not upstream's.
+   - **Anything already shipped: never.** Every ledger row on a deployed
+     database records the name it was applied with; moving one would re-run or
+     skip an applied migration. That covers the upload feature (657–660) and
+     every previously synced block (661–700 after the first sync).
+   - **The undeployed upstream candidate branch** is a separate line built fresh
+     from an upstream base: there, number the upload migrations after upstream's
+     highest instead, and update `concurrentIndexCleanups` in the same commit.
+
+   See the migration section of `docs/upload-patch-contract.md` for the ledger
+   preflight and the rehearsal a renumber needs before it reaches a deployment.
 2. **Storage guarantee.** A conflict resolution must keep the conditional copy in
    `server/internal/storage/s3_upload.go`. The guarantee that a client cannot
    overwrite a published object comes from that `If-Match` condition, not from
@@ -219,4 +229,5 @@ These carry distribution behaviour and should survive a sync:
 - `.goreleaser.myswy.yml`, `.github/workflows/release-myswy.yml`
 - `.env.example`, `docker-compose.selfhost.yml`,
   `docker-compose.selfhost.digest.yml`, `deploy/helm/multica/{values,Chart}.yaml`
-- `docs/self-host-distribution.md`, `docs/upload-patch-contract.md`
+- `docs/self-host-distribution.md`, `docs/upload-patch-contract.md`,
+  `docs/operating-card-*.md`

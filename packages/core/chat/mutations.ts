@@ -7,6 +7,7 @@ import type {
   ChatSession,
   ChatPinnedAgent,
   ChatWakeup,
+  ChatWakeupTiming,
   ChatDraftRestoresResponse,
   ChatQuickActionsPendingState,
 } from "../types";
@@ -76,6 +77,27 @@ export function useCancelChatWakeup() {
     onError: (err, { sessionId }, ctx) => {
       logger.warn("cancelChatWakeup.error", { sessionId, err });
       if (ctx?.prev) qc.setQueryData(chatKeys.wakeups(sessionId), ctx.prev);
+    },
+    onSettled: (_data, _err, { sessionId }) => {
+      qc.invalidateQueries({ queryKey: chatKeys.wakeups(sessionId) });
+      qc.invalidateQueries({ queryKey: chatKeys.myWakeups(wsId) });
+    },
+  });
+}
+
+/**
+ * Change when an active wakeup runs. Not optimistic: the server applies the
+ * limits, and chat:wakeup_changed plus the refetch bring the new timing.
+ */
+export function useRescheduleChatWakeup() {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+
+  return useMutation({
+    mutationFn: ({ sessionId, wakeupId, timing }: { sessionId: string; wakeupId: string; timing: ChatWakeupTiming }) =>
+      api.rescheduleChatWakeup(sessionId, wakeupId, timing),
+    onError: (err, { sessionId }) => {
+      logger.warn("rescheduleChatWakeup.error", { sessionId, err });
     },
     onSettled: (_data, _err, { sessionId }) => {
       qc.invalidateQueries({ queryKey: chatKeys.wakeups(sessionId) });
@@ -506,13 +528,20 @@ export function useRegenerateChatQuickActions() {
       // chat:quick_actions that resolves it — no ack reconciliation needed.
       // task_id is unknown here and unused for resolution (applyChatQuickActionsToCache
       // matches on message_id).
+      // Typed before the call, not as an inline literal: setQueryData's second
+      // parameter is `Updater<...>`, a union of the value and an updater
+      // FUNCTION. An inline literal is resolved against both branches, and
+      // TypeScript reports the object as "not assignable" because it also tries
+      // to treat it as a callback. A named value removes the ambiguity without
+      // changing what is stored.
+      const pending: ChatQuickActionsPendingState = {
+        message_id: messageId,
+        task_id: "",
+        expires_at: Date.now() + QUICK_ACTIONS_PENDING_TIMEOUT_MS,
+      };
       qc.setQueryData<ChatQuickActionsPendingState | null>(
         chatKeys.quickActionsPending(sessionId),
-        {
-          message_id: messageId,
-          task_id: "",
-          expires_at: Date.now() + QUICK_ACTIONS_PENDING_TIMEOUT_MS,
-        },
+        pending,
       );
       return { previous, sessionId };
     },

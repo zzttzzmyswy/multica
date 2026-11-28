@@ -921,7 +921,7 @@ func TestHandleDaemonWSHeartbeat_RuntimeGoneReturnsAckNotError(t *testing.T) {
 				missingRuntime: daemonws.NewRuntimeLease(testWorkspaceID, "online", time.Now().Add(-2*runtimeHeartbeatDBFlushInterval), true),
 			},
 		},
-		missingRuntime, false)
+		missingRuntime, protocol.DaemonHeartbeatRequestPayload{})
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
 	}
@@ -965,7 +965,7 @@ func TestHandleDaemonWSHeartbeat_AllowsAnyAuthorizedWorkspace(t *testing.T) {
 				runtimeID: daemonws.NewRuntimeLease(workspaceID, "online", time.Now(), true),
 			},
 		},
-		runtimeID, false)
+		runtimeID, protocol.DaemonHeartbeatRequestPayload{})
 	if err != nil {
 		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
 	}
@@ -1393,11 +1393,12 @@ func TestCancelTask_TaskBelongsToDifferentIssue_Returns404(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	// Issue X — the task's real parent.
 	var issueXID, taskID string
@@ -1441,11 +1442,12 @@ func TestCancelTask_SameIssue_Succeeds(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	var issueID, taskID string
 	dbfx.QueryRow(t, `
@@ -1504,12 +1506,11 @@ func TestGetIssueUsageReportsUsageCoverage(t *testing.T) {
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT id, runtime_id FROM agent
-		WHERE workspace_id = $1 AND runtime_id IS NOT NULL
-		LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it actually runs on, created together: a claim
+	// dispatches by (runtime, agent), so taking "some agent" and "some runtime"
+	// independently across a workspace other tests populate in parallel claims
+	// nothing at all.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 	issueID := dbfx.Issue(t, "issue usage coverage")
 	finished := testutil.Cols{
 		"issue_id":     issueID,
@@ -2040,10 +2041,10 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	autopilotID := dbfx.Insert(t, "autopilot", testutil.Cols{
 		"workspace_id":    testWorkspaceID,
@@ -2136,11 +2137,12 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 	`, projectID, testWorkspaceID, `{"url":"`+projectRepoURL+`","ref":"`+projectRepoRef+`"}`)
 
 	// Agent + runtime + queued task in this project.
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "project repo override", testutil.Cols{
 		"project_id": projectID,
@@ -2202,11 +2204,12 @@ func TestClaimTask_ProjectDescriptionInjected(t *testing.T) {
 		"description": projectDescription,
 	})
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "project description", testutil.Cols{
 		"project_id": projectID,
@@ -2291,11 +2294,12 @@ func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
 
 	projectID := dbfx.Project(t, "Claim project without repos")
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
+	// A runtime and agent of this test's own. The shared test workspace holds
+	// agents from other tests running in parallel, so "the first agent" is
+	// whichever one won a race — and a claim only ever looks at THIS runtime,
+	// so borrowing another test's agent makes the claim return no task.
+	runtimeID := dbfx.Runtime(t, "claim-ctx-runtime-"+uuid.NewString()[:8])
+	agentID := dbfx.Agent(t, "claim-ctx-agent-"+uuid.NewString()[:8], runtimeID)
 
 	issueID := dbfx.Issue(t, "no project repos", testutil.Cols{
 		"project_id": projectID,
@@ -2337,10 +2341,10 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	const projectDescription = "Use only the bound project resources."
 	projectID := dbfx.Project(t, "Run-only autopilot project", testutil.Cols{
@@ -2476,12 +2480,10 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 		t.Skip("database not available")
 	}
 
-	// Local agent/runtime (belongs to testWorkspace).
-	var localAgentID, localRuntimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&localAgentID, &localRuntimeID)
+	// A local agent and the runtime it runs on, created together (belongs to
+	// testWorkspace). Paired on purpose: the request names the runtime, and the
+	// claim only finds tasks whose agent is on it.
+	localAgentID, localRuntimeID := createHandlerTestAgentWithRuntime(t, "MismatchLocalAgent", []byte("[]"))
 
 	// Foreign workspace with its own issue — what the misrouted task will
 	// resolve to.
@@ -2543,10 +2545,10 @@ func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *test
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	setWorkspaceIssuePrefixForTest(t, "MUL")
 
@@ -2630,10 +2632,10 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "mul-1198 dedup fixture", testutil.Cols{
 		"status": "in_progress",
@@ -2684,10 +2686,10 @@ func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T)
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "trivial-done-suppression fixture", testutil.Cols{
 		"status": "in_progress",
@@ -2732,10 +2734,10 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 		t.Skip("database not available")
 	}
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	issueID := dbfx.Issue(t, "assignment-trivial-done fixture", testutil.Cols{
 		"status": "in_progress",
@@ -4015,10 +4017,10 @@ func TestGetTaskGCCheck(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	// Quick-create-shaped task: no issue_id, no chat_session_id, no run id.
 	// context.type is set so ResolveTaskWorkspaceID can recover workspace.
@@ -4721,10 +4723,10 @@ func TestAckTaskCancelled(t *testing.T) {
 
 	ctx := context.Background()
 
-	var agentID, runtimeID string
-	dbfx.QueryRow(t, `
-		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
-	`, testWorkspaceID).Scan(&agentID, &runtimeID)
+	// An agent and the runtime it runs on, created together: a claim dispatches
+	// by (runtime, agent), so picking each independently across a workspace other
+	// tests populate in parallel finds no task.
+	agentID, runtimeID := createHandlerTestAgentWithRuntime(t, "RunOnlyAutopilotAgent", []byte("[]"))
 
 	chatSessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
 		"title": "cancel ack test",

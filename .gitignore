@@ -7,6 +7,8 @@ dist
 # build outputs
 .turbo
 .next
+# Written by next dev / build / typegen, with paths that differ between them.
+next-env.d.ts
 out
 build
 bin
@@ -89,3 +91,4 @@ __pycache__/
 perf-report/
 # The production example is a tracked template; `.env*` above would hide it.
 !apps/mobile/.env.production.example
+isolated.env

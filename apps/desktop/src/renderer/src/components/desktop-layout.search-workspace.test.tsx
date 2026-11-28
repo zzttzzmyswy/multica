@@ -216,7 +216,8 @@ it("cancels an in-flight search when the production router switches workspace", 
   // requests: issues, projects and docs. Name them instead of counting whatever
   // happened to arrive — a count derived from the same stream it checks is true
   // at zero, and `requests` also holds this suite's earlier calls, so comparing
-  // against it would pass before anything was held at all.
+  // against it would pass before anything was held at all. Docs search runs on
+  // its own debounce, so waiting for fewer than all three raced its arrival.
   const SEARCH_PATHS = ["/api/issues/search", "/api/projects/search", "/api/docs/search"] as const;
   await waitFor(() => expect(held.length).toBe(SEARCH_PATHS.length), NETWORK_WAIT);
   // Each one exactly once: the workspace switch below has to cancel one held
